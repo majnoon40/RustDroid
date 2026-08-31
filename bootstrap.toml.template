@@ -1,0 +1,129 @@
+# SPDX-License-Identifier: MIT
+#
+# bootstrap.toml.template — Rust x.py config for self-hosting rustc on
+# aarch64-linux-android (Android host, NOT just cross-compile target).
+#
+# Substitution variables (filled by build.sh via sed/envsubst before x.py):
+#   @RUSTDROID_PREFIX@           on-device prefix (baked into install paths)
+#   @RUSTDROID_HOST_TRIPLE@     aarch64-linux-android
+#   @RUSTDROID_BUILD_TRIPLE@    x86_64-unknown-linux-gnu
+#   @NDK_TOOLCHAIN_BIN@         where aarch64-linux-android24-* symlinks live
+#   @NDK_API_LEVEL@             24
+#   @SHIM_LIB_DIR@              where libandroid_shims.a lives
+#   @NDK_ROOT@                  NDK installation root
+
+# Required by x.py: change-id tracks bootstrap.toml schema changes.
+# Bump only when migrating to a new rust-lang/rust tag where the schema
+# has changed (x.py will tell you the new value on first run).
+change-id = 134650
+
+# ============================================================================
+# [build] — what gets built, for what triples
+# ============================================================================
+[build]
+# Build triple: the machine doing the compiling (Linux x86_64 host).
+build = "@RUSTDROID_BUILD_TRIPLE@"
+# Host triples: machines where the produced rustc/cargo will RUN. By
+# putting aarch64-linux-android here we declare we want a self-hosting
+# toolchain — rustc that runs ON Android, not just targets it.
+host = ["@RUSTDROID_HOST_TRIPLE@"]
+# Target triples: machines whose binaries rustc can produce. Same as host
+# for self-hosting, but we can add more (e.g. armv7-linux-android for
+# 32-bit ARM support) later.
+target = ["@RUSTDROID_HOST_TRIPLE@"]
+
+# Cargo features to enable on stage0 tools (used during bootstrap).
+# Leave empty unless you need a specific nightly feature.
+cargo-native-static = false
+# We do NOT enable `extended = true` here — the standard dist set
+# (rustc, cargo, rust-std-$triple, rust-docs, rustfmt, clippy) is enough.
+
+# ============================================================================
+# [install] — where `x.py install` puts files. This is the prefix that gets
+# baked into binaries via RPATH/RUNPATH. MUST match RUSTDROID_PREFIX exactly.
+# ============================================================================
+[install]
+prefix = "@RUSTDROID_PREFIX@"
+sysconfdir = "etc"
+# docdir and bindir are derived from prefix by default — fine for our use.
+
+# ============================================================================
+# [llvm] — how the in-tree LLVM is built.
+# ============================================================================
+[llvm]
+# Build LLVM from rust-lang/rust's src/llvm-project submodule (the default).
+# This requires cmake + ninja-build on the build host (apt-get install cmake
+# ninja-build on Ubuntu).
+#
+# Why NOT download-ci-llvm = true:
+#   rust-lang deletes old CI LLVM artifacts after a few stable cycles, so
+#   older tags (1.85.0 as of 2026-08-31) return HTTP 404 from
+#   ci-artifacts.rust-lang.org. For the current stable tag it'd work; for
+#   pinned-older builds we must build LLVM from source. This is the safer
+#   default since it does not depend on rust-lang.org retention policy.
+download-ci-llvm = false
+optimize = true
+# We are NOT building lld/lldb as separate tools — rustc embeds LLVM's lld
+# via the `lld` feature, which is on by default for linux targets.
+static-libstdcpp = false  # Bionic doesn't have libstdc++; we use libc++
+thin-lto = true  # speed up link
+targets = "X86;ARM;AArch64"  # only build targets we actually need
+experimental-targets = ""   # empty string = disable all experimental targets
+
+# ============================================================================
+# [rust] — how the rustc/cargo binaries themselves are built.
+# ============================================================================
+[rust]
+channel = "stable"
+debug-logging = false
+debuginfo-level = 0
+debuginfo-level-rustc = 0
+debuginfo-level-std = 0
+debuginfo-level-tools = 0
+debuginfo-level-tests = 0
+incremental = false  # dist builds must be non-incremental
+optimize = true
+rpath = false  # we manage RPATH/RUNPATH via patchelf post-build
+# Use libunwind-based backtraces (NOT libexecinfo — Bionic has no libexecinfo).
+# Rust std links libunwind automatically on aarch64-linux-android when this is true.
+backtrace = true
+# Use lld as the linker (bundled with LLVM, faster, no system dep on ld.bfd).
+# This is critical: glibc's ld would not produce Android-compatible binaries,
+# but lld via NDK r27c produces correct DT_RUNPATH and /system/bin/linker64 interp.
+lld = true
+use-lld = true
+
+# ============================================================================
+# [target.aarch64-linux-android] — the C toolchain + extra link args.
+# ============================================================================
+# Valid fields in 1.85.0: cc, cxx, ar, ranlib, default-linker, linker,
+# split-debuginfo, llvm-config, llvm-has-rust-patches, llvm-filecheck,
+# llvm-libunwind, sanitizers, profiler, rpath, crt-static, musl-root,
+# musl-libdir, wasi-root, qemu-rootfs, no-std, codegen-backends, runner
+[target.aarch64-linux-android]
+# NDK r27c ships a unified clang at toolchains/llvm/prebuilt/linux-x86_64/bin/clang
+# with no triple prefix. We create symlinks named aarch64-linux-android24-clang
+# so rust's build system finds them via PATH lookup.
+cc = "@NDK_TOOLCHAIN_BIN@/aarch64-linux-android@NDK_API_LEVEL@-clang"
+cxx = "@NDK_TOOLCHAIN_BIN@/aarch64-linux-android@NDK_API_LEVEL@-clang++"
+linker = "@NDK_TOOLCHAIN_BIN@/aarch64-linux-android@NDK_API_LEVEL@-clang"
+ar = "@NDK_TOOLCHAIN_BIN@/aarch64-linux-android-ar"
+ranlib = "@NDK_TOOLCHAIN_BIN@/aarch64-linux-android-ranlib"
+# We DON'T set nm/objcopy/objdump/strip here — they're not valid fields.
+# rustc will fall back to PATH lookup for llvm-nm/llvm-objcopy/llvm-objdump/
+# llvm-strip, which our symlinks step puts on PATH.
+# Likewise `android-ndk` is not a valid field — the NDK path is conveyed
+# only via the cc/cxx/linker paths above.
+
+# Per-target rustflags can NOT live in this table in 1.85.0; pass them
+# via CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS env var instead.
+# build.sh exports this for `x.py dist` and verify.sh emits it for testing.
+
+# ============================================================================
+# [dist] — how the installable tarball is built.
+# ============================================================================
+[dist]
+compression-formats = ["xz"]
+include-mingw-linker = false  # we don't cross to windows
+# We don't sign or upload anywhere — the user packages & signs at app
+# packaging time. `sign-folder` and `upload-addr` left at defaults.
