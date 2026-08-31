@@ -264,9 +264,14 @@ do_vendor() {
 
     # x.py has a `vendor` subcommand that's preferred over `cargo vendor`
     # because it handles the rust-monorepo lockfile correctly.
-    (cd "$RUST_SRC" && ./x.py vendor --sync ./Cargo.toml --no-merge 2>&1) \
+    # NOTE: --no-merge was removed — current x.py vendor usage is:
+    #   x.py vendor <--sync <SYNC>|--versioned-dirs> [PATHS]... [-- <ARGS>...]
+    # --no-merge is not a recognized top-level flag on this version; x.py
+    # vendor already writes a fresh vendor config by default (no merge with
+    # an existing one), so dropping it preserves the original intent.
+    (cd "$RUST_SRC" && ./x.py vendor --sync ./Cargo.toml 2>&1) \
         | tee "$vendor_log" \
-        || fail "cargo vendor failed — see $vendor_log"
+        || fail "x.py vendor failed — see $vendor_log"
 
     log "vendor populated: $(du -sh "$RUST_SRC/vendor" 2>/dev/null | awk '{print $1}')"
 }
