@@ -413,7 +413,7 @@ EOF
 do_dist() {
     log "=== dist: x.py dist --stage 2 (this will take 2-4+ hours) ==="
     [[ -d "$RUST_SRC" ]] || fail "rust source missing; run ./build.sh prepare first"
-    [[ -f "$RUST_SRC/bootstrap.toml" ]] || fail "no bootstrap.toml; run ./build.sh configure first"
+    [[ -f "$RUST_SRC/config.toml" ]] || fail "no config.toml; run ./build.sh configure first"
 
     mkdir -p "$DIST_DIR"
     local dist_log; dist_log="$(step_log dist)"
