@@ -12,25 +12,40 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Free disk space
+      - name: Show disk layout before cleanup
+        run: |
+          df -h
+          echo "---"
+          lsblk
+
+      - name: Free disk space on root volume
         run: |
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
           sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
           sudo docker image prune --all --force
           df -h
+
+      - name: Redirect build to the large /mnt volume
+        run: |
+          sudo mkdir -p /mnt/rustdroid-stage
+          sudo chown -R "$USER:$USER" /mnt/rustdroid-stage
+          echo "RUSTDROID_STAGE_PREFIX=/mnt/rustdroid-stage" >> "$GITHUB_ENV"
+          df -h /mnt
 
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build patchelf
+          sudo apt-get install -y build-essential binutils cmake ninja-build patchelf
 
       - name: Install Android NDK r27c
         run: |
           curl -L -o ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
           unzip -q ndk.zip
-          echo "ANDROID_NDK_HOME=$PWD/android-ndk-r27c" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$PWD/android-ndk-r27c" >> "$GITHUB_ENV"
 
       - name: Run toolchain build
         run: |
@@ -40,11 +55,23 @@ jobs:
       - name: Run verification
         run: |
           chmod +x ./verify.sh
-          ./verify.sh stage/dist/rust-1.85.0-aarch64-linux-android.tar.xz
+          ./verify.sh "$RUSTDROID_STAGE_PREFIX/dist/rust-1.85.0-aarch64-linux-android.tar.xz"
+
+      - name: Show disk usage after build (debugging aid)
+        if: always()
+        run: df -h
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: logs/
 
       - name: Upload toolchain artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: rustdroid-toolchain-aarch64
-          path: stage/dist/rust-1.85.0-aarch64-linux-android.tar.xz
+          path: /mnt/rustdroid-stage/dist/rust-1.85.0-aarch64-linux-android.tar.xz
           retention-days: 14
