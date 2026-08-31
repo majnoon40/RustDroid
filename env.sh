@@ -13,6 +13,10 @@
 
 set -o pipefail
 
+# Compute SCRIPT_DIR first — everything below depends on it being portable
+# across hosts (sandbox, CI runner, or a dev machine), never hardcoded.
+export SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # ----------------------------------------------------------------------------
 # 1. Package identity (baked into RPATH / interpreter strings — DO NOT CHANGE
 #    post-build without re-patching via patchelf on every produced binary).
@@ -29,7 +33,9 @@ export RUSTDROID_PREFIX="${RUSTDROID_PREFIX:-/data/data/${RUSTDROID_PACKAGE_NAME
 # doesn't accidentally get baked in. MUST equal RUSTDROID_PREFIX in the
 # final tarball — build.sh enforces this by passing --prefix=$RUSTDROID_PREFIX
 # to bootstrap.toml, while using a separate _STAGE dir for working files.
-export RUSTDROID_STAGE_PREFIX="${RUSTDROID_STAGE_PREFIX:-/home/z/my-project/scripts/rustdroid-toolchain/stage}"
+# Portable: relative to SCRIPT_DIR so it works on any host (sandbox, CI
+# runner, dev machine) instead of a hardcoded sandbox-specific path.
+export RUSTDROID_STAGE_PREFIX="${RUSTDROID_STAGE_PREFIX:-${SCRIPT_DIR}/stage}"
 
 # ----------------------------------------------------------------------------
 # 2. Pinned toolchain versions (user-locked 2026-08-31).
@@ -71,9 +77,8 @@ export NDK_SHA1_KNOWN="${NDK_SHA1_KNOWN:-f7c084ae91c80e57fbf9070d26c9c3fddc4c0b9
 #   To pin hard, set NDK_SHA1_REQUIRED=1 and re-run.
 
 # ----------------------------------------------------------------------------
-# 5. Toolchain paths (computed).
+# 5. Toolchain paths (computed). SCRIPT_DIR is set at the top of the file.
 # ----------------------------------------------------------------------------
-export SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PATCHES_DIR="${SCRIPT_DIR}/patches"
 export SHIMS_DIR="${SCRIPT_DIR}/shims"
 export LOGS_DIR="${SCRIPT_DIR}/logs"
