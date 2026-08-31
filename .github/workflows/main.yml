@@ -18,7 +18,7 @@ jobs:
           echo "---"
           lsblk
 
-      - name: Free disk space on root volume
+      - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
@@ -28,13 +28,6 @@ jobs:
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
           sudo docker image prune --all --force
           df -h
-
-      - name: Redirect build to the large /mnt volume
-        run: |
-          sudo mkdir -p /mnt/rustdroid-stage
-          sudo chown -R "$USER:$USER" /mnt/rustdroid-stage
-          echo "RUSTDROID_STAGE_PREFIX=/mnt/rustdroid-stage" >> "$GITHUB_ENV"
-          df -h /mnt
 
       - name: Install build dependencies
         run: |
@@ -52,14 +45,14 @@ jobs:
           chmod +x ./build.sh
           ./build.sh all
 
+      - name: Show disk usage mid/post-build (debugging aid)
+        if: always()
+        run: df -h
+
       - name: Run verification
         run: |
           chmod +x ./verify.sh
-          ./verify.sh "$RUSTDROID_STAGE_PREFIX/dist/rust-1.85.0-aarch64-linux-android.tar.xz"
-
-      - name: Show disk usage after build (debugging aid)
-        if: always()
-        run: df -h
+          ./verify.sh ./stage/dist/rust-1.85.0-aarch64-linux-android.tar.xz
 
       - name: Upload logs on failure
         if: failure()
@@ -73,5 +66,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rustdroid-toolchain-aarch64
-          path: /mnt/rustdroid-stage/dist/rust-1.85.0-aarch64-linux-android.tar.xz
+          path: ./stage/dist/rust-1.85.0-aarch64-linux-android.tar.xz
           retention-days: 14
