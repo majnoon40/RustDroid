@@ -85,7 +85,12 @@ debuginfo-level-tools = 0
 debuginfo-level-tests = 0
 incremental = false  # dist builds must be non-incremental
 optimize = true
-rpath = false  # we manage RPATH/RUNPATH via patchelf post-build
+rpath = true  # let rustc's build embed correct RPATH automatically.
+              # (rpath=false previously broke the build: x.py needs to run
+              # the intermediate stage1 rustc internally mid-build, which
+              # requires it to find its own librustc_driver-*.so via RPATH.
+              # The "manage via patchelf post-build" plan was never actually
+              # implemented in build.sh, so this was providing no benefit.)
 # Use libunwind-based backtraces (NOT libexecinfo â€” Bionic has no libexecinfo).
 # Rust std links libunwind automatically on aarch64-linux-android when this is true.
 backtrace = true
