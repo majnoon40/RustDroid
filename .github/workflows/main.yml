@@ -40,6 +40,22 @@ jobs:
           unzip -q ndk.zip
           echo "ANDROID_NDK_HOME=$PWD/android-ndk-r27c" >> "$GITHUB_ENV"
 
+      # Caches both LLVM build trees (host x86_64 + target aarch64-android).
+      # Keyed on the two files that actually change LLVM's build inputs —
+      # bootstrap.toml.template (LLVM config: thin-lto, targets, etc.) and
+      # build.sh (in case shim/link flags feeding into the build change).
+      # Editing anything else (e.g. this workflow file, docs) won't bust
+      # the cache. If LLVM itself finished but a later step (rustc linking,
+      # dist packaging) fails, the next run restores LLVM instantly instead
+      # of rebuilding ~2,600 + ~2,600 compile units from scratch.
+      - name: Cache LLVM build
+        uses: actions/cache@v4
+        with:
+          path: |
+            stage/rust-src/build/x86_64-unknown-linux-gnu/llvm
+            stage/rust-src/build/aarch64-linux-android/llvm
+          key: llvm-${{ hashFiles('bootstrap.toml.template', 'build.sh') }}
+
       - name: Run toolchain build
         run: |
           chmod +x ./build.sh
