@@ -89,7 +89,7 @@ export NDK_ROOT="${NDK_ROOT:-${RUSTDROID_STAGE_PREFIX}/ndk}"
 export RUST_SRC="${RUST_SRC:-${RUSTDROID_STAGE_PREFIX}/rust-src}"
 export RUSTUP_HOME="${RUSTUP_HOME:-${RUSTDROID_STAGE_PREFIX}/rustup}"
 export CARGO_HOME="${CARGO_HOME:-${RUSTDROID_STAGE_PREFIX}/cargo}"
-export DIST_DIR="${DIST_DIR:-${RUSTDROID_STAGE_PREFIX}/dist}"   # x.py dist output
+export DIST_DIR="${DIST_DIR:-${RUSTDROID_STAGE_PREFIX}/dist}"   # final staging dir — build.sh copies x.py output (stage/rust-src/build/dist) here
 export SHIM_LIB_DIR="${SHIM_LIB_DIR:-${RUSTDROID_STAGE_PREFIX}/shim-lib}"
 
 # NDK toolchain bin path (this is where aarch64-linux-android24-clang lives

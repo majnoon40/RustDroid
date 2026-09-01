@@ -447,8 +447,23 @@ do_dist() {
         | tee "$dist_log" \
         || fail "x.py dist failed — see $dist_log"
 
-    log "dist OK — artifacts in $DIST_DIR"
-    log "  run ./verify.sh $DIST_DIR to sanity-check the tarball"
+    # x.py writes tarballs to $RUST_SRC/build/dist/ — NOT to $DIST_DIR.
+    # Copy them into $DIST_DIR so verify.sh and the CI artifact-upload step
+    # actually find them. (Previously this copy was missing entirely:
+    # stage/dist/ stayed empty and verification failed with
+    # "no ELF files found" after a successful 2h+ build — CI run #16.)
+    local xpy_dist_dir="${RUST_SRC}/build/dist"
+    if [[ ! -d "$xpy_dist_dir" ]] || [[ -z "$(ls -A "$xpy_dist_dir" 2>/dev/null)" ]]; then
+        fail "x.py dist produced no artifacts at $xpy_dist_dir — see $dist_log"
+    fi
+    log "  copying artifacts: $xpy_dist_dir -> $DIST_DIR"
+    cp -a "$xpy_dist_dir"/. "$DIST_DIR"/ \
+        || fail "copying dist artifacts into $DIST_DIR failed"
+
+    log "dist OK — artifacts in $DIST_DIR:"
+    ls -la "$DIST_DIR"
+    log "  verify with: ./verify.sh ./stage/dist-extracted/  (after extracting)"
+    log "  or a single tarball: ./verify.sh $DIST_DIR/rust-std-${RUST_TAG}-aarch64-linux-android.tar.xz"
 }
 
 # ----------------------------------------------------------------------------
