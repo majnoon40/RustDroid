@@ -35,8 +35,17 @@ target = ["@RUSTDROID_HOST_TRIPLE@"]
 # Cargo features to enable on stage0 tools (used during bootstrap).
 # Leave empty unless you need a specific nightly feature.
 cargo-native-static = false
-# We do NOT enable `extended = true` here â€” the standard dist set
-# (rustc, cargo, rust-std-$triple, rust-docs, rustfmt, clippy) is enough.
+# Extended dist: REQUIRED for tool tarballs (cargo, rustfmt, clippy) to
+# appear in the dist output. Without extended = true, x.py dist only
+# produces rustc / rust-std / rustc-dev / rust-docs / rust-src tarballs.
+# CI run #16 (2026-09-01) built for 2h23m and produced NO cargo tarball
+# because extended was unset -- the RustDroid mission needs a rustc+CARGO
+# toolchain, so this must be on.
+extended = true
+# Keep the tool set lean: cargo only. Each extra tool is its own
+# cross-compile (rustfmt, clippy, rust-analyzer can be added in later
+# iterations once the base toolchain is proven on-device).
+tools = ["cargo"]
 
 # ============================================================================
 # [install] â€” where `x.py install` puts files. This is the prefix that gets

@@ -440,6 +440,12 @@ do_dist() {
     export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="${dist_rustflags# }"
     log "  CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS=$CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS"
 
+    # NDK env for build scripts of vendored C deps in extended tools
+    # (cargo links vendored openssl + curl; openssl-src's android path reads
+    # ANDROID_NDK_ROOT / ANDROID_NDK_HOME). Harmless if already set.
+    export ANDROID_NDK_ROOT="${ANDROID_NDK_ROOT:-$NDK_ROOT}"
+    export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$NDK_ROOT}"
+
     # Full stage-2 self-hosting dist build.
     # --stage 2 = build stage0 -> stage1 -> stage2, where stage2 rustc runs
     # on aarch64-linux-android (the host triple).
@@ -459,6 +465,21 @@ do_dist() {
     log "  copying artifacts: $xpy_dist_dir -> $DIST_DIR"
     cp -a "$xpy_dist_dir"/. "$DIST_DIR"/ \
         || fail "copying dist artifacts into $DIST_DIR failed"
+
+    # Bundle the NDK's libc++_shared.so alongside the tarballs.
+    # Rationale: do_dist links stage2 rustc (and any extended tools) with
+    # -lc++_shared, so those binaries carry DT_NEEDED=libc++_shared.so.
+    # Android ships no system-wide libc++, so the file MUST travel with the
+    # toolchain. On-device install: place it in $RUSTDROID_PREFIX/lib and
+    # export LD_LIBRARY_PATH=$RUSTDROID_PREFIX/lib (see README).
+    local libcxx_src="${NDK_TOOLCHAIN_BIN%/bin}/sysroot/usr/lib/${RUSTDROID_HOST_TRIPLE}/libc++_shared.so"
+    if [[ -f "$libcxx_src" ]]; then
+        cp -a "$libcxx_src" "$DIST_DIR/libc++_shared.so"
+        log "  bundled $DIST_DIR/libc++_shared.so (runtime dep of -lc++_shared-linked binaries)"
+    else
+        log "  WARN: libc++_shared.so not found at $libcxx_src"
+        log "       dist binaries linked with -lc++_shared will need it from the NDK at install time"
+    fi
 
     log "dist OK — artifacts in $DIST_DIR:"
     ls -la "$DIST_DIR"
