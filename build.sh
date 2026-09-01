@@ -146,8 +146,12 @@ do_prepare() {
         fi
     fi
     if [[ -n "$preserved_build" ]]; then
-        mkdir -p "$RUST_SRC/build"
-        mv "$preserved_build"/. "$RUST_SRC/build"/
+        # Rename the whole preserved directory into place — atomic, no
+        # per-entry moves. ($RUST_SRC/build cannot exist in a fresh clone;
+        # `mv dir/. dest/` is NOT usable here — moving the "." entry fails
+        # with "Device or resource busy", which is what killed run #19.)
+        rm -rf "$RUST_SRC/build"
+        mv "$preserved_build" "$RUST_SRC/build"
         # Ninja and cmake use MTIME dirty-checking. A fresh clone stamps
         # every source file with NOW, which is newer than the restored
         # build outputs' mtimes — ninja would then rebuild ~100% (the
