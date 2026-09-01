@@ -229,3 +229,44 @@ If you bump to a newer rust tag (e.g. 1.86.0+):
    - `libgetopts` / other small std deps assuming glibc
    - cargo's `home::cargo_home()` returning the wrong path
    - Filesystem permissions under `/data/data/<pkg>/files/`
+
+---
+
+## 5. CI phase addendum (GitHub Actions, 2026-09-01)
+
+The full build moved from a rootless sandbox to `ubuntu-latest` runners
+(workflow_dispatch, `.github/workflows/main.yml`). Facts learned from live
+runs (not theory):
+
+- **Run #16 (2h23m, main@34993fd)**: the entire stage-2 self-hosting dist
+  SUCCEEDED on a 4-vCPU/16GB runner — LLVM (host + cross-aarch64), stage1,
+  stage2 rustc, all dist tarballs. Failed only because `stage/dist/` was
+  empty: `x.py dist` writes to `stage/rust-src/build/dist/`, and `do_dist`
+  never copied. Fixed in `c2ba52e`/`4db13a2`.
+- **No cargo tarball without `extended = true`**: plain `x.py dist` yields
+  rustc/rust-std/rustc-dev/docs/src only. The original template comment
+  claiming "the standard dist set ... is enough" was wrong. Fixed with
+  `extended = true` + `tools = ["cargo"]` (`4db13a2`).
+- **`-lc++_shared` is required**: rustc's link pulls NDK libc++ symbols
+  (`std::__ndk1::*`); the default `-lstdc++` resolves to NDK's empty legacy
+  compat stub. Consequence: every dist binary carries
+  `DT_NEEDED=libc++_shared.so`, which does not exist in Android's system
+  libs — the NDK copy is bundled into `stage/dist/` and must be installed
+  to `$RUSTDROID_PREFIX/lib` with `LD_LIBRARY_PATH` exported on-device.
+- **ThinLTO off**: the runner's default C++ compiler is GCC; `-flto=thin`
+  is Clang-only (`thin-lto = false` in the template).
+- **`x.py vendor --no-merge` is not a flag on 1.85.0** — dropped.
+- **LLVM build cache**: both `build/*/llvm` trees (~2.0GB zstd) fit inside
+  the 10GB Actions cache limit; exact-key hits skip the ~1h50m LLVM build.
+  Cache key = `hashFiles(bootstrap.toml.template, build.sh)` with an
+  `llvm-` restore-key fallback so doc-only changes never bust it.
+- **The openssl-probe patch must live in `patches/post-vendor/`**: it sat
+  at the repo root and was silently never attempted (warn-not-fail).
+  Moved in `4db13a2`.
+- Sandbox blockers (no root → no cmake; 4GB RAM; 9GB disk) are all
+  irrelevant on Actions runners.
+
+Still pending on-device validation: rustc/cargo actually executing on
+Android, `LD_LIBRARY_PATH` resolution of `libc++_shared.so`,
+`RUSTDROID_PREFIX` env var read by the patched openssl-probe, and cargo's
+`home::cargo_home()` under `/data/data/dev.rustdroid.ide/files/usr`.
