@@ -420,6 +420,26 @@ do_dist() {
     log "  full log: $dist_log"
     log "  dist artifacts will land in $DIST_DIR"
 
+    # Wire the Bionic shim library and the real NDK libc++ runtime into the
+    # actual dist link step. Previously these were only linked in the
+    # do_smoke() standalone test — x.py dist itself never saw them, causing
+    # undefined-symbol linker failures:
+    #   - "undefined reference ... syncfs" — libandroid_shims.a (built by
+    #     do_shims) was compiled but never passed to this build.
+    #   - undefined std::__ndk1::* (libc++) symbols — rustc's default
+    #     "-lstdc++" resolves to NDK's empty legacy compat stub, not the
+    #     real C++ runtime. Android's actual C++ std lib is LLVM libc++,
+    #     linked via "-lc++_shared".
+    local dist_rustflags=""
+    if [[ "$RUSTDROID_ENABLE_BIONIC_SHIMS" == "1" ]]; then
+        [[ -f "$SHIM_LIB_DIR/libandroid_shims.a" ]] \
+            || fail "libandroid_shims.a not found at $SHIM_LIB_DIR; run ./build.sh shims first"
+        dist_rustflags+=" -Clink-arg=-L${SHIM_LIB_DIR} -Clink-arg=-landroid_shims"
+    fi
+    dist_rustflags+=" -Clink-arg=-lc++_shared"
+    export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="${dist_rustflags# }"
+    log "  CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS=$CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS"
+
     # Full stage-2 self-hosting dist build.
     # --stage 2 = build stage0 -> stage1 -> stage2, where stage2 rustc runs
     # on aarch64-linux-android (the host triple).
