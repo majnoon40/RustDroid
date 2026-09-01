@@ -65,10 +65,13 @@ jobs:
         if: always()
         run: df -h
 
+      - name: List dist output
+        run: ls -la ./stage/dist/
+
       - name: Run verification
         run: |
           chmod +x ./verify.sh
-          ./verify.sh ./stage/dist/rust-1.85.0-aarch64-linux-android.tar.xz
+          ./verify.sh ./stage/dist/
 
       - name: Upload logs on failure
         if: failure()
@@ -82,5 +85,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rustdroid-toolchain-aarch64
-          path: ./stage/dist/rust-1.85.0-aarch64-linux-android.tar.xz
+          path: ./stage/dist/
           retention-days: 14
+
