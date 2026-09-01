@@ -32,9 +32,17 @@ host = ["@RUSTDROID_HOST_TRIPLE@"]
 # 32-bit ARM support) later.
 target = ["@RUSTDROID_HOST_TRIPLE@"]
 
-# Cargo features to enable on stage0 tools (used during bootstrap).
-# Leave empty unless you need a specific nightly feature.
-cargo-native-static = false
+# Statically link cargo's native deps (openssl, curl, libgit2, zlib) from
+# the vendored sources. In bootstrap (tool.rs, prepare_tool_cargo), this
+# gate pushes the "all-static" feature onto every cargo tool build, which
+# includes "vendored-openssl" -> openssl-src builds OpenSSL 1.1.1w from
+# the vendored source with our NDK clang. Without it, cargo's openssl-sys
+# runs find_normal.rs and panics ("Could not find directory of OpenSSL
+# installation") when cross-compiling to aarch64-linux-android, because
+# there is no system OpenSSL for that target (CI run #18, 2026-09-01).
+# This is also the right posture for RustDroid: a standalone toolchain
+# must not depend on build-host OpenSSL at all.
+cargo-native-static = true
 # Extended dist: REQUIRED for tool tarballs (cargo, rustfmt, clippy) to
 # appear in the dist output. Without extended = true, x.py dist only
 # produces rustc / rust-std / rustc-dev / rust-docs / rust-src tarballs.

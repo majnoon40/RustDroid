@@ -1,59 +1,52 @@
-From: RustDroid <dev@rustdroid.ide>
-Date: 2026-08-31
-Subject: [PATCH 1/3] openssl-probe: parameterize fallback prefix via RUSTDROID_PREFIX
-
-The vendored `openssl-probe` crate probes a fixed list of system lib
-paths when looking for libssl/libcrypto. Termux's adaptation adds a
-hardcoded `/data/data/com.termux/files/usr/lib` entry to that list.
-
-For RustDroid we cannot hardcode our package name — it must remain
-configurable at runtime so the same toolchain tarball can be relocated
-post-install (e.g. via patchelf --set-rpath + a wrapper script that
-exports RUSTDROID_PREFIX).
-
-This patch:
-  1. Adds RUSTDROID_PREFIX (env var) as the *first* probed path, before
-     the static fallback list. This means the on-device prefix always
-     wins when set, which is what we want.
-  2. Removes the hardcoded Termux path from the static fallback list
-     (if present in the vendored version we're patching).
-  3. Falls back to the static list if RUSTDROID_PREFIX is unset, so
-     non-Android hosts still work.
-
-Verified: applied to rust-lang/rust@1.85.0 vendor/openssl-probe/src/lib.rs
-Theoretical: actual runtime behavior under on-device cargo build — must
-be validated by running `cargo build` of an openssl-dep crate on-device
-with RUSTDROID_PREFIX exported.
----
- vendor/openssl-probe/src/lib.rs | 16 ++++++++++++++++
- 1 file changed, 16 insertions(+)
-
 diff --git a/vendor/openssl-probe/src/lib.rs b/vendor/openssl-probe/src/lib.rs
+index 0db12a7..e8de363 100644
 --- a/vendor/openssl-probe/src/lib.rs
 +++ b/vendor/openssl-probe/src/lib.rs
-@@ -1,4 +1,5 @@
- use std::path::PathBuf;
-+use std::env;
-
- pub trait ForeignLib {
-     fn probe_ssl(&self) -> Result<(PathBuf, PathBuf), Error>;
-@@ -65,6 +66,16 @@
- /// Probe for the OpenSSL library in a number of standard locations.
- pub fn probe_ssl() -> Result<(PathBuf, PathBuf), Error> {
-     let mut candidates = Vec::new();
+@@ -17,13 +17,13 @@ pub struct ProbeResult {
+ ///
+ /// This will only search known system locations.
+ pub fn find_certs_dirs() -> Vec<PathBuf> {
+-    cert_dirs_iter().map(Path::to_path_buf).collect()
++    cert_dirs_iter()
+ }
+ 
+ // TODO: when we bump to 0.2, make this the `find_certs_dirs` function
+-fn cert_dirs_iter() -> impl Iterator<Item = &'static Path> {
++fn cert_dirs_iter() -> Vec<PathBuf> {
+     // see http://gagravarr.org/writing/openssl-certs/others.shtml
+-    [
++    let mut dirs: Vec<PathBuf> = [
+         "/var/ssl",
+         "/usr/share/ssl",
+         "/usr/local/ssl",
+@@ -38,10 +38,28 @@ fn cert_dirs_iter() -> impl Iterator<Item = &'static Path> {
+         "/etc/ssl",
+         "/etc/certs",
+         "/opt/etc/ssl", // Entware
+-        "/data/data/com.termux/files/usr/etc/tls",
+         "/boot/system/data/ssl",
+     ]
+-    .iter().map(Path::new).filter(|p| p.exists())
++    .iter()
++    .map(Path::new)
++    .filter(|p| p.exists())
++    .map(|p| p.to_path_buf())
++    .collect();
 +
-+    // RustDroid: prepend $RUSTDROID_PREFIX/lib (if set) so the on-device
-+    // toolchain prefix wins over system fallbacks. This lets the same
-+    // dist tarball work for any package name without rebuilding.
-+    if let Ok(prefix) = env::var("RUSTDROID_PREFIX") {
-+        let p = PathBuf::from(prefix).join("lib");
-+        candidates.push(p.clone());
-+        candidates.push(p.join("openssl"));
++    // RustDroid: probe the app-controlled prefix (RUSTDROID_PREFIX env var)
++    // FIRST — before the static fallback list — so the on-device prefix
++    // always wins when it is set and populated. Falls through to the static
++    // list when unset (non-Android hosts keep working unchanged).
++    if let Some(prefix) = env::var_os("RUSTDROID_PREFIX") {
++        let prefix = PathBuf::from(prefix);
++        for sub in ["etc/tls", "etc/ssl", "etc"] {
++            let dir = prefix.join(sub);
++            if dir.exists() && !dirs.contains(&dir) {
++                dirs.insert(0, dir);
++            }
++        }
 +    }
-+
-     candidates.extend(EXPLICIT_OPENSSL_LIB_DIRS.iter().cloned());
-
-     // ... existing probe logic follows below
---
-2.43.0
-
++    dirs
+ }
+ 
+ /// Probe for SSL certificates on the system, then configure the SSL certificate `SSL_CERT_FILE`

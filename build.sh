@@ -117,6 +117,20 @@ do_prepare() {
     log "NDK ready at $NDK_ROOT"
 
     # 1c. rust-lang/rust source (shallow clone of tag).
+    #
+    # CRITICAL (CI cache): if a CI cache was restored into
+    # $RUST_SRC/build/ (actions/cache restores only the build trees, not
+    # .git), the re-clone below would `rm -rf $RUST_SRC` and DESTROY the
+    # restored trees — that is exactly why run #18 restored a 2GB LLVM
+    # cache and then rebuilt LLVM from scratch for 2h6m anyway. Move the
+    # restored trees aside, clone, then re-attach them.
+    local preserved_build=""
+    if [[ -d "$RUST_SRC/build" && ! -d "$RUST_SRC/.git" ]]; then
+        preserved_build="${RUSTDROID_STAGE_PREFIX}/_preserved_build"
+        log "preserving CI-restored build trees across clone..."
+        rm -rf "$preserved_build"
+        mv "$RUST_SRC/build" "$preserved_build"
+    fi
     if [[ ! -d "$RUST_SRC/.git" ]] || needs_force "$1"; then
         log "cloning rust-lang/rust @ $RUST_TAG (shallow)..."
         rm -rf "$RUST_SRC"
@@ -130,6 +144,17 @@ do_prepare() {
             (cd "$RUST_SRC" && git submodule update --init --depth 1 --recommend-shallow) 2>&1 \
                 | tee "$(step_log submodules)" || log "WARN: submodule update failed (may be OK for smoke)"
         fi
+    fi
+    if [[ -n "$preserved_build" ]]; then
+        mkdir -p "$RUST_SRC/build"
+        mv "$preserved_build"/. "$RUST_SRC/build"/
+        # Ninja and cmake use MTIME dirty-checking. A fresh clone stamps
+        # every source file with NOW, which is newer than the restored
+        # build outputs' mtimes — ninja would then rebuild ~100% (the
+        # cache would be restored but useless). Touch every restored file
+        # so the outputs sort as up-to-date relative to the fresh sources.
+        find "$RUST_SRC/build" -exec touch -c {} + 2>/dev/null || true
+        log "CI build trees re-attached under $RUST_SRC/build (touched for ninja freshness)"
     fi
     log "rust source ready at $RUST_SRC"
 }
@@ -146,9 +171,22 @@ do_symlinks() {
     # NDK r27c ships unified clang at $bin/clang with no triple prefix.
     # Rust's build system looks for ${triple}${api}-clang via PATH lookup
     # when invoked with --target=...; we create symlinks.
+    #
+    # NOTE: the NON-suffixed names (aarch64-linux-android-clang etc.) are
+    # ALSO required: the `cc` crate's default compiler for the
+    # aarch64-linux-android target is exactly "aarch64-linux-android-clang"
+    # (no API suffix). Build scripts of vendored C deps (openssl-src,
+    # libz-sys, curl-sys) look that name up on PATH — run #18 logged
+    # "ToolNotFound: Failed to find tool. Is `aarch64-linux-android-clang`
+    # installed?" warnings because only the suffixed symlinks existed.
+    # cc-rs passes --target=aarch64-linux-android to clang itself, so the
+    # API-less symlink still produces Android binaries (default min API 21,
+    # below our API 24 floor — compatible).
     local link_names=(
         "aarch64-linux-android${api}-clang"
         "aarch64-linux-android${api}-clang++"
+        "aarch64-linux-android-clang"
+        "aarch64-linux-android-clang++"
         "aarch64-linux-android-ar"
         "aarch64-linux-android-ranlib"
         "aarch64-linux-android-nm"
@@ -159,6 +197,8 @@ do_symlinks() {
     local source_files=(
         "clang"        # -> aarch64-linux-android24-clang
         "clang++"      # -> aarch64-linux-android24-clang++
+        "clang"        # -> aarch64-linux-android-clang (cc crate default)
+        "clang++"      # -> aarch64-linux-android-clang++ (cc crate default)
         "llvm-ar"      # -> aarch64-linux-android-ar
         "llvm-ranlib"  # -> aarch64-linux-android-ranlib
         "llvm-nm"      # -> aarch64-linux-android-nm
