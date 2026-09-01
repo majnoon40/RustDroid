@@ -69,10 +69,27 @@ jobs:
       - name: List dist output
         run: ls -la ./stage/dist/
 
+      - name: Extract dist tarballs for verification
+        run: |
+          mkdir -p ./stage/dist-extracted
+          shopt -s nullglob
+          found_any=0
+          for f in ./stage/dist/*.tar.xz ./stage/dist/*.tar.gz; do
+            [[ -e "$f" ]] || continue
+            found_any=1
+            echo "Extracting $f"
+            tar -xf "$f" -C ./stage/dist-extracted
+          done
+          if [[ "$found_any" -eq 0 ]]; then
+            echo "No .tar.xz/.tar.gz files found in ./stage/dist/ — see 'List dist output' step above"
+            exit 1
+          fi
+          find ./stage/dist-extracted -type f | head -20
+
       - name: Run verification
         run: |
           chmod +x ./verify.sh
-          ./verify.sh ./stage/dist/
+          ./verify.sh ./stage/dist-extracted/
 
       - name: Save LLVM build cache
         if: always() && steps.llvm-cache.outputs.cache-hit != 'true'
