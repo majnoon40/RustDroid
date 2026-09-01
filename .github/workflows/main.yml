@@ -48,8 +48,9 @@ jobs:
       # the cache. If LLVM itself finished but a later step (rustc linking,
       # dist packaging) fails, the next run restores LLVM instantly instead
       # of rebuilding ~2,600 + ~2,600 compile units from scratch.
-      - name: Cache LLVM build
-        uses: actions/cache@v4
+      - name: Restore LLVM build cache
+        id: llvm-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             stage/rust-src/build/x86_64-unknown-linux-gnu/llvm
@@ -73,6 +74,15 @@ jobs:
           chmod +x ./verify.sh
           ./verify.sh ./stage/dist/
 
+      - name: Save LLVM build cache
+        if: always() && steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            stage/rust-src/build/x86_64-unknown-linux-gnu/llvm
+            stage/rust-src/build/aarch64-linux-android/llvm
+          key: llvm-${{ hashFiles('bootstrap.toml.template', 'build.sh') }}
+
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -87,4 +97,3 @@ jobs:
           name: rustdroid-toolchain-aarch64
           path: ./stage/dist/
           retention-days: 14
-
