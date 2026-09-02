@@ -18,7 +18,7 @@ class ConsoleBuffer(private val capacity: Int = 2000) {
     private val _lines = MutableStateFlow<List<ConsoleLine>>(emptyList())
     val lines: StateFlow<List<ConsoleLine>> = _lines.asStateFlow()
 
-    private _newLines = MutableSharedFlow<ConsoleLine>(extraBufferCapacity = 256)
+    private val _newLines = MutableSharedFlow<ConsoleLine>(extraBufferCapacity = 256)
     val newLines: SharedFlow<ConsoleLine> = _newLines.asSharedFlow()
 
     @Volatile var droppedOverflow: Int = 0

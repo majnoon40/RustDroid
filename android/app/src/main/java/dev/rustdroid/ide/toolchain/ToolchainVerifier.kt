@@ -170,7 +170,11 @@ class ToolchainVerifier(
             val runResult = kotlinx.coroutines.runBlocking {
                 runner.run(
                     listOf("./hello"), cwd = scratch, env = env,
-                ) { line -> if (runOut.isNotEmpty()) runOut.append('\n'); runOut.append(line.text) }
+                    onLine = { line ->
+                        if (runOut.isNotEmpty()) runOut.append('\n')
+                        runOut.append(line.text)
+                    },
+                )
             }
             when {
                 !runResult.success -> "hello exited ${runResult.exitCode}"

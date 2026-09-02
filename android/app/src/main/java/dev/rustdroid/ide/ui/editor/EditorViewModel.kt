@@ -102,12 +102,14 @@ class EditorViewModel(
             return
         }
         val file = File(projectDir, relativePath)
-        try {
-            val text = withContext(Dispatchers.IO) { repo.readFile(file) }
-            _tabs.value = _tabs.value + EditorTab(relativePath, file, text)
-            setActive(_tabs.value.size - 1)
-        } catch (e: IOException) {
-            console.system("cannot open $relativePath: ${e.message}")
+        viewModelScope.launch {
+            try {
+                val text = withContext(Dispatchers.IO) { repo.readFile(file) }
+                _tabs.value = _tabs.value + EditorTab(relativePath, file, text)
+                setActive(_tabs.value.size - 1)
+            } catch (e: IOException) {
+                console.system("cannot open $relativePath: ${e.message}")
+            }
         }
     }
 
@@ -219,15 +221,18 @@ class EditorViewModel(
             console.clear()
             console.system("\$ ${command.joinToString(" ")}")
             try {
-                val result = runner.run(command, cwd = projectDir, env = env, stdin = stdinPipe) { line ->
-                    console.append(line)
-                    if (line.stream == dev.rustdroid.ide.model.Stream.STDERR) {
-                        parser.feed(line.text)
-                        if (parser.errorCount() + parser.warningCount() > 0) {
-                            _problems.value = parser.snapshot()
+                val result = runner.run(
+                    command, cwd = projectDir, env = env, stdin = stdinPipe,
+                    onLine = { line ->
+                        console.append(line)
+                        if (line.stream == dev.rustdroid.ide.model.Stream.STDERR) {
+                            parser.feed(line.text)
+                            if (parser.errorCount() + parser.warningCount() > 0) {
+                                _problems.value = parser.snapshot()
+                            }
                         }
-                    }
-                }
+                    },
+                )
                 _lastResult.value = result
                 console.system(
                     if (result.cancelled) "(terminated)"

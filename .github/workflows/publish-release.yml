@@ -47,8 +47,18 @@ jobs:
           echo "HEAD_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
           echo "RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
 
-          gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/artifacts" > arts.json
-          ART_ID=$(jq -r '.artifacts[] | select(.name=="rustdroid-toolchain-aarch64") | .id' | head -1)
+          gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/artifacts" > arts.json || true
+          echo "--- run artifacts (total_count / names):"
+          jq -r '.total_count // "no-total", (.artifacts[]?.name // empty)' arts.json || true
+
+          ART_ID=$(jq -r '.artifacts[]? | select(.name=="rustdroid-toolchain-aarch64") | .id' arts.json | head -1)
+          if [ -z "$ART_ID" ] || [ "$ART_ID" = "null" ]; then
+            # fallback: repo-wide artifact listing filtered by run id
+            echo "--- run-scoped listing empty; trying repo-wide listing"
+            gh api "repos/${{ github.repository }}/actions/artifacts?per_page=100" > all-arts.json || true
+            jq -r '.artifacts[]? | select(.workflow_run.id=='"$RUN_ID"') | .name' all-arts.json || true
+            ART_ID=$(jq -r '.artifacts[]? | select(.workflow_run.id=='"$RUN_ID"') | select(.name=="rustdroid-toolchain-aarch64") | .id' all-arts.json | head -1)
+          fi
           if [ -z "$ART_ID" ] || [ "$ART_ID" = "null" ]; then
             echo "no rustdroid-toolchain-aarch64 artifact in run $RUN_ID"; exit 1
           fi

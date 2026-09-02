@@ -26,6 +26,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
@@ -220,14 +221,14 @@ private fun FailedCard(state: ToolchainState.Failed, onRetry: () -> Unit, onImpo
 
 @Composable
 private fun LogTail(manager: dev.rustdroid.ide.toolchain.ToolchainManager) {
-    val log = remember(manager) { manager.logTail }
+    val log = manager.logTail
     if (log.isEmpty()) return
     Card {
         Column(Modifier.padding(12.dp)) {
             Text("log", style = MaterialTheme.typography.labelSmall)
-            log.takeLast(8).forEach {
+            for (line in log.takeLast(8)) {
                 Text(
-                    it,
+                    line,
                     style = MaterialTheme.typography.bodySmall,
                     fontFamily = FontFamily.Monospace,
                     maxLines = 3,

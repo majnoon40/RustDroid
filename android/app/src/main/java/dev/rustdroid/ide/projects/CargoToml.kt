@@ -23,7 +23,7 @@ object CargoToml {
         val result: TomlParseResult = Toml.parse(tomlFile.toPath())
         if (result.hasErrors()) {
             throw IOException("Cargo.toml parse errors: " +
-                result.errors().joinToString("; ") { it.message })
+                result.errors().joinToString("; ") { it.message ?: "parse error" })
         }
         val table = result.getTable("dependencies") ?: return emptyList()
         return table.keySet()
@@ -68,7 +68,7 @@ object CargoToml {
         } else {
             val next = nextSectionStart(lines, depIdx)
             // replace existing entry?
-            val existing = (depIdx + 1 until next).indexOfFirst { depSpec.matches(lines[it]) }
+            val existing = (depIdx + 1 until next).indexOfFirst { depSpec.containsMatchIn(lines[it]) }
             if (existing >= 0) {
                 lines[depIdx + 1 + existing] = line
             } else {
@@ -88,7 +88,7 @@ object CargoToml {
         val depIdx = sectionHeaderIndex(lines, "dependencies") ?: return false
         val next = nextSectionStart(lines, depIdx)
         val depSpec = Regex("^\\s*\"?${Regex.escape(name)}\"?\\s*=")
-        val idx = (depIdx + 1 until next).indexOfFirst { depSpec.matches(lines[it]) }
+        val idx = (depIdx + 1 until next).indexOfFirst { depSpec.containsMatchIn(lines[it]) }
         if (idx < 0) return false
         lines.removeAt(depIdx + 1 + idx)
         tomlFile.writeText(lines.joinToString("\n") + "\n")

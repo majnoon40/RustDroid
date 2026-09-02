@@ -5,11 +5,12 @@ import dev.rustdroid.ide.util.Fs
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.apache.commons.compress.archivers.zip.ZipArchiveEntry
-import org.apache.commons.compress.archivers.zip.ZipFile
+import org.apache.commons.compress.archivers.zip.ZipArchiveInputStream
 import org.apache.commons.compress.compressors.xz.XZCompressorInputStream
 import java.io.BufferedInputStream
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
 import java.nio.file.Files
 
 /**
@@ -18,87 +19,15 @@ import java.nio.file.Files
  *   tarballs (rustc/cargo/rust-std) -> strip <tarball>/<component>/ dirs
  *                                       into the prefix (modes preserved)
  *   libc++_shared.so                 -> $PREFIX/lib/
- *   rustdroid-link/**                -> $PREFIX/lib/rustdroid-link/
+ *   rustdroid-link contents          -> $PREFIX/lib/rustdroid-link/
  *   rustdroid-link/bin/{cc,clang,gcc}-> $PREFIX/bin/ (chmod 755)
  *
- * Zip-slip guarded, fails loud on layout drift. Pure JVM — unit-tested.
+ * Single streaming pass (zip -> tar.xz -> files), zip-slip guarded,
+ * fails loud on layout drift. Pure JVM — unit-tested.
  */
 class ArtifactExtractor(
     private val paths: ToolchainPaths,
 ) {
-    /** Progress callback: (filesWritten, estimatedTotal or null). */
-    fun install(zip: File, onProgress: (Int, Int?) -> Unit = { _, _ -> }): BundleManifestData {
-        val prefix = paths.prefix
-        prefix.mkdirs()
-
-        ZipFile.builder().setFile(zip).setReadOnly(true).get().use { zf ->
-            val manifest = readManifest(zf) ?: error(
-                "bundle manifest ${ToolchainDistro.MANIFEST_ENTRY} missing — layout drift?"
-            )
-
-            // 1. dist tarballs -> flatten into prefix
-            val tarballs = listOf(
-                "rustc-${ToolchainDistro.RUST_VERSION}-aarch64-linux-android.tar.xz",
-                "cargo-${ToolchainDistro.RUST_VERSION}-aarch64-linux-android.tar.xz",
-                "rust-std-${ToolchainDistro.RUST_VERSION}-aarch64-linux-android.tar.xz",
-            )
-            for (name in tarballs) {
-                val entry = zf.getEntry(name) ?: error("bundle missing $name")
-                extractTarball(zf.getInputStream(entry), prefix, name)
-            }
-
-            onProgress(1, null)
-
-            // 2. libc++_shared.so -> prefix/lib/
-            copyZipEntry(zf, "libc++_shared.so", File(prefix, "lib/libc++_shared.so"), 0b110_100_100)
-
-            // 3. rustdroid-link/** -> prefix/lib/rustdroid-link/
-            val kitDest = File(prefix, "lib/rustdroid-link")
-            var kitEntries = 0
-            for (entry in zf.entries) {
-                val name = entry.name
-                if (!name.startsWith("rustdroid-link/")) continue
-                val rel = name.removePrefix("rustdroid-link/").trimEnd('/')
-                if (rel.isEmpty()) continue
-                val dest = Fs.resolveChild(kitDest, rel)
-                if (entry.isDirectory) {
-                    dest.mkdirs()
-                } else {
-                    dest.parentFile?.mkdirs()
-                    zf.getInputStream(entry).use { input ->
-                        dest.outputStream().use { output -> input.copyTo(output) }
-                    }
-                    val mode = unixMode(entry)
-                    Fs.applyPosixMode(dest, if (mode != 0) mode else 0b110_100_100)
-                    kitEntries++
-                }
-            }
-            if (kitEntries == 0) error("bundle has no rustdroid-link/ kit folder")
-
-            // 4. shims -> prefix/bin (the cc shim is rustc's default linker)
-            for (shim in listOf("cc", "clang", "gcc")) {
-                val src = File(kitDest, "bin/$shim")
-                if (!src.isFile) error("kit missing bin/$shim (linker driver)")
-                val dest = File(prefix, "bin/$shim")
-                dest.parentFile.mkdirs()
-                src.copyTo(dest, overwrite = true)
-                dest.setExecutable(true, false)
-            }
-
-            // 5. sanity: the load-bearing binaries must exist
-            for (must in listOf("bin/rustc", "bin/cargo", "lib/rustdroid-link/crtbegin_dynamic.o")) {
-                if (!File(prefix, must).isFile) error("install incomplete: $must missing")
-            }
-
-            return BundleManifestData(
-                rustVersion = manifest.rust_version.ifEmpty { ToolchainDistro.RUST_VERSION },
-                sourceRun = manifest.source_run,
-                sourceCommit = manifest.source_commit,
-                kitEntryCount = kitEntries,
-            )
-        }
-    }
-
     data class BundleManifestData(
         val rustVersion: String,
         val sourceRun: Long,
@@ -106,18 +35,115 @@ class ArtifactExtractor(
         val kitEntryCount: Int,
     )
 
-    private fun readManifest(zf: ZipFile): dev.rustdroid.ide.model.BundleManifest? =
-        zf.getEntry(ToolchainDistro.MANIFEST_ENTRY)?.let { e ->
-            zf.getInputStream(e).bufferedReader().use { r -> parseBundleManifest(r.readText()) }
+    /** Progress callback: (filesWritten, estimatedTotal or null). */
+    fun install(zip: File, onProgress: (Int, Int?) -> Unit = { _, _ -> }): BundleManifestData {
+        val prefix = paths.prefix
+        prefix.mkdirs()
+
+        var manifest: dev.rustdroid.ide.model.BundleManifest? = null
+        var libcxxDone = false
+        var kitEntries = 0
+        val kitDest = File(prefix, "lib/rustdroid-link")
+
+        ZipArchiveInputStream(BufferedInputStream(zip.inputStream(), 1 shl 16)).use { zis ->
+            while (true) {
+                val entry: ZipArchiveEntry = zis.nextZipEntry ?: break
+                val name = entry.name
+                when {
+                    name == ToolchainDistro.MANIFEST_ENTRY -> {
+                        manifest = parseBundleManifest(zis.readBytes().decodeToString())
+                    }
+
+                    name == "libc++_shared.so" -> {
+                        val dest = File(prefix, "lib/libc++_shared.so")
+                        dest.parentFile?.mkdirs()
+                        zis.copyToFile(dest)
+                        Fs.applyPosixMode(dest, 0b110_100_100)
+                        libcxxDone = true
+                    }
+
+                    name.endsWith(".tar.xz") -> {
+                        val top = name.substringBefore('/')
+                        if (top in DIST_TARBALLS) {
+                            extractTarball(zis, prefix, name)
+                        } else {
+                            // unexpected tarball (e.g. full-dist docs) — skip
+                            zis.skipFully()
+                        }
+                    }
+
+                    name.startsWith("rustdroid-link/") -> {
+                        val rel = name.removePrefix("rustdroid-link/").trimEnd('/')
+                        if (rel.isNotEmpty()) {
+                            val dest = Fs.resolveChild(kitDest, rel)
+                            if (entry.isDirectory) {
+                                dest.mkdirs()
+                            } else {
+                                dest.parentFile?.mkdirs()
+                                zis.copyToFile(dest)
+                                // kit bin/ members are the linker-driver shims:
+                                // executable, exactly as CI packs them
+                                val mode = if (rel.startsWith("bin/")) 0b111_101_101 else 0b110_100_100
+                                Fs.applyPosixMode(dest, mode)
+                                kitEntries++
+                            }
+                        }
+                    }
+
+                    else -> {
+                        // unknown entry (README etc.) — skip data
+                        zis.skipFully()
+                    }
+                }
+            }
         }
 
+        val m = manifest ?: error(
+            "bundle manifest ${ToolchainDistro.MANIFEST_ENTRY} missing — layout drift?"
+        )
+        if (!libcxxDone) error("bundle missing libc++_shared.so (runtime dep of rustc/cargo)")
+        if (kitEntries == 0) error("bundle has no rustdroid-link/ kit folder")
+
+        // The cc shim is rustc's default linker: copy kit shims into prefix/bin
+        for (shim in listOf("cc", "clang", "gcc")) {
+            val src = File(kitDest, "bin/$shim")
+            if (!src.isFile) error("kit missing bin/$shim (linker driver)")
+            val dest = File(prefix, "bin/$shim")
+            dest.parentFile?.mkdirs()
+            src.copyTo(dest, overwrite = true)
+            dest.setExecutable(true, false)
+        }
+
+        // Load-bearing sanity: fail loud before the verifier even runs
+        for (must in listOf("bin/rustc", "bin/cargo", "lib/rustdroid-link/crtbegin_dynamic.o")) {
+            if (!File(prefix, must).isFile) error("install incomplete: $must missing")
+        }
+        onProgress(1, null)
+
+        return BundleManifestData(
+            rustVersion = m.rust_version.ifEmpty { ToolchainDistro.RUST_VERSION },
+            sourceRun = m.source_run,
+            sourceCommit = m.source_commit,
+            kitEntryCount = kitEntries,
+        )
+    }
+
+    private val DIST_TARBALLS = setOf(
+        "rustc-${ToolchainDistro.RUST_VERSION}-aarch64-linux-android.tar.xz",
+        "cargo-${ToolchainDistro.RUST_VERSION}-aarch64-linux-android.tar.xz",
+        "rust-std-${ToolchainDistro.RUST_VERSION}-aarch64-linux-android.tar.xz",
+    )
+
     /**
-     * Streams one dist tarball: every entry is `<topdir>/<component>/rest...`.
-     * We strip the two leading segments (install.sh & friends at depth 1 are
-     * dropped automatically) and preserve tar mode bits.
+     * Streams one dist tarball: every payload entry is
+     * `<topdir>/<component>/rest...`. We strip the two leading segments
+     * (install.sh & friends at depth 1 are dropped automatically) and
+     * preserve tar mode bits.
      */
-    private fun extractTarball(input: java.io.InputStream, prefix: File, label: String) {
-        val tar = TarArchiveInputStream(XZCompressorInputStream(BufferedInputStream(input, 1 shl 16)))
+    private fun extractTarball(input: InputStream, prefix: File, label: String) {
+        val tar = TarArchiveInputStream(
+            XZCompressorInputStream(BufferedInputStream(input, 1 shl 16))
+        )
         var top: String? = null
         var entries = 0
         while (true) {
@@ -127,9 +153,8 @@ class ArtifactExtractor(
             val segments = name.split('/')
             if (top == null) {
                 top = segments[0]
-                require(top.isNotEmpty()) { "bad first entry in $label: '${e.name}'" }
             }
-            if (segments.size < 3) continue // top-level metadata (install.sh, components…)
+            if (segments.size < 3) continue // top-level metadata (install.sh…)
             if (segments[0] != top) {
                 throw IOException("$label: unexpected second root '${segments[0]}'")
             }
@@ -140,20 +165,18 @@ class ArtifactExtractor(
             } else if (e.isLink) {
                 dest.parentFile?.mkdirs()
                 val target = Fs.resolveChild(prefix, e.linkName.trimStart('/'))
-                if (target.isFile) target.copyTo(dest, overwrite = true) else dest.writeBytes("")
+                if (target.isFile) target.copyTo(dest, overwrite = true)
                 Fs.applyPosixMode(dest, e.mode)
             } else if (e.isSymbolicLink) {
                 dest.parentFile?.mkdirs()
-                runCatching {
+                val ok = runCatching {
                     Files.deleteIfExists(dest.toPath())
                     Files.createSymbolicLink(dest.toPath(), java.nio.file.Paths.get(e.linkName))
-                }.onFailure {
-                    // fall back to a regular empty file; verifier will judge
-                    dest.writeBytes("")
                 }
+                if (ok.isFailure) dest.writeText("")
             } else {
                 dest.parentFile?.mkdirs()
-                dest.outputStream().use { out -> tar.copyTo(out, 1 shl 14) }
+                tar.copyToFile(dest)
                 Fs.applyPosixMode(dest, e.mode)
             }
             entries++
@@ -161,17 +184,17 @@ class ArtifactExtractor(
         if (entries == 0) throw IOException("$label: no payload entries found")
     }
 
-    private fun copyZipEntry(zf: ZipFile, name: String, dest: File, mode: Int) {
-        val entry = zf.getEntry(name) ?: error("bundle missing $name")
-        dest.parentFile?.mkdirs()
-        zf.getInputStream(entry).use { input ->
-            dest.outputStream().use { output -> input.copyTo(output) }
-        }
-        Fs.applyPosixMode(dest, unixMode(entry).takeIf { it != 0 } ?: mode)
+    /** Copies the CURRENT zip entry's data to [dest]. */
+    private fun java.io.InputStream.copyToFile(dest: File) {
+        dest.outputStream().use { out -> this.copyTo(out, 1 shl 14) }
     }
 
-    private fun unixMode(entry: ZipArchiveEntry): Int {
-        // unix perms live in the upper 16 bits of external attributes
-        return (entry.externalAttributes shr 16) and 0xFFF
+    /** Drains the current zip entry. */
+    private fun ZipArchiveInputStream.skipFully() {
+        val buf = ByteArray(1 shl 14)
+        while (true) {
+            val n = this.read(buf)
+            if (n < 0) break
+        }
     }
 }

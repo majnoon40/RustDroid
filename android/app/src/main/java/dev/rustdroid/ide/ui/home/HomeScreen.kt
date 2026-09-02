@@ -17,7 +17,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.Folder
+
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
@@ -47,6 +47,7 @@ import dev.rustdroid.ide.di.AppContainer
 import dev.rustdroid.ide.model.ProjectSummary
 import dev.rustdroid.ide.ui.components.ConfirmDialog
 import dev.rustdroid.ide.ui.components.EmptyState
+import dev.rustdroid.ide.ui.components.RdIcons
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -94,7 +95,7 @@ fun HomeScreen(
         if (projects.isEmpty()) {
             Box(Modifier.fillMaxSize().padding(padding)) {
                 EmptyState(
-                    icon = Icons.Filled.Folder,
+                    icon = RdIcons.Folder,
                     title = "No cargo projects yet",
                     subtitle = "Create one with cargo new — it compiles and runs right on this device.",
                 )

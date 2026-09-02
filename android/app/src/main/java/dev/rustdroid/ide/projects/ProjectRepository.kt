@@ -65,7 +65,8 @@ class ProjectRepository(
                 listOf("cargo", "new", if (isLib) "--lib" else "--bin", name),
                 cwd = projectsRoot,
                 env = envProvider(),
-            ) { line -> onLine(line.text) }
+                onLine = { line -> onLine(line.text) },
+            )
             if (!result.success || !File(dir, "Cargo.toml").isFile) {
                 Fs.deleteRecursively(dir)
                 throw IOException("cargo new failed (exit ${result.exitCode})")

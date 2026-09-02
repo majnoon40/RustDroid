@@ -6,7 +6,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import dev.rustdroid.ide.di.AppContainer
 import dev.rustdroid.ide.model.ProjectSummary
-import dev.rustdroid.ide.runtime.Stream
+
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow

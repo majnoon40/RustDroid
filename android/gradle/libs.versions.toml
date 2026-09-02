@@ -13,7 +13,7 @@ kotlinx-serialization-json = "1.7.3"
 sora-editor = "0.23.6"
 commons-compress = "1.27.1"
 xz = "1.10"
-tomlj = "3.1.0"
+tomlj = "1.1.1"
 junit = "4.13.2"
 
 [libraries]

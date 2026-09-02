@@ -28,10 +28,13 @@ class ArtifactExtractorTest {
         val bytes = java.io.ByteArrayOutputStream()
         TarArchiveOutputStream(XZCompressorOutputStream(bytes)).use { tar ->
             for ((name, content) in entries) {
+                tar.setLongFileMode(TarArchiveOutputStream.LONGFILE_POSIX)
                 val e = TarArchiveEntry(name)
-                e.mode = if (name.startsWith("top/") && name.count { it == '/' } >= 2) {
-                    if (name.endsWith("bin/rustc") || name.endsWith("bin/cargo")) 0b111_101_101 else 0b110_100_100
-                } else 0b110_100_100
+                e.mode = if (name.endsWith("bin/rustc") || name.endsWith("bin/cargo")) {
+                    0b111_101_101
+                } else {
+                    0b110_100_100
+                }
                 e.size = content.toByteArray().size.toLong()
                 tar.putArchiveEntry(e)
                 tar.write(content.toByteArray())

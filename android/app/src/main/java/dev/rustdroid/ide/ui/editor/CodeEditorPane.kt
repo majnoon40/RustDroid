@@ -55,10 +55,12 @@ object RustEditor {
         }
     }
 
-    fun createLanguage(): TextMateLanguage {
-        val def = DefaultGrammarDefinition.withGrammarSource(
-            grammarSourceFor(RustEditorHolder.assets, "textmate/rust.tmLanguage.json"),
-            "rust", "source.rust"
+    fun createLanguage(context: Context): TextMateLanguage {
+        val assets = context.assets
+        val def = DefaultGrammarDefinition.withLanguageConfiguration(
+            grammarSourceFor(assets, "textmate/rust.tmLanguage.json"),
+            "textmate/rust-language-configuration.json",
+            "rust", "source.rust",
         )
         return TextMateLanguage.create(def, true)
     }
@@ -68,9 +70,8 @@ object RustEditor {
 
     fun createEditor(context: Context, dark: Boolean): CodeEditor {
         ensureInit(context)
-        RustEditorHolder.assets = context.assets
         val editor = CodeEditor(context)
-        editor.setEditorLanguage(createLanguage())
+        editor.setEditorLanguage(createLanguage(context))
         editor.setColorScheme(colorScheme(dark))
         editor.typefaceText = android.graphics.Typeface.MONOSPACE
         editor.setTextSize(14f)
@@ -87,11 +88,6 @@ object RustEditor {
         }
         return TextMateColorScheme.create(registry, registry.currentThemeModel)
     }
-}
-
-/** Holds the asset manager for language creation (set in createEditor). */
-private object RustEditorHolder {
-    @Volatile var assets: android.content.res.AssetManager? = null
 }
 
 @Composable

@@ -24,13 +24,13 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.MenuBook
+
+
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Folder
+
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Stop
-import androidx.compose.material.icons.filled.Terminal
+
+
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
@@ -65,6 +65,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.launch
 import dev.rustdroid.ide.di.AppContainer
 import dev.rustdroid.ide.model.ConsoleLine
+import dev.rustdroid.ide.ui.components.RdIcons
 import dev.rustdroid.ide.model.Diagnostic
 import dev.rustdroid.ide.model.FileNode
 import dev.rustdroid.ide.model.Severity
@@ -124,7 +125,7 @@ fun EditorScreen(
                         Modifier.fillMaxWidth().padding(16.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Icon(Icons.Filled.Folder, null, tint = MaterialTheme.colorScheme.primary)
+                        Icon(RdIcons.Folder, null, tint = MaterialTheme.colorScheme.primary)
                         Spacer(Modifier.width(8.dp))
                         Text("Files", style = MaterialTheme.typography.titleMedium)
                         Spacer(Modifier.weight(1f))
@@ -150,7 +151,7 @@ fun EditorScreen(
                 TopAppBar(
                     navigationIcon = {
                         IconButton(onClick = { drawerScope.launch { drawerState.open() } }) {
-                            Icon(Icons.Filled.Folder, contentDescription = "Files")
+                            Icon(RdIcons.Folder, contentDescription = "Files")
                         }
                     },
                     title = { Text(projectName) },
@@ -158,7 +159,7 @@ fun EditorScreen(
                         TextButton(onClick = { onOpenDeps(projectName) }) { Text("Deps") }
                         if (running) {
                             IconButton(onClick = { vm.stop() }) {
-                                Icon(Icons.Filled.Stop, contentDescription = "Stop", tint = MaterialTheme.colorScheme.error)
+                                Icon(RdIcons.Stop, contentDescription = "Stop", tint = MaterialTheme.colorScheme.error)
                             }
                         } else {
                             IconButton(onClick = { vm.run() }) {
@@ -248,7 +249,7 @@ fun EditorScreen(
                                 onClick = { vm.selectBottomTab(EditorViewModel.BottomTab.CONSOLE) },
                                 text = {
                                     Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Icon(Icons.Filled.Terminal, null, Modifier.height(14.dp).width(14.dp))
+                                        Icon(RdIcons.Terminal, null, Modifier.height(14.dp).width(14.dp))
                                         Spacer(Modifier.width(6.dp))
                                         Text("Console")
                                         lastResult?.let {
@@ -328,7 +329,7 @@ private fun FileTreeRow(node: FileNode, onOpen: (String, Boolean) -> Unit) {
     ) {
         if (node.isDirectory) {
             Icon(
-                Icons.Filled.Folder, null,
+                RdIcons.Folder, null,
                 tint = MaterialTheme.colorScheme.primary,
                 modifier = Modifier.width(18.dp).height(18.dp),
             )
