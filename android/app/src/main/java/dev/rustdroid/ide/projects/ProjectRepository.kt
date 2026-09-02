@@ -1,0 +1,131 @@
+package dev.rustdroid.ide.projects
+
+import dev.rustdroid.ide.runtime.CargoRunner
+import dev.rustdroid.ide.runtime.ProcEnv
+import dev.rustdroid.ide.util.Fs
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.IOException
+
+/**
+ * On-device cargo project CRUD under files/projects. Creation runs
+ * `cargo new` through the bundled toolchain (the exact loop the IDE uses);
+ * listing/renaming/deletion are plain filesystem ops. Pure JVM.
+ */
+class ProjectRepository(
+    private val projectsRoot: File,
+    private val runner: CargoRunner,
+    private val envProvider: () -> Map<String, String>,
+) {
+    fun projectsRootExists(): Boolean = projectsRoot.isDirectory
+
+    fun list(): List<dev.rustdroid.ide.model.ProjectSummary> {
+        val dirs = projectsRoot.listFiles()
+            ?.filter { it.isDirectory && File(it, "Cargo.toml").isFile }
+            ?: return emptyList()
+        return dirs.map { dir ->
+            val deps = try {
+                CargoToml.readDependencies(File(dir, "Cargo.toml")).size
+            } catch (e: IOException) {
+                -1 // parse error marker
+            }
+            dev.rustdroid.ide.model.ProjectSummary(
+                name = dir.name,
+                dir = dir,
+                lastModifiedMs = latestMtime(dir),
+                dependencyCount = deps,
+            )
+        }.sortedByDescending { it.lastModifiedMs }
+    }
+
+    private fun latestMtime(root: File): Long {
+        var latest = root.lastModified()
+        root.listFiles()?.forEach { child ->
+            if (child.isDirectory) {
+                latest = maxOf(latest, latestMtime(child))
+            } else {
+                latest = maxOf(latest, child.lastModified())
+            }
+        }
+        return latest
+    }
+
+    /** Creates a project via `cargo new --bin/--lib NAME`. */
+    suspend fun create(name: String, isLib: Boolean, onLine: (String) -> Unit = {}): File =
+        withContext(Dispatchers.IO) {
+            require(name.matches(Regex("[a-zA-Z][a-zA-Z0-9_-]*"))) {
+                "project name must start with a letter and contain only letters, digits, - and _"
+            }
+            projectsRoot.mkdirs()
+            val dir = File(projectsRoot, name)
+            if (dir.exists()) throw IOException("project '$name' already exists")
+
+            val result = runner.run(
+                listOf("cargo", "new", if (isLib) "--lib" else "--bin", name),
+                cwd = projectsRoot,
+                env = envProvider(),
+            ) { line -> onLine(line.text) }
+            if (!result.success || !File(dir, "Cargo.toml").isFile) {
+                Fs.deleteRecursively(dir)
+                throw IOException("cargo new failed (exit ${result.exitCode})")
+            }
+            dir
+        }
+
+    fun rename(old: File, newName: String): File {
+        require(newName.matches(Regex("[a-zA-Z][a-zA-Z0-9_-]*"))) { "invalid name" }
+        val target = File(old.parentFile, newName)
+        if (target.exists()) throw IOException("'$newName' already exists")
+        if (!old.renameTo(target)) throw IOException("rename failed")
+        return target
+    }
+
+    fun delete(dir: File) {
+        if (!Fs.deleteRecursively(dir)) throw IOException("could not delete ${dir.name}")
+    }
+
+    // ---- file tree for the editor ----
+
+    /** Files under the project, skipping target/ and .git/. */
+    fun fileTree(projectDir: File, allFiles: Boolean): List<dev.rustdroid.ide.model.FileNode> {
+        val out = mutableListOf<dev.rustdroid.ide.model.FileNode>()
+        fun walk(dir: File, depth: Int) {
+            val children = dir.listFiles() ?: return
+            val sorted = children.sortedWith(
+                compareByDescending<File> { it.isDirectory }.thenBy { it.name.lowercase() }
+            )
+            for (child in sorted) {
+                val rel = child.relativeTo(projectDir).path
+                if (child.isDirectory) {
+                    if (child.name == "target" || child.name == ".git" || depth == 0 && child.name == ".cargo") {
+                        continue
+                    }
+                    out += dev.rustdroid.ide.model.FileNode(child, rel, true, depth)
+                    walk(child, depth + 1)
+                } else {
+                    if (!allFiles && !isEditable(child.name)) continue
+                    out += dev.rustdroid.ide.model.FileNode(child, rel, false, depth)
+                }
+            }
+        }
+        walk(projectDir, 0)
+        return out
+    }
+
+    private fun isEditable(name: String): Boolean {
+        val ext = name.substringAfterLast('.', "")
+        return name == "Cargo.toml" || name == "Cargo.lock" ||
+            ext in setOf("rs", "toml", "md", "txt", "json", "yml", "yaml", "lock", "cfg", "sh")
+    }
+
+    fun readFile(file: File): String {
+        if (file.length() > 4L * 1024 * 1024) throw IOException("file too large to edit")
+        return file.readText()
+    }
+
+    fun writeFile(file: File, content: String) {
+        file.parentFile?.mkdirs()
+        Fs.writeAtomic(file, content)
+    }
+}

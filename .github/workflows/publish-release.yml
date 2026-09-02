@@ -1,0 +1,164 @@
+# Publishes the toolchain from a completed CI run to a GitHub release.
+#
+# Assets produced:
+#   rustdroid-app-bundle-aarch64.zip  (~117 MB) — the subset the Android app
+#     downloads: rustc + cargo + rust-std tarballs, libc++_shared.so, the
+#     rustdroid-link kit, and a small manifest json (version, source, sizes).
+#   rustdroid-toolchain-aarch64.zip   (full ~1.2 GB dist) — the complete
+#     artifact zip as produced by CI (all 10 tarballs), for archival/manual
+#     installs. Same bytes as the Actions artifact.
+#
+# Manual dispatch: run_id empty = latest successful build run.
+name: Publish toolchain release
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Actions run id to publish (default: latest successful)'
+        required: false
+        default: ''
+      tag:
+        description: 'Release tag'
+        required: false
+        default: 'toolchain-1.85.0-aarch64'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Resolve the source run + artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RUN_ID="${{ inputs.run_id }}"
+          if [ -z "$RUN_ID" ]; then
+            RUN_ID=$(gh api "repos/${{ github.repository }}/actions/workflows/main.yml/runs?status=success&per_page=1" --jq '.workflow_runs[0].id')
+          fi
+          echo "publishing from run #$RUN_ID"
+          gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID" > run.json
+          HEAD_SHA=$(jq -r .head_sha run.json)
+          echo "HEAD_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
+          echo "RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+
+          gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/artifacts" > arts.json
+          ART_ID=$(jq -r '.artifacts[] | select(.name=="rustdroid-toolchain-aarch64") | .id' | head -1)
+          if [ -z "$ART_ID" ] || [ "$ART_ID" = "null" ]; then
+            echo "no rustdroid-toolchain-aarch64 artifact in run $RUN_ID"; exit 1
+          fi
+          echo "ART_ID=$ART_ID" >> "$GITHUB_ENV"
+
+      - name: Download artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/actions/artifacts/$ART_ID/zip" > full-dist.zip
+          ls -la full-dist.zip
+          mkdir -p dist
+          unzip -q full-dist.zip -d dist/
+          echo "=== dist contents ==="
+          ls -la dist/
+
+      - name: Build the app bundle (subset the app installs)
+        run: |
+          set -euo pipefail
+          cd dist
+          RUSTC_TAR="rustc-1.85.0-aarch64-linux-android.tar.xz"
+          CARGO_TAR="cargo-1.85.0-aarch64-linux-android.tar.xz"
+          STD_TAR="rust-std-1.85.0-aarch64-linux-android.tar.xz"
+          for f in "$RUSTC_TAR" "$CARGO_TAR" "$STD_TAR" libc++_shared.so; do
+            [ -f "$f" ] || { echo "MISSING from dist: $f"; exit 1; }
+          done
+          [ -d rustdroid-link ] || { echo "MISSING from dist: rustdroid-link/"; exit 1; }
+
+          # per-component sha256 for the manifest
+          sha_of() { sha256sum "$1" | awk '{print $1}'; }
+          RUSTC_SHA=$(sha_of "$RUSTC_TAR"); RUSTC_SZ=$(stat -c%s "$RUSTC_TAR")
+          CARGO_SHA=$(sha_of "$CARGO_TAR"); CARGO_SZ=$(stat -c%s "$CARGO_TAR")
+          STD_SHA=$(sha_of "$STD_TAR"); STD_SZ=$(stat -c%s "$STD_TAR")
+          LIBCXX_SHA=$(sha_of libc++_shared.so); LIBCXX_SZ=$(stat -c%s libc++_shared.so)
+          KIT_FILES=$(find rustdroid-link -type f | wc -l)
+
+          cat > rustdroid-app-bundle.json <<EOF
+          {
+            "format": 1,
+            "rust_version": "1.85.0",
+            "target": "aarch64-linux-android",
+            "created": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "source_run": ${{ env.RUN_ID }},
+            "source_commit": "${{ env.HEAD_SHA }}",
+            "components": {
+              "rustc":     { "file": "$RUSTC_TAR",  "sha256": "$RUSTC_SHA", "size": $RUSTC_SZ },
+              "cargo":     { "file": "$CARGO_TAR",  "sha256": "$CARGO_SHA", "size": $CARGO_SZ },
+              "rust-std":  { "file": "$STD_TAR",    "sha256": "$STD_SHA",   "size": $STD_SZ },
+              "libcxx":    { "file": "libc++_shared.so", "sha256": "$LIBCXX_SHA", "size": $LIBCXX_SZ },
+              "kit":       { "file": "rustdroid-link", "sha256": "", "size": $KIT_FILES }
+            }
+          }
+          EOF
+          cat rustdroid-app-bundle.json
+
+          cd ..
+          # STORED (no recompression): contents are already xz-compressed.
+          (cd dist && zip -0 -r ../rustdroid-app-bundle-aarch64.zip \
+            "$RUSTC_TAR" "$CARGO_TAR" "$STD_TAR" \
+            libc++_shared.so rustdroid-app-bundle.json rustdroid-link/)
+          # full dist zip gets a stable name
+          cp full-dist.zip rustdroid-toolchain-aarch64.zip
+          ls -la *.zip
+
+      - name: Checksums
+        run: |
+          sha256sum rustdroid-app-bundle-aarch64.zip rustdroid-toolchain-aarch64.zip | tee SHA256SUMS.txt
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # create release if missing (idempotent)
+          gh release view "$TAG" --repo "${{ github.repository }}" 2>/dev/null || \
+            gh release create "$TAG" --repo "${{ github.repository }}" \
+              --title "RustDroid toolchain 1.85.0 (aarch64-linux-android)" \
+              --prerelease \
+              --notes "Self-hosting Rust toolchain for aarch64 Android. See the app (android/) for the installable IDE."
+
+          gh release upload "$TAG" \
+            rustdroid-app-bundle-aarch64.zip \
+            rustdroid-toolchain-aarch64.zip \
+            SHA256SUMS.txt \
+            --clobber --repo "${{ github.repository }}"
+
+      - name: Update release notes with provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          APP_SHA=$(sha256sum rustdroid-app-bundle-aarch64.zip | awk '{print $1}')
+          FULL_SHA=$(sha256sum rustdroid-toolchain-aarch64.zip | awk '{print $1}')
+          APP_SZ=$(numfmt --to=iec $(stat -c%s rustdroid-app-bundle-aarch64.zip))
+          FULL_SZ=$(numfmt --to=iec $(stat -c%s rustdroid-toolchain-aarch64.zip))
+          gh release view "$TAG" --repo "${{ github.repository }}" --json body -q .body > old-body.md || true
+          cat > new-body.md <<EOF
+          ## RustDroid toolchain — rust 1.85.0, aarch64-linux-android
+
+          Built from main @ ${{ env.HEAD_SHA }} (run #${{ env.RUN_ID }}, verified by its CI: static ELF checks + kit checks + real cross-link smoke test).
+
+          | Asset | Size | SHA-256 |
+          |-------|------|---------|
+          | \`rustdroid-app-bundle-aarch64.zip\` — what the Android app installs | $APP_SZ | \`$APP_SHA\` |
+          | \`rustdroid-toolchain-aarch64.zip\` — full dist (all 10 tarballs) | $FULL_SZ | \`$FULL_SHA\` |
+
+          The app bundle contains: rustc + cargo + rust-std tarballs, \`libc++_shared.so\`, and the \`rustdroid-link\` kit (crt objects, 18 bionic stubs, \`libunwind.a\`, \`libclang_rt.builtins.a\`, cc/clang/gcc ld.lld shims) — everything Phase 1 proved necessary and sufficient for on-device compile+link+run.
+
+          On-device recipe (no app): extract the tarballs into a prefix, \`cp -a rustdroid-link \$PREFIX/lib/\`, \`cp rustdroid-link/bin/* \$PREFIX/bin/ && chmod 755 \$PREFIX/bin/{cc,clang,gcc}\`, then run with \`LD_LIBRARY_PATH=\$PREFIX/lib PATH=\$PREFIX/bin:\$PATH\`.
+          EOF
+          gh release edit "$TAG" --repo "${{ github.repository }}" --notes-file new-body.md

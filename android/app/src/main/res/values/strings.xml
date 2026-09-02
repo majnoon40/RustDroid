@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">RustDroid</string>
+    <string name="notif_channel_toolchain">Toolchain installation</string>
+    <string name="notif_toolchain_title">Installing Rust toolchain</string>
+    <string name="notif_toolchain_body">Preparing your on-device Rust environment…</string>
+    <string name="notif_toolchain_done">Rust toolchain ready</string>
+</resources>

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- Toolchain (files/usr) is a large, re-downloadable install: skip it.
+         Projects and settings ARE backed up. -->
+    <exclude domain="file" path="usr" />
+    <exclude domain="file" path="home/cache" />
+</full-backup-content>

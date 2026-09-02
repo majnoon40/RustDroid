@@ -1,0 +1,231 @@
+package dev.rustdroid.ide.toolchain
+
+import android.content.Context
+import android.net.Uri
+import dev.rustdroid.ide.model.CheckStatus
+import dev.rustdroid.ide.model.ToolchainState
+import dev.rustdroid.ide.runtime.CargoRunner
+import dev.rustdroid.ide.runtime.ProcEnv
+import dev.rustdroid.ide.util.Fs
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import java.io.File
+
+/**
+ * Owns the toolchain lifecycle: install (network or imported zip), verify,
+ * state, uninstall. Single-flight: concurrent callers await the same install.
+ * State is observable for the Gate screen + Settings.
+ */
+class ToolchainManager(
+    private val context: Context,
+    val paths: ToolchainPaths,
+    private val runner: CargoRunner,
+    private val http: OkHttpClient,
+) {
+    private val _state = MutableStateFlow<ToolchainState>(initialState())
+    val state: StateFlow<ToolchainState> = _state.asStateFlow()
+
+    private val mutex = Mutex()
+    private val uiScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + Dispatchers.Main
+    )
+
+    private val downloader = ArtifactDownloader(http)
+    private val extractor = ArtifactExtractor(paths)
+    private val verifier = ToolchainVerifier(paths, context.filesDir, runner)
+
+    /** Extra log lines surfaced by the UI (extraction/verify output tail). */
+    val logTail = ArrayDeque<String>()
+
+    private fun initialState(): ToolchainState {
+        return if (paths.readyMarker.isFile && paths.isInstalled()) {
+            val env = ProcEnv.env(paths.prefix, context.filesDir)
+            val rustc = kotlinx.coroutines.runBlocking {
+                runner.probe(listOf(paths.rustc.absolutePath, "--version"), env)
+            }
+            val cargo = kotlinx.coroutines.runBlocking {
+                runner.probe(listOf(paths.cargo.absolutePath, "--version"), env)
+            }
+            if (rustc.startsWith("rustc ") && cargo.startsWith("cargo ")) {
+                ToolchainState.Ready(firstLine(rustc), firstLine(cargo))
+            } else {
+                ToolchainState.Failed(
+                    "startup", "installed toolchain no longer runs — reinstall it (Settings)"
+                )
+            }
+        } else {
+            ToolchainState.NotInstalled
+        }
+    }
+
+    private fun firstLine(s: String) = s.lineSequence().firstOrNull() ?: s
+
+    private fun log(line: String) {
+        synchronized(logTail) {
+            logTail.addLast(line)
+            while (logTail.size > 200) logTail.removeFirst()
+        }
+    }
+
+    /** Install path A: download the pinned bundle from the GitHub release. */
+    suspend fun installFromNetwork() =
+        installWith { zip ->
+            _state.value = ToolchainState.Downloading(0, ToolchainDistro.expectedSizeBytes)
+            downloader.downloadBlocking(
+                ToolchainDistro.url,
+                zip,
+                ToolchainDistro.SHA256.takeIf { it.length == 64 },
+            ) { bytes, total ->
+                _state.value = ToolchainState.Downloading(bytes, total)
+            }
+            log("download complete: ${Fs.humanBytes(zip.length())}")
+            zip
+        }
+
+    /**
+     * Install path B: user-imported zip (SAF). [open] yields the zip stream;
+     * we spool it to the cache file, then run the shared install pipeline.
+     */
+    suspend fun installFromImport(open: () -> java.io.InputStream) =
+        installWith { zip ->
+            _state.value = ToolchainState.Downloading(0, null)
+            zip.parentFile?.mkdirs()
+            val tmp = File(zip.parentFile, zip.name + ".part")
+            open().use { input ->
+                tmp.outputStream().use { output ->
+                    val buf = ByteArray(64 * 1024)
+                    var copied = 0L
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n < 0) break
+                        output.write(buf, 0, n)
+                        copied += n
+                        if (copied % (4 * 1024 * 1024) == 0L) {
+                            _state.value = ToolchainState.Downloading(copied, null)
+                        }
+                    }
+                }
+            }
+            if (zip.exists()) zip.delete()
+            check(tmp.renameTo(zip)) { "cannot finalize imported zip" }
+            log("import complete: ${Fs.humanBytes(zip.length())}")
+            zip
+        }
+
+    private suspend fun installWith(fetch: (File) -> File) = mutex.withLock {
+        try {
+            if (paths.isInstalled()) {
+                uninstallLocked()
+            }
+            paths.ensureDirs()
+            ProcEnv.ensureDirs(context.filesDir)
+
+            val zip = fetch(paths.bundleZip)
+
+            // Extract
+            _state.value = ToolchainState.Extracting(0, null)
+            withContext(Dispatchers.IO) {
+                val info = extractor.install(zip) { done, total ->
+                    _state.value = ToolchainState.Extracting(done, total)
+                }
+                log("toolchain ${info.rustVersion} installed (kit files: ${info.kitEntryCount})")
+            }
+
+            // Verify — the smoke test is the gate
+            runVerifyLocked()
+
+            // Clean the 100+ MB zip: prefix is self-contained now
+            paths.bundleZip.delete()
+        } catch (e: Exception) {
+            val stage = when (val s = _state.value) {
+                is ToolchainState.Downloading -> "download"
+                is ToolchainState.Extracting -> "extraction"
+                is ToolchainState.Verifying -> "verification"
+                else -> "install"
+            }
+            log("FAILED at $stage: ${e.message}")
+            _state.value = ToolchainState.Failed(stage, e.message ?: e.javaClass.simpleName)
+        }
+    }
+
+    private fun ToolchainToolchainProgress(done: Int, total: Int?): ToolchainState =
+        ToolchainState.Extracting(done, total)
+
+    /** Re-run the full health check (Settings button, or after import). */
+    suspend fun reverify() = mutex.withLock {
+        if (!paths.isInstalled()) {
+            _state.value = ToolchainState.NotInstalled
+            return
+        }
+        runVerifyLocked()
+    }
+
+    private suspend fun runVerifyLocked() {
+        _state.value = ToolchainState.Verifying(emptyList())
+        val order = mutableListOf<String>()
+        val checks = withContext(Dispatchers.IO) {
+            verifier.verify { check ->
+                if (check.id !in order) order += check.id
+                val list = (_state.value as? ToolchainState.Verifying)?.checks ?: emptyList()
+                val next = (list.filter { it.id != check.id } + check)
+                    .sortedBy { order.indexOf(it.id) }
+                _state.value = ToolchainState.Verifying(next)
+            }
+        }
+        val failed = checks.filter { it.status == CheckStatus.FAIL }
+        if (failed.isEmpty()) {
+            val env = ProcEnv.env(paths.prefix, context.filesDir)
+            val rustc = runner.probe(listOf(paths.rustc.absolutePath, "--version"), env)
+            val cargo = runner.probe(listOf(paths.cargo.absolutePath, "--version"), env)
+            paths.readyMarker.writeText(
+                buildString {
+                    appendLine("verified=${System.currentTimeMillis()}")
+                    appendLine("rust_version=${firstLine(rustc)}")
+                }
+            )
+            _state.value = ToolchainState.Ready(firstLine(rustc), firstLine(cargo))
+            log("verification PASSED — toolchain ready")
+        } else {
+            val first = failed.first()
+            _state.value = ToolchainState.Failed(
+                "verification",
+                "check '${first.title}' failed: ${first.detail ?: "unknown"}"
+            )
+            log("verification FAILED (${failed.size} checks)")
+        }
+    }
+
+    fun uninstall() {
+        kotlinx.coroutines.runBlocking { mutex.withLock { uninstallLocked() } }
+    }
+
+    private fun uninstallLocked() {
+        Fs.deleteRecursively(paths.prefix)
+        paths.readyMarker.delete()
+        paths.bundleZip.delete()
+        _state.value = ToolchainState.NotInstalled
+        log("toolchain removed")
+    }
+
+    /** Convenience: [uri] content import via SAF (fire-and-forget from UI). */
+    fun launchImport(uri: Uri) {
+        uiScope.launch { installFromUri(uri) }
+    }
+
+    suspend fun installFromUri(uri: Uri): Boolean {
+        return try {
+            val stream = context.contentResolver.openInputStream(uri)
+                ?: throw java.io.IOException("cannot open $uri")
+            stream.use { s -> installFromImport { s } }
+            _state.value is ToolchainState.Ready
+        } catch (e: Exception) {
+            false
+        }
+    }
+}
