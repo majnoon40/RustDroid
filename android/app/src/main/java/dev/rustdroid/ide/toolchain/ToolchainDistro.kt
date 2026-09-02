@@ -19,13 +19,13 @@ object ToolchainDistro {
         "https://github.com/majnoon40/RustDroid/releases/download/$RELEASE_TAG/$ASSET_NAME"
 
     /**
-     * SHA-256 of the app bundle zip. Filled from the publish workflow
-     * (scripts/publish; also recorded in the release's SHA256SUMS.txt).
+     * SHA-256 of the app bundle zip, recorded by the publish workflow
+     * (also in the release's SHA256SUMS.txt + body table).
      * Empty string disables pinning (dev builds only).
      */
-    const val SHA256 = "%%BUNDLE_SHA256%%"
+    const val SHA256 = "d7e50fe2a86dab08c7d8a5f55eeceaf28423d6f2536ad7852648299a93f46be9"
 
-    val expectedSizeBytes: Long = 117_000_000L // approx; display only
+    val expectedSizeBytes: Long = 116_974_122L // exact; display only
 
     /** Zip entry names expected inside the bundle (layout contract). */
     val expectedEntries = listOf(

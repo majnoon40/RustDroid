@@ -13,7 +13,7 @@ This repository currently contains **Phase 1**: the foundation everything else d
 | Phase | Scope | Status |
 |-------|-------|--------|
 | **1 — Toolchain** (this repo) | Self-hosting rustc + cargo for `aarch64-linux-android`, built via GitHub Actions, verified statically + on-device | **VALIDATED ON-DEVICE** (2026-09-02): full `rustc` compile + link + run works on a TECNO-LJ9 via the `rustdroid-link` kit (`hello from RustDroid on Android`). CI: runs #22/#23 green; kit + libunwind fix landed in 0f7eb19/2cc5296, baked into artifacts from run #26 on |
-| 2 — App shell | Android app (`dev.rustdroid.ide`) that downloads/bundles the toolchain, provides terminal + editor | Planned |
+| 2 — App shell | Android app (`dev.rustdroid.ide`) that downloads/bundles the toolchain, provides terminal + editor | **BUILT, sandbox-verified** (see `android/`): APK 14.6 MB, 31/31 JVM tests, real-bundle extraction proven; on-device validation pending |
 | 3 — IDE experience | Code editor with Rust syntax/racer, project templates, build output panel, `cargo run` in PTY | Planned |
 
 Phase 1 is deliberately the highest-risk piece: if a Bionic-hosted `rustc`+`cargo` cannot run standalone in an app sandbox, nothing downstream matters. Everything else is "just" Android app engineering.

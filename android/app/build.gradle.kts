@@ -56,6 +56,10 @@ android {
 
     testOptions {
         unitTests.isReturnDefaultValues = true
+        // opt-in real-bundle integration test: -Drd.bundle=/path/to/bundle.zip
+        unitTests.all { test ->
+            test.systemProperty("rd.bundle", System.getProperty("rd.bundle") ?: "")
+        }
     }
 }
 
