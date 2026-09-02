@@ -35,6 +35,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=env.sh
 source "${SCRIPT_DIR}/env.sh"
 
+
+
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+log()  { echo "[$(date -u +%H:%M:%S)] $*" >&2; }
+fail() { log "ERROR: $*"; exit 1; }
+step_log() {
+    local step="$1"; shift
+    mkdir -p "$LOGS_DIR"
+    echo "$LOGS_DIR/${step}-$(date +%Y%m%d-%H%M%S).log"
+}
+
+# Idempotent-ish: only download if target missing (or --force).
+needs_force() {
+    [[ "${1:-}" == "--force" || "${FORCE:-0}" == "1" ]]
+}
+
 # ----------------------------------------------------------------------------
 # ccache — compiler cache for the C/C++ parts (LLVM, lld, compiler-rt).
 # Bootstrap 1.85 has NATIVE support: `[llvm] ccache = "ccache"` in config.toml
@@ -67,23 +85,6 @@ if command -v ccache >/dev/null 2>&1; then
     mkdir -p "$CCACHE_DIR"
     log "ccache enabled: dir=$CCACHE_DIR maxsize=$CCACHE_MAXSIZE"
 fi
-
-
-# ----------------------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------------------
-log()  { echo "[$(date -u +%H:%M:%S)] $*" >&2; }
-fail() { log "ERROR: $*"; exit 1; }
-step_log() {
-    local step="$1"; shift
-    mkdir -p "$LOGS_DIR"
-    echo "$LOGS_DIR/${step}-$(date +%Y%m%d-%H%M%S).log"
-}
-
-# Idempotent-ish: only download if target missing (or --force).
-needs_force() {
-    [[ "${1:-}" == "--force" || "${FORCE:-0}" == "1" ]]
-}
 
 # ----------------------------------------------------------------------------
 # 1. prepare — rustup + NDK + rust source clone
