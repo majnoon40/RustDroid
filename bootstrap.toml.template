@@ -54,6 +54,17 @@ extended = true
 # cross-compile (rustfmt, clippy, rust-analyzer can be added in later
 # iterations once the base toolchain is proven on-device).
 tools = ["cargo"]
+# CRITICAL (CI run #20, 2026-09-01): force bootstrap's vendored-source mode.
+# Bootstrap defaults `vendor` to false for GIT checkouts (true only for
+# release tarballs that ship vendor/ + .cargo/config.toml). With vendor=false
+# every tool build (cargo included) compiles from the crates.io REGISTRY
+# copies in $CARGO_HOME/registry — NOT from our patched vendor/ tree — so
+# the openssl-probe patch (which removes the hardcoded
+# /data/data/com.termux/files/usr/etc/tls fallback) never reaches the
+# binaries, and verify.sh check 1 fails on the cargo binary (it ships in
+# both the cargo tarball and the meta rust tarball -> exactly 2 ELF files).
+# vendor=true additionally passes --frozen to all cargo invocations.
+vendor = true
 
 # ============================================================================
 # [install] â€” where `x.py install` puts files. This is the prefix that gets

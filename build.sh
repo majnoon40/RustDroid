@@ -306,6 +306,11 @@ do_vendor() {
     local vendor_log; vendor_log="$(step_log vendor)"
     log "  full log: $vendor_log"
 
+    # Deactivate any previously-activated vendored-source config before
+    # re-vendoring: `cargo vendor` must talk to the crates.io registry, and
+    # source replacement can interfere with it on re-runs.
+    rm -f "$RUST_SRC/.cargo/config.toml"
+
     # x.py has a `vendor` subcommand that's preferred over `cargo vendor`
     # because it handles the rust-monorepo lockfile correctly.
     # NOTE: --no-merge was removed — current x.py vendor usage is:
@@ -318,6 +323,33 @@ do_vendor() {
         || fail "x.py vendor failed — see $vendor_log"
 
     log "vendor populated: $(du -sh "$RUST_SRC/vendor" 2>/dev/null | awk '{print $1}')"
+
+    # CRITICAL (CI run #20, 2026-09-01): activate the vendored sources for
+    # every subsequent cargo invocation bootstrap makes. `cargo vendor` only
+    # PRINTS this config to stdout (it never writes it); rust's own dist
+    # step captures the printout and writes it into the release tarball
+    # (dist.rs PlainSourceTarball). Our pipeline is a git checkout, for
+    # which bootstrap defaults `vendor` to false — so unless this file
+    # exists, tool builds (cargo!) compile from the UNPATCHED crates.io
+    # registry copies in $CARGO_HOME/registry instead of the patched
+    # vendor/ tree, and the openssl-probe patch never reaches the binaries.
+    mkdir -p "$RUST_SRC/.cargo"
+    cat > "$RUST_SRC/.cargo/config.toml" <<'EOF'
+# Written by RustDroid build.sh do_vendor (see run #20 forensics).
+# Redirects all crates.io dependencies to the local, PATCHED vendor/ tree.
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+EOF
+    log "  wrote $RUST_SRC/.cargo/config.toml (vendored sources ACTIVE)"
+
+    # Early sanity check: the openssl-probe patch target must EXIST in the
+    # vendor tree — fail fast here rather than 2h later at verification.
+    # (The patch itself applies in the next step, patches-post-vendor.)
+    [[ -f "$RUST_SRC/vendor/openssl-probe/src/lib.rs" ]] \
+        || fail "vendor/openssl-probe/src/lib.rs missing — patch 0001 has no target; did x.py vendor sync cargo's tree?"
 }
 
 # ----------------------------------------------------------------------------
@@ -343,6 +375,19 @@ do_patches_post_vendor() {
         fi
     done
     log "post-vendor patches summary: $apply_ok applied cleanly, $apply_fail drifted"
+
+    # CRITICAL gate (run #20 forensics): if openssl-probe is still carrying
+    # a com.termux path after patching, the built cargo binary WILL fail
+    # verify.sh check 1 — 2h later. The openssl-probe patch is the ONLY
+    # defense against the upstream 0.1.5 hardcoded
+    # /data/data/com.termux/files/usr/etc/tls fallback (line 41), which gets
+    # compiled into cargo whenever this patch does not apply. Fail NOW
+    # instead, with a message that names the file to fix.
+    if [[ -f "$RUST_SRC/vendor/openssl-probe/src/lib.rs" ]] \
+        && grep -q "com\.termux" "$RUST_SRC/vendor/openssl-probe/src/lib.rs"; then
+        fail "vendor/openssl-probe/src/lib.rs still contains a com.termux path after patching — cargo will embed it (verify.sh check 1 WILL fail). Fix patches/post-vendor/0001 and re-run."
+    fi
+    log "  vendor/openssl-probe verified: no com.termux paths remain"
 }
 
 # ----------------------------------------------------------------------------

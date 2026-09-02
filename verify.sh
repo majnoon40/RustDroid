@@ -44,7 +44,12 @@ fail() { echo "  FAIL: $*"; exit 1; }
 # ----------------------------------------------------------------------------
 WORK_DIR=""
 cleanup() {
+    # NOTE: must end in success. The EXIT trap's return status overrides the
+    # script's exit code in bash — with a directory target WORK_DIR is empty,
+    # the [[ ]] fails, and a previously-ALL-GREEN verification would still
+    # exit 1 (which would fail the CI step and skip artifact upload).
     [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]] && rm -rf "$WORK_DIR"
+    return 0
 }
 trap cleanup EXIT
 
@@ -64,12 +69,40 @@ fi
 # Build the list of ELF files to check.
 # Skip the obvious junk (debug info, fonts, etc).
 # ----------------------------------------------------------------------------
+# Fast path: one python3 process reading 20 magic bytes per file. The old
+# implementation spawned `file` once per file (the extracted rust-src tree
+# alone has tens of thousands of files — CI run #20 spent ~24 minutes in
+# this enumeration alone). ELF check: magic \x7fELF + e_machine == 0xB7
+# (EM_AARCH64, little-endian) at offsets 18-19. The ELF class check is
+# deliberately omitted: EM_AARCH64 only exists in 64-bit ELF.
+# Fallback: legacy `file`-per-file loop if python3 is unavailable.
 ELF_FILES=()
-while IFS= read -r -d '' f; do
-    if file "$f" 2>/dev/null | grep -q 'ELF .*aarch64'; then
+if command -v python3 >/dev/null 2>&1; then
+    while IFS= read -r -d '' f; do
         ELF_FILES+=("$f")
-    fi
-done < <(find "$TARGET_DIR" -type f -print0)
+    done < <(python3 - "$TARGET_DIR" <<'PYEOF'
+import os, sys
+root = sys.argv[1]
+for dirpath, dirnames, filenames in os.walk(root):
+    for fn in filenames:
+        p = os.path.join(dirpath, fn)
+        try:
+            with open(p, 'rb') as fh:
+                h = fh.read(20)
+        except OSError:
+            continue
+        if (len(h) >= 20 and h[:4] == b'\x7fELF'
+                and h[18] == 0xb7 and h[19] == 0):
+            sys.stdout.write(p + '\0')
+PYEOF
+)
+else
+    while IFS= read -r -d '' f; do
+        if file "$f" 2>/dev/null | grep -q 'ELF .*aarch64'; then
+            ELF_FILES+=("$f")
+        fi
+    done < <(find "$TARGET_DIR" -type f -print0)
+fi
 
 log "found ${#ELF_FILES[@]} aarch64 ELF files to verify"
 [[ ${#ELF_FILES[@]} -gt 0 ]] || fail "no ELF files found under $TARGET_DIR"
@@ -92,8 +125,16 @@ check_termux_strings() {
     if [[ $found -eq 0 ]]; then
         pass "no 'com.termux' or '/data/data/com.termux' strings in any ELF"
     else
-        fail "$found ELF files still contain Termux hardcoded paths:"
-        printf '  %s\n' "${offending[@]}" | head -10
+        # Print the offending files AND the matching strings BEFORE fail()
+        # — fail() calls exit 1, so anything printed after it never appears
+        # in CI logs (run #20 lost the file list exactly this way).
+        echo "  FAIL: $found ELF files still contain Termux hardcoded paths:"
+        local f2
+        for f2 in "${offending[@]}"; do
+            echo "  --> $f2"
+            strings -a -n 8 "$f2" 2>/dev/null | grep -E 'com\.termux|/data/data/com\.termux' | head -5 | sed 's/^/        /'
+        done | head -40
+        fail "$found ELF files still contain Termux hardcoded paths (see list above)"
     fi
 
     # Also confirm our OWN prefix IS present where we'd expect (rustc, cargo).

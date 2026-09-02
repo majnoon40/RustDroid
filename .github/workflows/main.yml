@@ -84,9 +84,19 @@ jobs:
           # Primary: ./stage/dist (populated by build.sh's copy step).
           # Fallback: x.py's raw output dir, in case an older build.sh ran
           # or the copy step is skipped.
+          # Dedup by basename: stage/dist is a cp -a of build/dist, so the
+          # fallback dir only contributes files the copy missed. Run #20
+          # extracted every tarball TWICE (~13 wasted minutes).
+          declare -A seen=()
           for dir in ./stage/dist ./stage/rust-src/build/dist; do
             for f in "$dir"/*.tar.xz "$dir"/*.tar.gz; do
               [[ -e "$f" ]] || continue
+              base="$(basename "$f")"
+              if [[ -n "${seen[$base]:-}" ]]; then
+                echo "Skipping duplicate: $f (already extracted from stage/dist)"
+                continue
+              fi
+              seen["$base"]=1
               found_any=1
               echo "Extracting $f"
               tar -xf "$f" -C ./stage/dist-extracted
