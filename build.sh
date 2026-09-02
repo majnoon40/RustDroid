@@ -117,6 +117,20 @@ do_prepare() {
     log "NDK ready at $NDK_ROOT"
 
     # 1c. rust-lang/rust source (shallow clone of tag).
+    #
+    # CRITICAL (CI cache): if a CI cache was restored into
+    # $RUST_SRC/build/ (actions/cache restores only the build trees, not
+    # .git), the re-clone below would `rm -rf $RUST_SRC` and DESTROY the
+    # restored trees — that is exactly why run #18 restored a 2GB LLVM
+    # cache and then rebuilt LLVM from scratch for 2h6m anyway. Move the
+    # restored trees aside, clone, then re-attach them.
+    local preserved_build=""
+    if [[ -d "$RUST_SRC/build" && ! -d "$RUST_SRC/.git" ]]; then
+        preserved_build="${RUSTDROID_STAGE_PREFIX}/_preserved_build"
+        log "preserving CI-restored build trees across clone..."
+        rm -rf "$preserved_build"
+        mv "$RUST_SRC/build" "$preserved_build"
+    fi
     if [[ ! -d "$RUST_SRC/.git" ]] || needs_force "$1"; then
         log "cloning rust-lang/rust @ $RUST_TAG (shallow)..."
         rm -rf "$RUST_SRC"
@@ -130,6 +144,21 @@ do_prepare() {
             (cd "$RUST_SRC" && git submodule update --init --depth 1 --recommend-shallow) 2>&1 \
                 | tee "$(step_log submodules)" || log "WARN: submodule update failed (may be OK for smoke)"
         fi
+    fi
+    if [[ -n "$preserved_build" ]]; then
+        # Rename the whole preserved directory into place — atomic, no
+        # per-entry moves. ($RUST_SRC/build cannot exist in a fresh clone;
+        # `mv dir/. dest/` is NOT usable here — moving the "." entry fails
+        # with "Device or resource busy", which is what killed run #19.)
+        rm -rf "$RUST_SRC/build"
+        mv "$preserved_build" "$RUST_SRC/build"
+        # Ninja and cmake use MTIME dirty-checking. A fresh clone stamps
+        # every source file with NOW, which is newer than the restored
+        # build outputs' mtimes — ninja would then rebuild ~100% (the
+        # cache would be restored but useless). Touch every restored file
+        # so the outputs sort as up-to-date relative to the fresh sources.
+        find "$RUST_SRC/build" -exec touch -c {} + 2>/dev/null || true
+        log "CI build trees re-attached under $RUST_SRC/build (touched for ninja freshness)"
     fi
     log "rust source ready at $RUST_SRC"
 }
@@ -146,9 +175,22 @@ do_symlinks() {
     # NDK r27c ships unified clang at $bin/clang with no triple prefix.
     # Rust's build system looks for ${triple}${api}-clang via PATH lookup
     # when invoked with --target=...; we create symlinks.
+    #
+    # NOTE: the NON-suffixed names (aarch64-linux-android-clang etc.) are
+    # ALSO required: the `cc` crate's default compiler for the
+    # aarch64-linux-android target is exactly "aarch64-linux-android-clang"
+    # (no API suffix). Build scripts of vendored C deps (openssl-src,
+    # libz-sys, curl-sys) look that name up on PATH — run #18 logged
+    # "ToolNotFound: Failed to find tool. Is `aarch64-linux-android-clang`
+    # installed?" warnings because only the suffixed symlinks existed.
+    # cc-rs passes --target=aarch64-linux-android to clang itself, so the
+    # API-less symlink still produces Android binaries (default min API 21,
+    # below our API 24 floor — compatible).
     local link_names=(
         "aarch64-linux-android${api}-clang"
         "aarch64-linux-android${api}-clang++"
+        "aarch64-linux-android-clang"
+        "aarch64-linux-android-clang++"
         "aarch64-linux-android-ar"
         "aarch64-linux-android-ranlib"
         "aarch64-linux-android-nm"
@@ -159,6 +201,8 @@ do_symlinks() {
     local source_files=(
         "clang"        # -> aarch64-linux-android24-clang
         "clang++"      # -> aarch64-linux-android24-clang++
+        "clang"        # -> aarch64-linux-android-clang (cc crate default)
+        "clang++"      # -> aarch64-linux-android-clang++ (cc crate default)
         "llvm-ar"      # -> aarch64-linux-android-ar
         "llvm-ranlib"  # -> aarch64-linux-android-ranlib
         "llvm-nm"      # -> aarch64-linux-android-nm
@@ -262,6 +306,11 @@ do_vendor() {
     local vendor_log; vendor_log="$(step_log vendor)"
     log "  full log: $vendor_log"
 
+    # Deactivate any previously-activated vendored-source config before
+    # re-vendoring: `cargo vendor` must talk to the crates.io registry, and
+    # source replacement can interfere with it on re-runs.
+    rm -f "$RUST_SRC/.cargo/config.toml"
+
     # x.py has a `vendor` subcommand that's preferred over `cargo vendor`
     # because it handles the rust-monorepo lockfile correctly.
     # NOTE: --no-merge was removed — current x.py vendor usage is:
@@ -274,6 +323,33 @@ do_vendor() {
         || fail "x.py vendor failed — see $vendor_log"
 
     log "vendor populated: $(du -sh "$RUST_SRC/vendor" 2>/dev/null | awk '{print $1}')"
+
+    # CRITICAL (CI run #20, 2026-09-01): activate the vendored sources for
+    # every subsequent cargo invocation bootstrap makes. `cargo vendor` only
+    # PRINTS this config to stdout (it never writes it); rust's own dist
+    # step captures the printout and writes it into the release tarball
+    # (dist.rs PlainSourceTarball). Our pipeline is a git checkout, for
+    # which bootstrap defaults `vendor` to false — so unless this file
+    # exists, tool builds (cargo!) compile from the UNPATCHED crates.io
+    # registry copies in $CARGO_HOME/registry instead of the patched
+    # vendor/ tree, and the openssl-probe patch never reaches the binaries.
+    mkdir -p "$RUST_SRC/.cargo"
+    cat > "$RUST_SRC/.cargo/config.toml" <<'EOF'
+# Written by RustDroid build.sh do_vendor (see run #20 forensics).
+# Redirects all crates.io dependencies to the local, PATCHED vendor/ tree.
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+EOF
+    log "  wrote $RUST_SRC/.cargo/config.toml (vendored sources ACTIVE)"
+
+    # Early sanity check: the openssl-probe patch target must EXIST in the
+    # vendor tree — fail fast here rather than 2h later at verification.
+    # (The patch itself applies in the next step, patches-post-vendor.)
+    [[ -f "$RUST_SRC/vendor/openssl-probe/src/lib.rs" ]] \
+        || fail "vendor/openssl-probe/src/lib.rs missing — patch 0001 has no target; did x.py vendor sync cargo's tree?"
 }
 
 # ----------------------------------------------------------------------------
@@ -299,6 +375,19 @@ do_patches_post_vendor() {
         fi
     done
     log "post-vendor patches summary: $apply_ok applied cleanly, $apply_fail drifted"
+
+    # CRITICAL gate (run #20 forensics): if openssl-probe is still carrying
+    # a com.termux path after patching, the built cargo binary WILL fail
+    # verify.sh check 1 — 2h later. The openssl-probe patch is the ONLY
+    # defense against the upstream 0.1.5 hardcoded
+    # /data/data/com.termux/files/usr/etc/tls fallback (line 41), which gets
+    # compiled into cargo whenever this patch does not apply. Fail NOW
+    # instead, with a message that names the file to fix.
+    if [[ -f "$RUST_SRC/vendor/openssl-probe/src/lib.rs" ]] \
+        && grep -q "com\.termux" "$RUST_SRC/vendor/openssl-probe/src/lib.rs"; then
+        fail "vendor/openssl-probe/src/lib.rs still contains a com.termux path after patching — cargo will embed it (verify.sh check 1 WILL fail). Fix patches/post-vendor/0001 and re-run."
+    fi
+    log "  vendor/openssl-probe verified: no com.termux paths remain"
 }
 
 # ----------------------------------------------------------------------------
@@ -440,6 +529,12 @@ do_dist() {
     export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="${dist_rustflags# }"
     log "  CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS=$CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS"
 
+    # NDK env for build scripts of vendored C deps in extended tools
+    # (cargo links vendored openssl + curl; openssl-src's android path reads
+    # ANDROID_NDK_ROOT / ANDROID_NDK_HOME). Harmless if already set.
+    export ANDROID_NDK_ROOT="${ANDROID_NDK_ROOT:-$NDK_ROOT}"
+    export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$NDK_ROOT}"
+
     # Full stage-2 self-hosting dist build.
     # --stage 2 = build stage0 -> stage1 -> stage2, where stage2 rustc runs
     # on aarch64-linux-android (the host triple).
@@ -447,8 +542,38 @@ do_dist() {
         | tee "$dist_log" \
         || fail "x.py dist failed — see $dist_log"
 
-    log "dist OK — artifacts in $DIST_DIR"
-    log "  run ./verify.sh $DIST_DIR to sanity-check the tarball"
+    # x.py writes tarballs to $RUST_SRC/build/dist/ — NOT to $DIST_DIR.
+    # Copy them into $DIST_DIR so verify.sh and the CI artifact-upload step
+    # actually find them. (Previously this copy was missing entirely:
+    # stage/dist/ stayed empty and verification failed with
+    # "no ELF files found" after a successful 2h+ build — CI run #16.)
+    local xpy_dist_dir="${RUST_SRC}/build/dist"
+    if [[ ! -d "$xpy_dist_dir" ]] || [[ -z "$(ls -A "$xpy_dist_dir" 2>/dev/null)" ]]; then
+        fail "x.py dist produced no artifacts at $xpy_dist_dir — see $dist_log"
+    fi
+    log "  copying artifacts: $xpy_dist_dir -> $DIST_DIR"
+    cp -a "$xpy_dist_dir"/. "$DIST_DIR"/ \
+        || fail "copying dist artifacts into $DIST_DIR failed"
+
+    # Bundle the NDK's libc++_shared.so alongside the tarballs.
+    # Rationale: do_dist links stage2 rustc (and any extended tools) with
+    # -lc++_shared, so those binaries carry DT_NEEDED=libc++_shared.so.
+    # Android ships no system-wide libc++, so the file MUST travel with the
+    # toolchain. On-device install: place it in $RUSTDROID_PREFIX/lib and
+    # export LD_LIBRARY_PATH=$RUSTDROID_PREFIX/lib (see README).
+    local libcxx_src="${NDK_TOOLCHAIN_BIN%/bin}/sysroot/usr/lib/${RUSTDROID_HOST_TRIPLE}/libc++_shared.so"
+    if [[ -f "$libcxx_src" ]]; then
+        cp -a "$libcxx_src" "$DIST_DIR/libc++_shared.so"
+        log "  bundled $DIST_DIR/libc++_shared.so (runtime dep of -lc++_shared-linked binaries)"
+    else
+        log "  WARN: libc++_shared.so not found at $libcxx_src"
+        log "       dist binaries linked with -lc++_shared will need it from the NDK at install time"
+    fi
+
+    log "dist OK — artifacts in $DIST_DIR:"
+    ls -la "$DIST_DIR"
+    log "  verify with: ./verify.sh ./stage/dist-extracted/  (after extracting)"
+    log "  or a single tarball: ./verify.sh $DIST_DIR/rust-std-${RUST_TAG}-aarch64-linux-android.tar.xz"
 }
 
 # ----------------------------------------------------------------------------
