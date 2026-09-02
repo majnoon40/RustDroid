@@ -335,8 +335,16 @@ check_link_kit() {
         if ! grep -q 'rust-lld' "$kit/bin/$f"; then
             fail "bin/$f does not reference rust-lld (corrupt shim?)"
         fi
+        if ! grep -q 'gcc-ld/ld.lld' "$kit/bin/$f"; then
+            fail "bin/$f does not use gcc-ld/ld.lld flavor dispatch (generic rust-lld refuses to link)"
+        fi
         if ! grep -q 'rustdroid-link' "$kit/bin/$f"; then
             fail "bin/$f does not reference the link kit (corrupt shim?)"
+        fi
+        # -L kit paths must precede the -l resolution point (rustc links with
+        # -nodefaultlibs; the driver must supply the search paths)
+        if ! grep -q 'CMD="\$CMD -L \$KIT' "$kit/bin/$f"; then
+            fail "bin/$f does not add kit -L paths before -l flags"
         fi
     done
     pass "cc/clang/gcc linker-driver shims present and sane"
@@ -349,8 +357,12 @@ check_link_kit() {
     fi
     pass "crtbegin_dynamic.o is AArch64"
 
-    # the shims exec rust-lld from the rustc component — make sure it exists
-    local lld="$TARGET_DIR/rustc-${RUST_TAG}-aarch64-linux-android/rustc/lib/rustlib/aarch64-linux-android/bin/rust-lld"
+    # the shims exec ld.lld from the rustc component — make sure it exists
+    # (gcc-ld/ld.lld preferred: generic rust-lld refuses to link)
+    local lld="$TARGET_DIR/rustc-${RUST_TAG}-aarch64-linux-android/rustc/lib/rustlib/aarch64-linux-android/bin/gcc-ld/ld.lld"
+    if [[ ! -e "$lld" ]]; then
+        lld="$(find "$TARGET_DIR" -path '*rustlib/aarch64-linux-android/bin/gcc-ld/ld.lld' -print -quit 2>/dev/null)"
+    fi
     if [[ ! -e "$lld" ]]; then
         lld="$(find "$TARGET_DIR" -path '*rustlib/aarch64-linux-android/bin/rust-lld' -print -quit 2>/dev/null)"
     fi

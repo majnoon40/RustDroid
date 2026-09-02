@@ -785,12 +785,18 @@ do_dist() {
 
 SELF_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
 PREFIX="$(dirname "$SELF_DIR")"
-LLD="$PREFIX/lib/rustlib/aarch64-linux-android/bin/rust-lld"
+# lld is a MULTI-CALL driver: invoked under the generic name `rust-lld` it
+# refuses to link ("lld is a generic driver — invoke ld.lld (Unix) ...");
+# the flavor is selected by argv[0]. The rustc dist ships real per-flavor
+# copies under gcc-ld/ (ld.lld, ld64.lld, lld-link, wasm-ld).
+RUSTLIB="$PREFIX/lib/rustlib/aarch64-linux-android/bin"
+LLD="$RUSTLIB/gcc-ld/ld.lld"
+[ -x "$LLD" ] || LLD="$RUSTLIB/rust-lld"   # fallback (generic; usually refuses)
 KIT="$PREFIX/lib/rustdroid-link"
 
 if [ "$#" -eq 1 ]; then
     case "$1" in
-        --version|-v) echo "rustdroid-cc 0.1 (link-only shim over rust-lld)"; exit 0 ;;
+        --version|-v) echo "rustdroid-cc 0.2 (link-only shim over ld.lld)"; exit 0 ;;
     esac
 fi
 if [ ! -x "$LLD" ]; then
@@ -867,12 +873,16 @@ CMD="$LLD"
 if [ "$NO_CRT" = "0" ]; then
     CMD="$CMD $CRT_B"
 fi
+# -L paths BEFORE every -l: ld-style linkers resolve -l flags at their
+# parse position, and rustc (in -nodefaultlibs mode, as on Android) relies
+# on the DRIVER to supply library search paths — lld has no defaults here.
+CMD="$CMD -L $KIT -L $KIT/sysroot -L $PREFIX/lib"
 CMD="$CMD$FILES $LD_ARGS"
 if [ "$NO_LIBS" = "0" ]; then
     if [ -f "$KIT/libclang_rt.builtins.a" ]; then
         CMD="$CMD $KIT/libclang_rt.builtins.a"
     fi
-    CMD="$CMD -L $KIT -L $KIT/sysroot -L $PREFIX/lib -lc -lm -ldl"
+    CMD="$CMD -lc -lm -ldl"
 fi
 if [ "$NO_CRT" = "0" ]; then
     CMD="$CMD $CRT_E"
