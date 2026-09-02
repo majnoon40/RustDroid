@@ -287,6 +287,84 @@ EOF
 }
 
 # ----------------------------------------------------------------------------
+# Check 5: RustDroid link kit (on-device linking support)
+#
+# Verified on-device (2026-09-02): rustc/cargo run and --emit=obj compiles,
+# but linking fails with "linker 'cc' not found" — stock Android has no C
+# linker driver, crt objects or link-time libc stubs. The dist must carry
+# the link kit (crt objects + bionic stubs + cc/clang/gcc shims) so
+# `rustc hello.rs -o hello` and `cargo run` work on-device.
+# ----------------------------------------------------------------------------
+check_link_kit() {
+    log "=== check 5: RustDroid link kit (on-device linking) ==="
+    local kit=""
+    local cand
+    for cand in "$TARGET_DIR/rustdroid-link" "$(dirname "$TARGET_DIR")/dist/rustdroid-link"; do
+        if [[ -d "$cand" ]]; then
+            kit="$cand"
+            break
+        fi
+    done
+    if [[ -z "$kit" ]]; then
+        fail "rustdroid-link kit not found (expected loose in the dist dir next to the tarballs)"
+    fi
+    log "  kit found at $kit"
+
+    local f
+    for f in crtbegin_dynamic.o crtbegin_so.o crtend_android.o crtend_so.o; do
+        if [[ ! -f "$kit/$f" ]]; then
+            fail "link kit missing $f"
+        fi
+    done
+    pass "crt objects present (crtbegin_dynamic/so, crtend_android/so)"
+
+    if [[ ! -f "$kit/sysroot/libc.so" ]]; then
+        fail "link kit missing sysroot/libc.so (bionic link stub)"
+    fi
+    for f in libm.so libdl.so; do
+        if [[ ! -f "$kit/sysroot/$f" ]]; then
+            warn "link kit missing sysroot/$f"
+        fi
+    done
+    pass "bionic link stubs present ($(ls "$kit/sysroot" 2>/dev/null | wc -l) .so files)"
+
+    for f in cc clang gcc; do
+        if [[ ! -f "$kit/bin/$f" ]]; then
+            fail "link kit missing bin/$f (linker driver shim)"
+        fi
+        if ! grep -q 'rust-lld' "$kit/bin/$f"; then
+            fail "bin/$f does not reference rust-lld (corrupt shim?)"
+        fi
+        if ! grep -q 'rustdroid-link' "$kit/bin/$f"; then
+            fail "bin/$f does not reference the link kit (corrupt shim?)"
+        fi
+    done
+    pass "cc/clang/gcc linker-driver shims present and sane"
+
+    # crt objects must be AArch64 (guards against bundling host artifacts)
+    local mach
+    mach="$("$READELF" -h "$kit/crtbegin_dynamic.o" 2>/dev/null | awk '/Machine:/ {print $NF}')"
+    if [[ "$mach" != "AArch64" ]]; then
+        fail "crtbegin_dynamic.o Machine != AArch64 (got: ${mach:-none})"
+    fi
+    pass "crtbegin_dynamic.o is AArch64"
+
+    # the shims exec rust-lld from the rustc component — make sure it exists
+    local lld="$TARGET_DIR/rustc-${RUST_TAG}-aarch64-linux-android/rustc/lib/rustlib/aarch64-linux-android/bin/rust-lld"
+    if [[ ! -e "$lld" ]]; then
+        lld="$(find "$TARGET_DIR" -path '*rustlib/aarch64-linux-android/bin/rust-lld' -print -quit 2>/dev/null)"
+    fi
+    if [[ -n "$lld" ]]; then
+        if [[ -L "$lld" ]]; then
+            warn "rust-lld at $lld is a symlink (may not survive Windows repacking)"
+        fi
+        pass "rust-lld present at ${lld#$TARGET_DIR/}"
+    else
+        warn "rust-lld not found in extracted tree — shim exec target untested"
+    fi
+}
+
+# ----------------------------------------------------------------------------
 # Run all checks.
 # ----------------------------------------------------------------------------
 log "RustDroid verify.sh starting on: $TARGET"
@@ -296,6 +374,7 @@ log "ELF file count   = ${#ELF_FILES[@]}"
 check_termux_strings
 check_rpath
 check_interp
+check_link_kit
 check_smoke_compile
 
 log "all static checks complete."

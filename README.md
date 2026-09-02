@@ -44,7 +44,7 @@ Phase 1 is deliberately the highest-risk piece: if a Bionic-hosted `rustc`+`carg
 
 An LLVM build cache (`stage/rust-src/build/*/llvm`, ~2 GB) is keyed on `hashFiles(bootstrap.toml.template, build.sh)` with an `llvm-` restore-key fallback, so unrelated changes do not force a full LLVM rebuild. First full run ≈ 2.5 h; cached runs ≈ 1.5 h.
 
-**Expected dist output** (component tarballs + one runtime lib):
+**Expected dist output** (component tarballs + runtime lib + link kit):
 
 ```
 stage/dist/
@@ -54,7 +54,13 @@ stage/dist/
 ├── rustc-dev-1.85.0-aarch64-linux-android.tar.xz
 ├── rust-src-1.85.0.tar.xz
 ├── rust-dev-1.85.0-aarch64-linux-android.tar.xz
-└── libc++_shared.so                               # runtime dep of -lc++_shared-linked binaries
+├── libc++_shared.so                               # runtime dep of -lc++_shared-linked binaries
+└── rustdroid-link/                                # on-device LINKING support
+    ├── bin/{cc,clang,gcc}                         #   linker-driver shims over rust-lld
+    ├── crtbegin_dynamic.o, crtbegin_so.o          #   Bionic startup objects (NDK)
+    ├── crtend_android.o, crtend_so.o
+    ├── libgcc.a, libunwind.a, libclang_rt.builtins.a
+    └── sysroot/                                   #   link-time stubs (libc.so, libm.so, ...)
 ```
 
 ## Notes learned the hard way
@@ -67,6 +73,8 @@ Each of these was a real CI failure (see commit history / DEVIATIONS.md):
 - **Bootstrap does not vendor git checkouts by default** — `vendor = true` only applies to release tarballs. Without an explicit source-replacement config, tool builds (cargo included) compile from the **unpatched crates.io registry**, silently embedding Termux paths from `openssl-probe` (run #20). Fix: `do_vendor` writes `$RUST_SRC/.cargo/config.toml` with the source replacement, and `bootstrap.toml` sets `vendor = true`.
 - **Editing vendored sources breaks cargo's directory-source checksums** — after patching `vendor/openssl-probe`, `.cargo-checksum.json` must be regenerated or `--frozen` builds fail with "the listed checksum has changed" (run #21). Fix: `do_patches_post_vendor` resyncs the checksum file for every crate a patch touched.
 - **openssl-sys must come from the vendor set, not the registry**, and needs `ANDROID_NDK_ROOT`/`ANDROID_NDK_HOME` exported for its vendored-openssl cross-build (run #18).
+- **On-device validation (2026-09-02, TECNO-LJ9, Android shell in `/data/local/tmp`)**: `rustc --version`, `cargo --version` and `rustc --emit=obj` all work — the Bionic-hosted compiler genuinely compiles Rust on Android. `rustc hello.rs -o hello` failed with `linker 'cc' not found`: stock Android ships no C linker driver, crt objects, or link-time libc stubs. Fix: the **rustdroid-link kit** (crt objects + bionic stubs + `cc`/`clang`/`gcc` shims that drive the toolchain's own `rust-lld`) is bundled into the dist; after installing it, `rustc` links with no extra flags.
+- **Windows repacking loses Unix permission bits**: extracting/repacking the tarballs with Windows `tar` produces `rw-rw-rw-` files — run `chmod -R 755 <toolchain-dir>` once on-device after extracting.
 
 ## Building locally (alternative)
 
@@ -80,37 +88,56 @@ On a real Ubuntu x86_64 host with root, 16 GB+ RAM, 30 GB+ disk:
 
 For a fast pipeline check without the full build: `./build.sh all-smoke` (cross-compiles `hello.c` with the NDK + shims, `x.py` config validation).
 
-## On-device validation (via adb, app sandbox)
+## On-device validation (via adb)
+
+**Minimum set for a smoke test** (skip rust-dev / rustc-dev / docs / src / the big `rust-` meta bundle):
+`rustc`, `rust-std`, `cargo` tarballs + `libc++_shared.so` + `rustdroid-link/`.
+
+> **Windows hosts**: Android's `tar` has no `xz` support, so decompress on the PC (`tar -xf foo.tar.xz`) and push plain `tar`s. Windows repacking also drops Unix permission bits — run the `chmod` step below, always.
 
 ```bash
-PREFIX=/data/data/dev.rustdroid.ide/files/usr
+adb shell mkdir -p /data/local/tmp/rd
+adb push rustc.tar rust-std.tar cargo.tar /data/local/tmp/rd/   # PC-decompressed, plain tar
+adb push libc++_shared.so /data/local/tmp/rd/
+adb push rustdroid-link /data/local/tmp/rd/                     # loose directory, recursive push
+```
 
-# 1. Push the dist directory (tarballs + libc++_shared.so).
-adb push stage/dist /data/local/tmp/rustdroid-dist
+Then, inside one `adb shell` session (the exports must survive):
 
-# 2. Extract under the app's sandbox (must be writable by the app user).
-adb shell run-as dev.rustdroid.ide sh -c '
-  mkdir -p '$PREFIX'/lib &&
-  cd '$PREFIX' &&
-  for f in /data/local/tmp/rustdroid-dist/*.tar.xz; do tar xf "$f"; done &&
-  cp /data/local/tmp/rustdroid-dist/libc++_shared.so '$PREFIX'/lib/'
+```sh
+cd /data/local/tmp/rd
+mkdir -p tc
+for t in rustc rust-std cargo; do tar xf $t.tar -C tc --strip-components=2; done
+cp libc++_shared.so tc/lib/         # runtime dep of rustc (libc++_shared)
+cp -a rustdroid-link tc/lib/        # crt objects + bionic stubs
+mkdir -p tc/bin
+cp rustdroid-link/bin/* tc/bin/     # cc / clang / gcc linker-driver shims
+chmod -R 755 tc                     # (Windows-repack permission fix; harmless on Linux hosts)
 
-# 3. Smoke-compile: rustc + cargo must both run.
-adb shell run-as dev.rustdroid.ide sh -c '
-  export RUSTDROID_PREFIX='$PREFIX' &&
-  export LD_LIBRARY_PATH='$PREFIX'/lib &&
-  export PATH='$PREFIX'/bin:$PATH &&
-  echo "fn main() { println!(\"hello from RustDroid\"); }" > hello.rs &&
-  rustc hello.rs -o hello && ./hello &&
-  cargo new smoke && cd smoke && cargo run'
+export TC=/data/local/tmp/rd/tc
+export LD_LIBRARY_PATH=$TC/lib      # libc++_shared.so for rustc and rust-lld
+export HOME=/data/local/tmp/rd      # cargo home
+export PATH=$TC/bin:$PATH           # rustc, cargo, AND the cc shim (rustc's default linker)
 
-# 4. Full on-device verification (static checks + smoke-compile).
+rustc --version && cargo --version
+
+echo 'fn main() { println!("hello from RustDroid on Android"); }' > hello.rs
+rustc hello.rs -o hello && ./hello
+
+cargo new smoke && cd smoke && cargo run
+```
+
+What works today (verified on a TECNO-LJ9, 2026-09-02): `rustc --version`, `cargo --version`, `rustc --emit=obj` (full compile pipeline), and — with the link kit installed — linking and running `hello`-style binaries via the `cc` shim + `rust-lld`. **Not yet supported**: compiling C code (build scripts using the `cc` crate) — the shim is link-only and reports that clearly; a real on-device `clang` is Phase 2 work. `cargo build` of crates with network dependencies needs the registry reachable from the device.
+
+`LD_LIBRARY_PATH=$TC/lib` is required: dist binaries carry `DT_NEEDED=libc++_shared.so`, which is not part of Android's system libraries.
+
+For the real app-sandbox prefix (once the Phase 2 app exists), the same steps run wrapped in `adb shell run-as dev.rustdroid.ide` with `PREFIX=/data/data/dev.rustdroid.ide/files/usr` — plus:
+
+```bash
 adb shell run-as dev.rustdroid.ide sh -c '
   RUSTDROID_PREFIX='$PREFIX' RUSTDROID_PACKAGE_NAME=dev.rustdroid.ide \
   sh /data/local/tmp/verify.sh '$PREFIX' --device'
 ```
-
-`LD_LIBRARY_PATH=$PREFIX/lib` is required: dist binaries carry `DT_NEEDED=libc++_shared.so`, which is not part of Android's system libraries.
 
 ## Repo layout
 

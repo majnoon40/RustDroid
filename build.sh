@@ -640,6 +640,213 @@ do_dist() {
         log "       dist binaries linked with -lc++_shared will need it from the NDK at install time"
     fi
 
+    # ------------------------------------------------------------------------
+    # RustDroid link kit — everything needed to LINK binaries ON-DEVICE.
+    #
+    # On-device validation (2026-09-02, TECNO-LJ9, /data/local/tmp):
+    #   rustc --version         OK
+    #   cargo --version         OK
+    #   rustc --emit=obj        OK  (full compile pipeline works on-device)
+    #   rustc hello.rs -o hello FAIL: "linker 'cc' not found"
+    #
+    # Stock Android ships no C linker driver, no crtbegin/crtend startup
+    # objects and no link-time libc stubs. The fix: ship a kit with
+    #   - crt objects (crtbegin_dynamic/so, crtend_android/so) from the NDK
+    #   - link-time stub .so libs for the pinned API (their SONAMEs match
+    #     the device's real /system/lib64 libs, so linked binaries load)
+    #   - libgcc.a / libunwind.a / clang_rt.builtins (symbol resolution)
+    #   - bin/{cc,clang,gcc}: sh shim emulating a clang-style LINKER DRIVER
+    #     over the toolchain's own rust-lld (shipped in the rustc tarball
+    #     at lib/rustlib/aarch64-linux-android/bin/rust-lld). LINKING ONLY —
+    #     C compilation (-c) is not supported yet (Phase 2 ships real clang).
+    #
+    # On-device install:
+    #   cp -a rustdroid-link $PREFIX/lib/
+    #   cp rustdroid-link/bin/* $PREFIX/bin/ && chmod 755 $PREFIX/bin/*
+    # After that rustc needs no extra flags: its default linker is "cc",
+    # found on $PREFIX/bin.
+    # ------------------------------------------------------------------------
+    local kit_dir="$DIST_DIR/rustdroid-link"
+    local sysroot_lib="${NDK_TOOLCHAIN_BIN%/bin}/sysroot/usr/lib/${RUSTDROID_HOST_TRIPLE}"
+    local kit_f kit_src
+    mkdir -p "$kit_dir/bin" "$kit_dir/sysroot"
+
+    for kit_f in crtbegin_dynamic.o crtbegin_so.o crtend_android.o crtend_so.o; do
+        kit_src="$(find "$sysroot_lib" -name "$kit_f" -print -quit 2>/dev/null)"
+        if [[ -z "$kit_src" ]]; then
+            fail "link kit: $kit_f not found under $sysroot_lib (NDK sysroot layout changed?)"
+        fi
+        cp -a "$kit_src" "$kit_dir/$kit_f"
+    done
+    log "  link kit: crt objects bundled from $sysroot_lib"
+
+    # Link-time stub libs for the pinned API level (libc.so is REQUIRED:
+    # every linked binary gets DT_NEEDED=libc.so matching /system/lib64).
+    local api_dir="$sysroot_lib/${NDK_API_LEVEL}"
+    if [[ ! -d "$api_dir" ]]; then
+        api_dir="$sysroot_lib"
+        log "  WARN: per-API dir $sysroot_lib/${NDK_API_LEVEL} missing; using $api_dir"
+    fi
+    local kit_so
+    for kit_so in "$api_dir"/*.so; do
+        [[ -e "$kit_so" ]] || continue
+        cp -a "$kit_so" "$kit_dir/sysroot/"
+    done
+    if [[ ! -f "$kit_dir/sysroot/libc.so" ]]; then
+        fail "link kit: libc.so stub not found in $api_dir — on-device linking impossible"
+    fi
+    for kit_f in libm.so libdl.so; do
+        if [[ ! -f "$kit_dir/sysroot/$kit_f" ]]; then
+            log "  WARN: link kit sysroot missing $kit_f (from $api_dir)"
+        fi
+    done
+    log "  link kit: bionic stub libs bundled ($(ls "$kit_dir/sysroot" | wc -l) .so files)"
+
+    # compiler-rt builtins + libgcc/libunwind stubs
+    local builtins_src
+    builtins_src="$(find "${NDK_TOOLCHAIN_BIN%/bin}" -name 'libclang_rt.builtins-aarch64-android.a' -print -quit 2>/dev/null)"
+    if [[ -n "$builtins_src" ]]; then
+        cp -a "$builtins_src" "$kit_dir/libclang_rt.builtins.a"
+    else
+        log "  WARN: libclang_rt.builtins-aarch64-android.a not found under ${NDK_TOOLCHAIN_BIN%/bin}"
+    fi
+    for kit_f in libgcc.a libunwind.a; do
+        if [[ -f "$sysroot_lib/$kit_f" ]]; then
+            cp -a "$sysroot_lib/$kit_f" "$kit_dir/$kit_f"
+        else
+            log "  WARN: $kit_f not at $sysroot_lib (kit continues without it)"
+        fi
+    done
+
+    # The cc/clang/gcc linker-driver shim (identical script, three names:
+    # rustc's default linker is "cc"; the cc crate probes "clang" first).
+    cat > "$kit_dir/bin/cc" <<'SHIM_EOF'
+#!/system/bin/sh
+# rustdroid-cc — clang-style LINKER DRIVER shim over rust-lld.
+#
+# rustc's default linker for aarch64-linux-android is "cc" (a C compiler
+# driver). Stock Android ships none. This shim emulates just enough of a
+# clang-style driver for rustc's LINK phase: cc-style flags are translated
+# to lld (GNU ld) syntax, the Android crt objects + bionic stub libs from
+# the RustDroid link kit are added, and the toolchain's own rust-lld is
+# exec'd.
+#
+# LINKING ONLY. C compilation (-c/-E/-S) is rejected with a clear message;
+# a real on-device clang arrives in a later phase.
+#
+# Limitation: arguments are split on whitespace — paths with spaces are
+# not supported (rustc link invocations never produce them on Android).
+#
+# Install: $RUSTDROID_PREFIX/bin/{cc,clang,gcc}
+# Kit:     $RUSTDROID_PREFIX/lib/rustdroid-link
+
+SELF_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+PREFIX="$(dirname "$SELF_DIR")"
+LLD="$PREFIX/lib/rustlib/aarch64-linux-android/bin/rust-lld"
+KIT="$PREFIX/lib/rustdroid-link"
+
+if [ "$#" -eq 1 ]; then
+    case "$1" in
+        --version|-v) echo "rustdroid-cc 0.1 (link-only shim over rust-lld)"; exit 0 ;;
+    esac
+fi
+if [ ! -x "$LLD" ]; then
+    echo "rustdroid-cc: rust-lld not found at $LLD" >&2
+    echo "  (is the toolchain extracted under $PREFIX?)" >&2
+    exit 1
+fi
+if [ ! -f "$KIT/crtbegin_dynamic.o" ]; then
+    echo "rustdroid-cc: link kit missing at $KIT" >&2
+    echo "  (install with: cp -a rustdroid-link \$PREFIX/lib/)" >&2
+    exit 1
+fi
+
+LD_ARGS=""
+FILES=""
+LINK_SHARED=0
+PIE=1
+NO_CRT=0
+NO_LIBS=0
+NEXT=""
+
+for a in "$@"; do
+    if [ -n "$NEXT" ]; then
+        case "$NEXT" in
+            o)  LD_ARGS="$LD_ARGS -o $a" ;;
+            L)  LD_ARGS="$LD_ARGS -L $a" ;;
+            u)  LD_ARGS="$LD_ARGS -u $a" ;;
+            vs) LD_ARGS="$LD_ARGS $a" ;;
+        esac
+        NEXT=""
+        continue
+    fi
+    case "$a" in
+        # compile modes this shim cannot serve — fail loudly, not obscurely
+        -c|-E|-S|-M|-MM)
+            echo "rustdroid-cc: flag '$a' (C compilation) unsupported — this shim only links" >&2
+            exit 70 ;;
+        # translated / passed through in lld (GNU ld) syntax
+        -Wl,*)
+            LD_ARGS="$LD_ARGS $(printf '%s' "${a#-Wl,}" | tr ',' ' ')" ;;
+        -shared)        LINK_SHARED=1; LD_ARGS="$LD_ARGS -shared" ;;
+        -pie)           PIE=1 ;;
+        -no-pie|-nopie) PIE=0 ;;
+        -nostdlib)      NO_CRT=1; NO_LIBS=1 ;;
+        -nostartfiles)  NO_CRT=1 ;;
+        -nodefaultlibs|-nostdlib++) NO_LIBS=1 ;;
+        -rdynamic)      LD_ARGS="$LD_ARGS --export-dynamic" ;;
+        -o)             NEXT=o ;;
+        -L)             NEXT=L ;;
+        -u)             NEXT=u ;;
+        --version-script) NEXT=vs; LD_ARGS="$LD_ARGS --version-script" ;;
+        -l*|-L*|-soname*|-h|-z*|--as-needed|--no-as-needed|--whole-archive|\
+        --no-whole-archive|--start-group|--end-group|-Bstatic|-Bdynamic|\
+        -Bsymbolic*|--exclude-libs*|--version-script*|-s)
+            LD_ARGS="$LD_ARGS $a" ;;
+        # C-compiler-only flags: harmless to drop for linking
+        --target=*|-f*|-m*|-g*|-O*|-D*|-I*|-U*|-pthread|-rtlib=*|--rtlib=*|\
+        -unwindlib=*|--unwindlib=*|-fuse-ld=*|-fuse-*|-Wa*|-Wp*|-static-libgcc|\
+        -pipe|-v|-x)
+            : ;;
+        *) FILES="$FILES $a" ;;
+    esac
+done
+
+if [ "$LINK_SHARED" = "1" ]; then
+    CRT_B="$KIT/crtbegin_so.o"
+    CRT_E="$KIT/crtend_so.o"
+else
+    CRT_B="$KIT/crtbegin_dynamic.o"
+    CRT_E="$KIT/crtend_android.o"
+fi
+
+CMD="$LLD"
+if [ "$NO_CRT" = "0" ]; then
+    CMD="$CMD $CRT_B"
+fi
+CMD="$CMD$FILES $LD_ARGS"
+if [ "$NO_LIBS" = "0" ]; then
+    if [ -f "$KIT/libclang_rt.builtins.a" ]; then
+        CMD="$CMD $KIT/libclang_rt.builtins.a"
+    fi
+    CMD="$CMD -L $KIT -L $KIT/sysroot -L $PREFIX/lib -lc -lm -ldl"
+fi
+if [ "$NO_CRT" = "0" ]; then
+    CMD="$CMD $CRT_E"
+fi
+CMD="$CMD -z max-page-size=16384 -z noexecstack"
+if [ "$LINK_SHARED" = "0" ] && [ "$PIE" = "1" ]; then
+    CMD="$CMD -pie -dynamic-linker /system/bin/linker64"
+fi
+
+exec $CMD
+SHIM_EOF
+    chmod 755 "$kit_dir/bin/cc"
+    cp "$kit_dir/bin/cc" "$kit_dir/bin/clang"
+    cp "$kit_dir/bin/cc" "$kit_dir/bin/gcc"
+    chmod 755 "$kit_dir/bin/clang" "$kit_dir/bin/gcc"
+    log "  link kit: cc/clang/gcc linker-driver shims written"
+
     log "dist OK — artifacts in $DIST_DIR:"
     ls -la "$DIST_DIR"
     log "  verify with: ./verify.sh ./stage/dist-extracted/  (after extracting)"
