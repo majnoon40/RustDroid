@@ -349,6 +349,25 @@ check_link_kit() {
     done
     pass "cc/clang/gcc linker-driver shims present and sane"
 
+    # libunwind.a is REQUIRED: rustc's android link line passes -lunwind and
+    # nothing else provides those symbols (libc++_shared.so exports none).
+    # Its absence caused the 2026-09-02 on-device failure "unable to find
+    # library -lunwind" — the kit shipped without it because build.sh then
+    # only WARNed when the file was not in the NDK sysroot (it actually
+    # lives in the toolchain's clang runtime dir).
+    if [[ ! -f "$kit/libunwind.a" ]]; then
+        fail "link kit missing libunwind.a — on-device -lunwind would fail"
+    fi
+    if [[ -z "$(nm "$kit/libunwind.a" 2>/dev/null | grep '_Unwind_Resume')" ]]; then
+        fail "kit libunwind.a contains no _Unwind symbols (wrong archive?)"
+    fi
+    pass "libunwind.a present with _Unwind symbols"
+
+    if [[ ! -f "$kit/libclang_rt.builtins.a" ]]; then
+        fail "link kit missing libclang_rt.builtins.a"
+    fi
+    pass "libclang_rt.builtins.a present"
+
     # crt objects must be AArch64 (guards against bundling host artifacts)
     local mach
     mach="$("$READELF" -h "$kit/crtbegin_dynamic.o" 2>/dev/null | awk '/Machine:/ {print $NF}')"
@@ -377,6 +396,109 @@ check_link_kit() {
 }
 
 # ----------------------------------------------------------------------------
+# Check 6: on-host LINK smoke test — reproduce the on-device rustc link.
+#
+# Runs the DIST kit's cc shim + a rust 1.85.0 cross-compile on THIS host:
+#   rustc --target aarch64-linux-android hello.rs (cc shim in PATH)
+# The shim's lld exec target is swapped for the host-runnable ld.lld from
+# the rustup toolchain (lld's library resolution is arch-independent; only
+# the exec'ed binary differs). This is the exact failure mode chain caught
+# on-device 2026-09-02 (generic-driver refusal, then -lunwind resolution)
+# — either would have failed THIS check before shipping.
+# Requires: rustup + network (installs 1.85.0 + aarch64 target, ~40 MB).
+# Warn-skips when rustup/network unavailable (non-CI hosts).
+# ----------------------------------------------------------------------------
+check_link_smoke() {
+    log "=== check 6: on-host rustc link smoke test (kit + shim) ==="
+    if ! command -v rustup >/dev/null 2>&1; then
+        warn "rustup not found — skipping on-host link smoke test"
+        return 0
+    fi
+    local kit=""
+    local cand
+    for cand in "$TARGET_DIR/rustdroid-link" "$(dirname "$TARGET_DIR")/dist/rustdroid-link"; do
+        [[ -d "$cand" ]] && { kit="$cand"; break; }
+    done
+    [[ -n "$kit" ]] || { warn "no kit dir — skipping link smoke test"; return 0; }
+
+    local tc_bin=""
+    tc_bin="$(rustup which --toolchain "$RUST_TAG" rustc 2>/dev/null)" || true
+    if [[ -z "$tc_bin" || ! -x "$tc_bin" ]]; then
+        log "  installing rustup toolchain $RUST_TAG (minimal) + aarch64 target..."
+        if ! rustup toolchain install "$RUST_TAG" --profile minimal >/dev/null 2>&1; then
+            warn "could not install rustup toolchain $RUST_TAG — skipping link smoke test"
+            return 0
+        fi
+        tc_bin="$(rustup which --toolchain "$RUST_TAG" rustc 2>/dev/null)"
+    fi
+    if ! rustup target list --toolchain "$RUST_TAG" --installed 2>/dev/null | grep -q aarch64-linux-android; then
+        rustup target add aarch64-linux-android --toolchain "$RUST_TAG" >/dev/null 2>&1 \
+            || { warn "aarch64-linux-android target unavailable — skipping link smoke test"; return 0; }
+    fi
+    local sysroot
+    sysroot="$("$tc_bin" --print sysroot)" || { warn "bad rustc — skipping"; return 0; }
+    local host_bin="$sysroot/lib/rustlib/x86_64-unknown-linux-gnu/bin"
+    # gcc-ld/ld.lld in the toolchain is a WRAPPER that re-execs sibling
+    # ../rust-lld by relative path — both must be present in the fake prefix.
+    [[ -f "$host_bin/gcc-ld/ld.lld" && -x "$host_bin/rust-lld" ]] \
+        || { warn "no host ld.lld/rust-lld pair in rustup toolchain — skipping link smoke test"; return 0; }
+
+    local fake bin_dir workdir
+    workdir="$(mktemp -d -p "${TMPDIR:-/tmp}" rustdroid-linksmoke-XXXX)"
+    fake="$workdir/prefix"; bin_dir="$fake/bin"
+    mkdir -p "$bin_dir" "$fake/lib/rustlib/aarch64-linux-android/bin/gcc-ld"
+
+    # kit copy + shim with a HOST-runnable shebang (device uses /system/bin/sh;
+    # here we only validate translation + library resolution)
+    cp -a "$kit" "$fake/lib/rustdroid-link"
+    for f in cc clang gcc; do
+        [[ -f "$fake/lib/rustdroid-link/bin/$f" ]] || continue
+        sed '1s|.*|#!/bin/sh|' "$fake/lib/rustdroid-link/bin/$f" > "$bin_dir/$f"
+        chmod 755 "$bin_dir/$f"
+    done
+    # host-runnable lld pair at the path the shim expects. The dist's own
+    # aarch64 lld cannot run on an x86_64 host, and the host toolchain's
+    # rust-lld resolves libLLVM.so via $ORIGIN-relative RUNPATH — so instead
+    # of COPYING the binary (which breaks that resolution), place a stub
+    # script that exec's the real one in its original location. Chain:
+    # shim -> gcc-ld/ld.lld wrapper (copied, position-independent) ->
+    # stub (fake sibling) -> real host rust-lld (libLLVM resolves in place).
+    cp "$host_bin/gcc-ld/ld.lld" "$fake/lib/rustlib/aarch64-linux-android/bin/gcc-ld/ld.lld"
+    chmod 755 "$fake/lib/rustlib/aarch64-linux-android/bin/gcc-ld/ld.lld"
+    cat > "$fake/lib/rustlib/aarch64-linux-android/bin/rust-lld" <<STUBEOF
+#!/bin/sh
+exec "$host_bin/rust-lld" "\$@"
+STUBEOF
+    chmod 755 "$fake/lib/rustlib/aarch64-linux-android/bin/rust-lld"
+    # libc++_shared.so into prefix/lib (shim -L path; not needed to link hello)
+    for cand in "$DIST_DIR/libc++_shared.so" "$(dirname "$TARGET_DIR")/dist/libc++_shared.so"; do
+        if [[ -f "$cand" ]]; then cp "$cand" "$fake/lib/libc++_shared.so"; break; fi
+    done
+
+    cat > "$workdir/hello.rs" <<'EOF2'
+fn main() {
+    println!("hello from RustDroid");
+}
+EOF2
+    log "  linking with $tc_bin --target aarch64-linux-android (shim in PATH)"
+    if PATH="$bin_dir:$PATH" LD_LIBRARY_PATH="$fake/lib" \
+       "$tc_bin" --target aarch64-linux-android "$workdir/hello.rs" -o "$workdir/hello" 2>"$workdir/err.log"; then
+        local mach interp
+        mach="$("$READELF" -h "$workdir/hello" 2>/dev/null | awk '/Machine:/ {print $NF}')"
+        interp="$("$READELF" -lW "$workdir/hello" 2>/dev/null | grep -o 'Requesting program interpreter:.*' | awk '{print $NF}')"
+        interp="${interp%\]}"   # readelf prints [Requesting program interpreter: /system/bin/linker64]
+        [[ "$mach" == "AArch64" ]] || { fail "smoke link produced non-AArch64 output ($mach)"; }
+        [[ "$interp" == "/system/bin/linker64" ]] || { fail "smoke link PT_INTERP is '$interp' (expected /system/bin/linker64)"; }
+        pass "rustc cross-link via kit shim OK (AArch64 PIE, /system/bin/linker64)"
+    else
+        log "--- linker error output (tail) ---"
+        tail -8 "$workdir/err.log" >&2 || true
+        fail "on-host link smoke test FAILED — the kit would fail on-device the same way"
+    fi
+    rm -rf "$workdir"
+}
+
+# ----------------------------------------------------------------------------
 # Run all checks.
 # ----------------------------------------------------------------------------
 log "RustDroid verify.sh starting on: $TARGET"
@@ -387,6 +509,7 @@ check_termux_strings
 check_rpath
 check_interp
 check_link_kit
+check_link_smoke
 check_smoke_compile
 
 log "all static checks complete."

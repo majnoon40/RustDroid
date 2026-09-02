@@ -697,11 +697,13 @@ do_dist() {
     #   - crt objects (crtbegin_dynamic/so, crtend_android/so) from the NDK
     #   - link-time stub .so libs for the pinned API (their SONAMEs match
     #     the device's real /system/lib64 libs, so linked binaries load)
-    #   - libgcc.a / libunwind.a / clang_rt.builtins (symbol resolution)
+    #   - libunwind.a + libclang_rt.builtins.a (REQUIRED: rustc's android
+    #     link line uses -lunwind; libc++_shared.so exports no _Unwind_*)
     #   - bin/{cc,clang,gcc}: sh shim emulating a clang-style LINKER DRIVER
-    #     over the toolchain's own rust-lld (shipped in the rustc tarball
-    #     at lib/rustlib/aarch64-linux-android/bin/rust-lld). LINKING ONLY —
-    #     C compilation (-c) is not supported yet (Phase 2 ships real clang).
+    #     over the toolchain's own ld.lld (shipped in the rustc tarball
+    #     at lib/rustlib/aarch64-linux-android/bin/gcc-ld/ld.lld). LINKING
+    #     ONLY — C compilation (-c) is not supported yet (Phase 2 ships real
+    #     clang).
     #
     # On-device install:
     #   cp -a rustdroid-link $PREFIX/lib/
@@ -745,21 +747,43 @@ do_dist() {
     done
     log "  link kit: bionic stub libs bundled ($(ls "$kit_dir/sysroot" | wc -l) .so files)"
 
-    # compiler-rt builtins + libgcc/libunwind stubs
-    local builtins_src
+    # compiler-rt builtins + libunwind (both REQUIRED for on-device links)
+    #
+    # libunwind: rustc's android link line contains -lunwind (panic_unwind
+    # FFI) — without this file the on-device link fails exactly as seen in
+    # the 2026-09-02 device test: "rust-lld: error: unable to find library
+    # -lunwind". It is NOT in the NDK sysroot; it lives in the toolchain's
+    # clang runtime dir (verified in NDK r27c):
+    #   .../toolchains/llvm/prebuilt/linux-x86_64/lib/clang/18/lib/linux/aarch64/libunwind.a
+    # Find it anywhere under the toolchain (layout-drift tolerance) and FAIL
+    # LOUDLY if absent — a warn here shipped a silently broken kit once.
+    # libc++_shared.so does NOT export _Unwind_* (0 dynsym matches, NDK
+    # r27c), so the .a is the only provider. Its GLOBAL HIDDEN visibility
+    # is fine for executables: symbols link in statically and the output
+    # needs no libunwind at RUNTIME (DT_NEEDED stays libc/libdl only —
+    # verified by readelf on a locally-reproduced link).
+    local builtins_src unwind_src
     builtins_src="$(find "${NDK_TOOLCHAIN_BIN%/bin}" -name 'libclang_rt.builtins-aarch64-android.a' -print -quit 2>/dev/null)"
     if [[ -n "$builtins_src" ]]; then
         cp -a "$builtins_src" "$kit_dir/libclang_rt.builtins.a"
     else
-        log "  WARN: libclang_rt.builtins-aarch64-android.a not found under ${NDK_TOOLCHAIN_BIN%/bin}"
+        fail "link kit: libclang_rt.builtins-aarch64-android.a not found under ${NDK_TOOLCHAIN_BIN%/bin}"
     fi
-    for kit_f in libgcc.a libunwind.a; do
-        if [[ -f "$sysroot_lib/$kit_f" ]]; then
-            cp -a "$sysroot_lib/$kit_f" "$kit_dir/$kit_f"
-        else
-            log "  WARN: $kit_f not at $sysroot_lib (kit continues without it)"
-        fi
-    done
+    unwind_src="$(find "${NDK_TOOLCHAIN_BIN%/bin}" -path '*linux/aarch64/libunwind.a' -print -quit 2>/dev/null)"
+    [[ -n "$unwind_src" ]] || unwind_src="$(find "${NDK_TOOLCHAIN_BIN%/bin}" -name 'libunwind.a' -print -quit 2>/dev/null)"
+    if [[ -n "$unwind_src" ]]; then
+        cp -a "$unwind_src" "$kit_dir/libunwind.a"
+        log "  link kit: libunwind.a bundled from $unwind_src"
+    else
+        fail "link kit: libunwind.a (aarch64) not found under ${NDK_TOOLCHAIN_BIN%/bin} — on-device -lunwind would fail"
+    fi
+    # libgcc: NDK r21+ dropped it (clang uses compiler-rt builtins) and
+    # rustc's android link line has no -lgcc — optional, warn only.
+    if [[ -f "$sysroot_lib/libgcc.a" ]]; then
+        cp -a "$sysroot_lib/libgcc.a" "$kit_dir/libgcc.a"
+    else
+        log "  WARN: libgcc.a not at $sysroot_lib (NDK r21+ dropped libgcc; not needed by rustc's android link line)"
+    fi
 
     # The cc/clang/gcc linker-driver shim (identical script, three names:
     # rustc's default linker is "cc"; the cc crate probes "clang" first).
