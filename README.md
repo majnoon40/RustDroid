@@ -12,7 +12,7 @@ This repository currently contains **Phase 1**: the foundation everything else d
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| **1 — Toolchain** (this repo) | Self-hosting rustc + cargo for `aarch64-linux-android`, built via GitHub Actions, verified statically + on-device | **CI green** (run #22, 73 min): all 10 tarballs + `libc++_shared.so` built, 182 ELF files pass static checks (no Termux paths, correct PT_INTERP). On-device validation pending |
+| **1 — Toolchain** (this repo) | Self-hosting rustc + cargo for `aarch64-linux-android`, built via GitHub Actions, verified statically + on-device | **VALIDATED ON-DEVICE** (2026-09-02): full `rustc` compile + link + run works on a TECNO-LJ9 via the `rustdroid-link` kit (`hello from RustDroid on Android`). CI: runs #22/#23 green; kit + libunwind fix landed in 0f7eb19/2cc5296, baked into artifacts from run #26 on |
 | 2 — App shell | Android app (`dev.rustdroid.ide`) that downloads/bundles the toolchain, provides terminal + editor | Planned |
 | 3 — IDE experience | Code editor with Rust syntax/racer, project templates, build output panel, `cargo run` in PTY | Planned |
 
@@ -131,7 +131,7 @@ rustc hello.rs -o hello && ./hello
 cargo new smoke && cd smoke && cargo run
 ```
 
-What works today (verified on a TECNO-LJ9, 2026-09-02): `rustc --version`, `cargo --version`, `rustc --emit=obj` (full compile pipeline), and — with the link kit installed — linking and running `hello`-style binaries via the `cc` shim + `rust-lld`. **Not yet supported**: compiling C code (build scripts using the `cc` crate) — the shim is link-only and reports that clearly; a real on-device `clang` is Phase 2 work. `cargo build` of crates with network dependencies needs the registry reachable from the device.
+What works today (verified on a TECNO-LJ9, 2026-09-02): `rustc --version`, `cargo --version`, `rustc hello.rs -o hello && ./hello` — **full compile, link, and execution, entirely on-device** (the toolchain is self-hosting end-to-end). Linking goes through the `cc` shim → `gcc-ld/ld.lld` → `rust-lld -flavor gnu` chain with the `rustdroid-link` kit providing Bionic crt objects, NDK runtime libs, and `libunwind.a` (clang runtime dir — see run #26+ artifacts; earlier artifacts need the [libunwind.a patch](https://github.com/majnoon40/RustDroid/releases/download/device-kit-patch-20260902/libunwind.a)). **Not yet supported**: compiling C code (build scripts using the `cc` crate) — the shim is link-only and reports that clearly; a real on-device `clang` is Phase 2 work. `cargo build` of crates with network dependencies needs the registry reachable from the device.
 
 `LD_LIBRARY_PATH=$TC/lib` is required: dist binaries carry `DT_NEEDED=libc++_shared.so`, which is not part of Android's system libraries.
 
