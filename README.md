@@ -12,7 +12,7 @@ This repository currently contains **Phase 1**: the foundation everything else d
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| **1 — Toolchain** (this repo) | Self-hosting rustc + cargo for `aarch64-linux-android`, built via GitHub Actions, verified statically + on-device | **In progress** — full pipeline works; CI fix chain under test (run #22+) |
+| **1 — Toolchain** (this repo) | Self-hosting rustc + cargo for `aarch64-linux-android`, built via GitHub Actions, verified statically + on-device | **CI green** (run #22, 73 min): all 10 tarballs + `libc++_shared.so` built, 182 ELF files pass static checks (no Termux paths, correct PT_INTERP). On-device validation pending |
 | 2 — App shell | Android app (`dev.rustdroid.ide`) that downloads/bundles the toolchain, provides terminal + editor | Planned |
 | 3 — IDE experience | Code editor with Rust syntax/racer, project templates, build output panel, `cargo run` in PTY | Planned |
 
