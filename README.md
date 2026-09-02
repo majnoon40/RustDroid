@@ -1,8 +1,22 @@
-# RustDroid Toolchain
+# RustDroid
 
-Build a **self-hosting Rust toolchain for `aarch64-linux-android`** — `rustc` + `cargo` that run ON Android, reparented under an app-controlled prefix (`/data/data/dev.rustdroid.ide/files/usr`), independent of Termux's filesystem assumptions.
+A **Pydroid-style Rust IDE for Android** — develop, compile, and run Rust programs entirely on-device, with no PC, no Termux, and no root.
 
-This is the first, highest-risk piece of the RustDroid IDE (a Pydroid-style Rust IDE): proving that a Bionic-hosted `rustc` + `cargo` can be built and run standalone on Android.
+This repository currently contains **Phase 1**: the foundation everything else depends on — a **self-hosting Rust toolchain for `aarch64-linux-android`**, built by CI and installable under an app-owned prefix:
+
+- `rustc` + `cargo` that **execute on Android** (Bionic libc, `/system/bin/linker64`)
+- reparented to `/data/data/dev.rustdroid.ide/files/usr` — a prefix the future IDE app fully controls
+- zero Termux filesystem assumptions, zero Termux code or branding
+
+## Project phases
+
+| Phase | Scope | Status |
+|-------|-------|--------|
+| **1 — Toolchain** (this repo) | Self-hosting rustc + cargo for `aarch64-linux-android`, built via GitHub Actions, verified statically + on-device | **In progress** — full pipeline works; CI fix chain under test (run #22+) |
+| 2 — App shell | Android app (`dev.rustdroid.ide`) that downloads/bundles the toolchain, provides terminal + editor | Planned |
+| 3 — IDE experience | Code editor with Rust syntax/racer, project templates, build output panel, `cargo run` in PTY | Planned |
+
+Phase 1 is deliberately the highest-risk piece: if a Bionic-hosted `rustc`+`cargo` cannot run standalone in an app sandbox, nothing downstream matters. Everything else is "just" Android app engineering.
 
 ## Pinned versions (DO NOT CHANGE without re-running the full build)
 
@@ -21,14 +35,14 @@ This is the first, highest-risk piece of the RustDroid IDE (a Pydroid-style Rust
 
 ## Building via GitHub Actions (primary path)
 
-The workflow at `.github/workflows/main.yml` (manually dispatched via `workflow_dispatch`) runs the full pipeline on an `ubuntu-latest` runner:
+`main` is the **only branch**. The workflow at `.github/workflows/main.yml` is manually dispatched (`workflow_dispatch`) and runs the full pipeline on an `ubuntu-latest` runner:
 
 1. Frees disk, installs `cmake ninja-build patchelf` etc.
 2. Runs `./build.sh all` — `prepare → symlinks → shims → patches → vendor → patches-post-vendor → configure → dist`
-3. Extracts the resulting tarballs and runs `./verify.sh` (static checks: no Termux strings, no bad RPATH, correct Android PT_INTERP)
+3. Extracts the resulting tarballs and runs `./verify.sh` (static checks: no Termux strings, no bad RPATH, correct Android PT_INTERP — with the offending file list printed on failure)
 4. Uploads the dist directory as the `rustdroid-toolchain-aarch64` artifact (14-day retention)
 
-An LLVM build cache (`stage/rust-src/build/*/llvm`, ~2 GB) is keyed on `hashFiles(bootstrap.toml.template, build.sh)` with an `llvm-` restore-key fallback, so unrelated changes do not force a full LLVM rebuild. First full run ≈ 2.5 h; cached runs ≈ 1.5-2 h.
+An LLVM build cache (`stage/rust-src/build/*/llvm`, ~2 GB) is keyed on `hashFiles(bootstrap.toml.template, build.sh)` with an `llvm-` restore-key fallback, so unrelated changes do not force a full LLVM rebuild. First full run ≈ 2.5 h; cached runs ≈ 1.5 h.
 
 **Expected dist output** (component tarballs + one runtime lib):
 
@@ -43,11 +57,16 @@ stage/dist/
 └── libc++_shared.so                               # runtime dep of -lc++_shared-linked binaries
 ```
 
-Notes learned the hard way (see commit history / DEVIATIONS.md):
+## Notes learned the hard way
 
-- `x.py dist` writes to `stage/rust-src/build/dist/` — `build.sh do_dist` copies the tarballs into `stage/dist/` so verification and the artifact upload find them (run #16 failed exactly here after a 2h23m build).
+Each of these was a real CI failure (see commit history / DEVIATIONS.md):
+
+- **`x.py dist` writes to `stage/rust-src/build/dist/`** — not `stage/dist/`. `build.sh do_dist` copies the tarballs into `stage/dist/` so verification and the artifact upload find them (run #16 failed exactly here after a 2h23m build).
 - **Tool tarballs (cargo) only appear with `extended = true`** in `[build]`; plain `x.py dist` yields only rustc/rust-std/rustc-dev/docs/src.
-- Dist binaries are linked with `-lc++_shared` (Android has no system libc++), so the NDK's `libc++_shared.so` is bundled next to the tarballs.
+- **Dist binaries are linked with `-lc++_shared`** (Android has no system libc++), so the NDK's `libc++_shared.so` is bundled next to the tarballs.
+- **Bootstrap does not vendor git checkouts by default** — `vendor = true` only applies to release tarballs. Without an explicit source-replacement config, tool builds (cargo included) compile from the **unpatched crates.io registry**, silently embedding Termux paths from `openssl-probe` (run #20). Fix: `do_vendor` writes `$RUST_SRC/.cargo/config.toml` with the source replacement, and `bootstrap.toml` sets `vendor = true`.
+- **Editing vendored sources breaks cargo's directory-source checksums** — after patching `vendor/openssl-probe`, `.cargo-checksum.json` must be regenerated or `--frozen` builds fail with "the listed checksum has changed" (run #21). Fix: `do_patches_post_vendor` resyncs the checksum file for every crate a patch touched.
+- **openssl-sys must come from the vendor set, not the registry**, and needs `ANDROID_NDK_ROOT`/`ANDROID_NDK_HOME` exported for its vendored-openssl cross-build (run #18).
 
 ## Building locally (alternative)
 
@@ -96,7 +115,7 @@ adb shell run-as dev.rustdroid.ide sh -c '
 ## Repo layout
 
 ```
-├── .github/workflows/main.yml     # CI build + verify + artifact upload
+├── .github/workflows/main.yml     # CI build + verify + artifact upload (workflow_dispatch)
 ├── env.sh                         # single source of truth (paths, versions, triples)
 ├── bootstrap.toml.template        # x.py config.toml template (@VAR@ substitution)
 ├── build.sh                       # driver: prepare/symlinks/shims/patches/vendor/configure/dist
@@ -105,6 +124,8 @@ adb shell run-as dev.rustdroid.ide sh -c '
 ├── patches/post-vendor/0001-...   # openssl-probe: RUSTDROID_PREFIX-aware cert/lib probing
 └── DEVIATIONS.md                  # verified-vs-theoretical matrix, Termux deltas
 ```
+
+`main` is the only branch — fixes land directly on it, and each CI run dispatches from `main`.
 
 ## License & attribution
 
