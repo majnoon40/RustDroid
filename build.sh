@@ -361,11 +361,17 @@ do_patches_post_vendor() {
     [[ -d "$RUST_SRC/vendor" ]] || fail "vendor/ missing; run ./build.sh vendor first"
 
     local apply_ok=0 apply_fail=0
+    local touched=()
     local p
     for p in "$PATCHES_DIR/post-vendor"/*.patch; do
         [[ -f "$p" ]] || continue
         local name; name="$(basename "$p")"
         log "  applying $name..."
+        # Record which files this patch touches (needed for the
+        # .cargo-checksum.json resync below) BEFORE applying.
+        while IFS= read -r tf; do
+            [[ -n "$tf" ]] && touched+=("$tf")
+        done < <(cd "$RUST_SRC" && git apply --numstat "$p" 2>/dev/null | awk '{print $NF}')
         if (cd "$RUST_SRC" && git apply --check "$p" 2>&1 && git apply "$p" 2>&1); then
             log "    OK"
             apply_ok=$((apply_ok + 1))
@@ -375,6 +381,70 @@ do_patches_post_vendor() {
         fi
     done
     log "post-vendor patches summary: $apply_ok applied cleanly, $apply_fail drifted"
+
+    # ------------------------------------------------------------------------
+    # .cargo-checksum.json resync — REQUIRED after editing vendored sources.
+    #
+    # cargo's directory-source verification (cargo/src/cargo/sources/
+    # directory.rs verify()) re-hashes every file listed in each vendored
+    # crate's .cargo-checksum.json and FAILS the build on mismatch:
+    #   error: the listed checksum of `.../vendor/openssl-probe/src/lib.rs`
+    #   has changed ... directory sources are not intended to be edited
+    # (CI run #21, exactly here — after vendor mode was activated, the
+    # patched file was finally being compiled, and cargo rejected it).
+    #
+    # Standard distro practice: patch the vendored source AND update the
+    # checksum file. We regenerate the "files" map (bare sha256 hex, no
+    # prefix — the format cargo's copy_and_checksum writes) for every crate
+    # a patch touched, preserving "package" as-is.
+    # ------------------------------------------------------------------------
+    if [[ ${#touched[@]} -gt 0 ]]; then
+        log "  resyncing .cargo-checksum.json for patched crates..."
+        python3 - "$RUST_SRC" "${touched[@]}" <<'PYEOF'
+import hashlib, json, os, sys
+
+rust_src = sys.argv[1]
+touched = sys.argv[2:]
+
+# Map touched vendor files -> crate roots (the ancestor dir holding
+# .cargo-checksum.json).
+roots = set()
+for rel in touched:
+    if not rel.startswith('vendor/'):
+        continue
+    d = os.path.dirname(os.path.join(rust_src, rel))
+    while d.startswith(os.path.join(rust_src, 'vendor')):
+        if os.path.isfile(os.path.join(d, '.cargo-checksum.json')):
+            roots.add(d)
+            break
+        d = os.path.dirname(d)
+
+for root in sorted(roots):
+    cj_path = os.path.join(root, '.cargo-checksum.json')
+    with open(cj_path) as f:
+        data = json.load(f)
+    files_map = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            p = os.path.join(dirpath, fn)
+            rel = os.path.relpath(p, root)
+            if rel == '.cargo-checksum.json':
+                continue
+            h = hashlib.sha256()
+            with open(p, 'rb') as fh:
+                while True:
+                    chunk = fh.read(65536)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            files_map[rel] = h.hexdigest()
+    data['files'] = files_map
+    with open(cj_path, 'w') as f:
+        json.dump(data, f, sort_keys=True)
+    print('    resynced {} entries in {}/.cargo-checksum.json'.format(
+        len(files_map), os.path.basename(root)))
+PYEOF
+    fi
 
     # CRITICAL gate (run #20 forensics): if openssl-probe is still carrying
     # a com.termux path after patching, the built cargo binary WILL fail
