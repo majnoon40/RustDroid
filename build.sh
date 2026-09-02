@@ -36,6 +36,40 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/env.sh"
 
 # ----------------------------------------------------------------------------
+# ccache — compiler cache for the C/C++ parts (LLVM, lld, compiler-rt).
+# Bootstrap 1.85 has NATIVE support: `[llvm] ccache = "ccache"` in config.toml
+# makes it pass -DCMAKE_{C,CXX}_COMPILER_LAUNCHER=ccache to every cmake build
+# (host x86_64 tree AND cross aarch64 tree; see bootstrap's
+# core/build_steps/llvm.rs configure_cmake — Linux targets get the launcher).
+# This does NOT affect rustc/cargo compilation (that would need sccache, which
+# is risky with nightly -Z flags used inside stage builds).
+#
+# Why: the GHA LLVM build-tree cache short-circuits ninja when it hits, but a
+# key change forces a from-scratch rebuild (~50+ min for ~5,200 compile units
+# across both trees). With ccache warm, the same rebuild compiles in minutes:
+# object files come straight from the content-addressed cache. The two caches
+# complement each other: tree cache = fast path, ccache = rebuild insurance.
+#
+# CCACHE_DIR is under stage/ so the CI workflow can cache it directly.
+# If ccache is NOT installed, everything degrades gracefully to a plain build
+# (do_configure drops the ccache line from config.toml).
+if command -v ccache >/dev/null 2>&1; then
+    export CCACHE_DIR="${CCACHE_DIR:-${RUSTDROID_STAGE_PREFIX}/ccache}"
+    # Make cache hits robust across checkouts/runners:
+    # - BASEDIR + NOHASHDIR: don't hash absolute source paths (rename-tolerant)
+    # - COMPILERCHECK=content: hash compiler BINARY content, not mtime
+    #   (runner images update gcc/clang without notice; content check avoids
+    #   false misses after restore)
+    export CCACHE_BASEDIR="${CCACHE_BASEDIR:-${SCRIPT_DIR}}"
+    export CCACHE_NOHASHDIR="${CCACHE_NOHASHDIR:-1}"
+    export CCACHE_COMPILERCHECK="${CCACHE_COMPILERCHECK:-content}"
+    export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-4G}"
+    mkdir -p "$CCACHE_DIR"
+    log "ccache enabled: dir=$CCACHE_DIR maxsize=$CCACHE_MAXSIZE"
+fi
+
+
+# ----------------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------------
 log()  { echo "[$(date -u +%H:%M:%S)] $*" >&2; }
@@ -473,6 +507,13 @@ do_configure() {
     local out="$RUST_SRC/config.toml"
 
     # Substitute our env vars into the template.
+    # The ccache line: enabled only when ccache is installed (checked here,
+    # not at template-read time, so local builds without ccache degrade
+    # gracefully instead of failing with "ccache: not found" mid-cmake).
+    local ccache_line='# ccache = "ccache"  # (ccache not found on this host — compiler cache disabled)'
+    if command -v ccache >/dev/null 2>&1; then
+        ccache_line='ccache = "ccache"'
+    fi
     sed \
         -e "s|@RUSTDROID_PREFIX@|${RUSTDROID_PREFIX}|g" \
         -e "s|@RUSTDROID_HOST_TRIPLE@|${RUSTDROID_HOST_TRIPLE}|g" \
@@ -481,8 +522,10 @@ do_configure() {
         -e "s|@NDK_API_LEVEL@|${NDK_API_LEVEL}|g" \
         -e "s|@SHIM_LIB_DIR@|${SHIM_LIB_DIR}|g" \
         -e "s|@NDK_ROOT@|${NDK_ROOT}|g" \
+        -e "s|@RUSTDROID_CCACHE_LINE@|${ccache_line}|g" \
         "$tpl" > "$out"
     log "  config.toml written: $out"
+    grep -n 'ccache' "$out" | head -2 || true
 
     # Validate by asking x.py to print the parsed config (uses the same
     # TOML loader as a real build).

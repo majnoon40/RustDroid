@@ -44,6 +44,8 @@ Phase 1 is deliberately the highest-risk piece: if a Bionic-hosted `rustc`+`carg
 
 An LLVM build cache (`stage/rust-src/build/*/llvm`, ~2 GB) is keyed on `hashFiles(bootstrap.toml.template, build.sh)` with an `llvm-` restore-key fallback, so unrelated changes do not force a full LLVM rebuild. First full run ≈ 2.5 h; cached runs ≈ 1.5 h.
 
+A second cache layer, **ccache** (bootstrap's native `[llvm] ccache` → `CMAKE_{C,CXX}_COMPILER_LAUNCHER`), covers the C/C++ compiles: when the LLVM tree cache misses or cmake regenerates `build.ninja`, a warm ccache serves most of the ~5,200 compile units from its content-addressed store instead of recompiling. The tree cache is the fast path; ccache is rebuild insurance. Rust compiles are NOT ccache'd (that would need sccache, which is risky with the `-Z` flags stage builds use).
+
 **Expected dist output** (component tarballs + runtime lib + link kit):
 
 ```
@@ -85,6 +87,8 @@ On a real Ubuntu x86_64 host with root, 16 GB+ RAM, 30 GB+ disk:
 ./build.sh all         # full pipeline, 2-4 h
 ./verify.sh stage/dist-extracted/   # after extracting tarballs
 ```
+
+Optional: `sudo apt install ccache` before building — `build.sh` auto-detects it, enables bootstrap's `[llvm] ccache`, and keeps its store in `stage/ccache` (subsequent local rebuilds of LLVM become near-instant). Without ccache everything still builds, just uncached.
 
 For a fast pipeline check without the full build: `./build.sh all-smoke` (cross-compiles `hello.c` with the NDK + shims, `x.py` config validation).
 

@@ -32,7 +32,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential binutils lld cmake ninja-build patchelf
+          sudo apt-get install -y build-essential binutils lld cmake ninja-build patchelf ccache
 
       - name: Install Android NDK r27c
         run: |
@@ -48,6 +48,11 @@ jobs:
       # the cache. If LLVM itself finished but a later step (rustc linking,
       # dist packaging) fails, the next run restores LLVM instantly instead
       # of rebuilding ~2,600 + ~2,600 compile units from scratch.
+      #
+      # NOTE: a key change restores via the llvm- fallback key but cmake still
+      # regenerates build.ninja when the compile COMMANDS change (e.g. the
+      # first run that adds the ccache launcher) — that rebuild is exactly
+      # what the ccache layer below makes cheap.
       - name: Restore LLVM build cache
         id: llvm-cache
         uses: actions/cache/restore@v4
@@ -64,6 +69,27 @@ jobs:
           restore-keys: |
             llvm-
 
+      # ccache layer — rebuild insurance for the C/C++ parts (LLVM, lld,
+      # compiler-rt). Bootstrap enables it via `[llvm] ccache` in
+      # config.toml (CMAKE_{C,CXX}_COMPILER_LAUNCHER). When the LLVM
+      # build-tree cache above hits, ccache is not even consulted; when it
+      # misses (key change, cmake command change, eviction), a warm ccache
+      # turns the ~5,200-unit rebuild into mostly cache hits.
+      # Key is unique per run (github.run_id) so every run saves a fresh
+      # snapshot; the restore-key picks up the newest previous one.
+      - name: Restore ccache
+        id: ccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: stage/ccache
+          key: ccache-v1-${{ github.run_id }}
+          restore-keys: |
+            ccache-v1-
+      - name: Show ccache stats (pre-build)
+        run: |
+          ccache --version | head -1
+          CCACHE_DIR=$PWD/stage/ccache ccache -s || true
+
       - name: Run toolchain build
         run: |
           chmod +x ./build.sh
@@ -72,6 +98,12 @@ jobs:
       - name: Show disk usage mid/post-build (debugging aid)
         if: always()
         run: df -h
+
+      - name: Show ccache stats (post-build)
+        if: always()
+        run: |
+          CCACHE_DIR=$PWD/stage/ccache ccache -s || true
+          du -sh ./stage/ccache 2>/dev/null || true
 
       - name: List dist output
         run: ls -la ./stage/dist/
@@ -125,6 +157,13 @@ jobs:
             stage/rust-src/build/x86_64-unknown-linux-gnu/llvm
             stage/rust-src/build/aarch64-linux-android/llvm
           key: llvm-${{ hashFiles('bootstrap.toml.template', 'build.sh') }}
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: stage/ccache
+          key: ccache-v1-${{ github.run_id }}
 
       - name: Upload logs on failure
         if: failure()

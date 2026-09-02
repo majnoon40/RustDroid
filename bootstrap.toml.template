@@ -99,6 +99,12 @@ thin-lto = false  # disabled â€” host runner's default c++ is GCC, which do
                   # with "unrecognized argument to '-flto=' option: 'thin'"
 targets = "X86;ARM;AArch64"  # only build targets we actually need
 experimental-targets = ""   # empty string = disable all experimental targets
+# Compiler cache for all cmake-built C/C++ (LLVM/lld/compiler-rt, host AND
+# cross trees): bootstrap passes -DCMAKE_{C,CXX}_COMPILER_LAUNCHER=<ccache>
+# (core/build_steps/llvm.rs configure_cmake; non-darwin only). The line is
+# substituted by do_configure: `ccache = "ccache"` when ccache is installed,
+# a no-op comment when it is not (local builds without ccache).
+@RUSTDROID_CCACHE_LINE@
 
 # ============================================================================
 # [rust] â€” how the rustc/cargo binaries themselves are built.
