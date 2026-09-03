@@ -231,20 +231,34 @@ class ToolchainManager(
      * Writes $CARGO_HOME/config.toml with `new.vcs = "none"` (the bundle
      * ships no git binary, and cargo's default is vcs=git) and merges
      * `http.cainfo` pointing at the generated CA bundle — cargo's
-     * crates.io downloads die with libcurl error 60 otherwise (statically
-     * linked OpenSSL has no Android trust store). User-set values are
-     * never clobbered.
+     * crates.io downloads die with libcurl error 77 ("Problem with the
+     * SSL CA cert") or 60 otherwise (statically linked OpenSSL has no
+     * Android trust store). User-set values are never clobbered.
+     *
+     * Never leaves a dangling cainfo: cargo turns a missing CAfile into
+     * error 77 *before any network I/O*, so when no usable bundle can be
+     * built (no APK asset, no readable system store), an app-managed
+     * cainfo value pointing at the missing file is stripped instead.
      */
     private suspend fun writeCargoDefaults() = withContext(Dispatchers.IO) {
         runCatching {
             // Warm the bundle first so cainfo points at a real file even
             // if the first cargo invocation races ProcEnv's lazy ensure().
-            val bundle = CaBundle.ensure(context.filesDir, paths.prefix)
-                ?: return@runCatching
-            val cainfo = bundle.absolutePath
+            // The APK asset fallback keeps this working on devices whose
+            // system CA store is empty or unreadable (Android 14+/OEM).
+            val bundle = CaBundle.ensure(
+                context.filesDir, paths.prefix,
+                assetProvider = { CaBundle.readAssetPem(context.assets) },
+            )
+            val canonical = CaBundle.bundleFile(context.filesDir).absolutePath
             val cargoHome = ProcEnv.cargoHome(context.filesDir)
             cargoHome.mkdirs()
             val cfg = File(cargoHome, "config.toml")
+            if (bundle == null) {
+                stripAppManagedCainfo(cfg, canonical)
+                return@runCatching
+            }
+            val cainfo = bundle.absolutePath
             if (!cfg.isFile) {
                 cfg.writeText(
                     "[new]\nvcs = \"none\"\n\n[http]\ncainfo = \"$cainfo\"\n"
@@ -252,8 +266,10 @@ class ToolchainManager(
                 return@runCatching
             }
             val text = cfg.readText()
-            if (Regex("""(?m)^\s*cainfo\s*=""").containsMatchIn(text)) {
-                return@runCatching // user-set: leave it alone
+            // present and pointing at the canonical bundle -> nothing to do;
+            // present with any other value -> user-set, leave it alone
+            if (cainfoValue(text) != null) {
+                return@runCatching
             }
             if (Regex("""(?m)^\[http\]""").containsMatchIn(text)) {
                 cfg.writeText(
@@ -268,6 +284,26 @@ class ToolchainManager(
                 )
             }
         }
+    }
+
+    /** Current `cainfo` value in a config.toml text, if any. */
+    private fun cainfoValue(text: String): String? =
+        Regex("""(?m)^\s*cainfo\s*=\s*"([^"]*)"\s*$""").find(text)?.groupValues?.get(1)
+
+    /**
+     * Removes an app-managed cainfo line (value == [canonical]) from [cfg]
+     * when that value can no longer be backed by a real bundle file. Any
+     * other cainfo value is considered user-set and kept untouched.
+     */
+    private fun stripAppManagedCainfo(cfg: File, canonical: String) {
+        if (!cfg.isFile) return
+        val text = runCatching { cfg.readText() }.getOrNull() ?: return
+        val current = cainfoValue(text) ?: return
+        if (current != canonical) return
+        val cleaned = text.lines()
+            .filterNot { it.trim().startsWith("cainfo") && it.contains(canonical) }
+            .joinToString("\n")
+        runCatching { cfg.writeText(cleaned) }
     }
 
     /** Convenience: [uri] content import via SAF (fire-and-forget from UI). */

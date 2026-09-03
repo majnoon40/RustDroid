@@ -2,6 +2,7 @@ package dev.rustdroid.ide
 
 import dev.rustdroid.ide.runtime.CaBundle
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -85,5 +86,63 @@ class CaBundleTest {
         val missing = File(tmp.root, "does-not-exist")
         assertNull(CaBundle.ensure(files, prefix, sources = listOf(missing)))
         assertNull(CaBundle.bundleFile(files).takeIf { it.exists() })
+    }
+
+    @Test
+    fun `asset fallback builds a usable bundle when no system store is readable`() {
+        val files = tmp.newFolder("files5")
+        val prefix = tmp.newFolder("usr5")
+        val missing = File(tmp.root, "does-not-exist-5")
+        val asset =
+            "-----BEGIN CERTIFICATE-----\nASSETCERT\n-----END CERTIFICATE-----\n"
+                .toByteArray()
+
+        val bundle = CaBundle.ensure(
+            files, prefix, sources = listOf(missing), assetProvider = { asset },
+        )
+
+        assertNotNull(bundle)
+        assertEquals(File(files, "home/.ssl/cacert.pem"), bundle)
+        assertTrue(CaBundle.isUsable(bundle!!))
+        assertTrue(bundle.readText().contains("ASSETCERT"))
+        // probe mirror exists at prefix/etc/tls/cert.pem with same content
+        assertEquals(bundle.readText(), CaBundle.probeFile(prefix).readText())
+    }
+
+    @Test
+    fun `corrupt on-disk bundle self-heals from the asset`() {
+        val files = tmp.newFolder("files6")
+        val prefix = tmp.newFolder("usr6")
+        val asset =
+            "-----BEGIN CERTIFICATE-----\nHEALED\n-----END CERTIFICATE-----\n"
+                .toByteArray()
+
+        // simulate the error-77 state: a bundle file with no PEM content
+        val target = CaBundle.bundleFile(files)
+        target.parentFile?.mkdirs()
+        target.writeText("truncated garbage without pem markers")
+
+        val bundle = CaBundle.ensure(
+            files, prefix,
+            sources = listOf(File(tmp.root, "nope-6")),
+            assetProvider = { asset },
+        )
+
+        assertNotNull(bundle)
+        assertTrue(CaBundle.isUsable(bundle!!))
+        assertTrue(bundle.readText().contains("HEALED"))
+    }
+
+    @Test
+    fun `isUsable rejects missing empty and non-pem files`() {
+        assertFalse(CaBundle.isUsable(File(tmp.root, "absent.pem")))
+        val empty = tmp.newFile("empty.pem")
+        assertFalse(CaBundle.isUsable(empty))
+        val garbage = tmp.newFile("garbage.pem")
+        garbage.writeText("random bytes, no markers")
+        assertFalse(CaBundle.isUsable(garbage))
+        val good = tmp.newFile("good.pem")
+        good.writeText("-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----\n")
+        assertTrue(CaBundle.isUsable(good))
     }
 }

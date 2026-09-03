@@ -37,7 +37,16 @@ class EditorViewModel(
     private val repo = container.projectRepository
     private val runner = container.cargoRunner
     private val env by lazy {
-        ProcEnv.env(container.toolchainPaths.prefix, container.context.filesDir)
+        ProcEnv.env(
+            container.toolchainPaths.prefix, container.context.filesDir,
+            // APK-pinned CA store: cargo fetch/build must reach crates.io
+            // even when the device system trust store is unusable.
+            assetProvider = {
+                dev.rustdroid.ide.runtime.CaBundle.readAssetPem(
+                    container.context.assets,
+                )
+            },
+        )
     }
 
     // ---- tabs ----

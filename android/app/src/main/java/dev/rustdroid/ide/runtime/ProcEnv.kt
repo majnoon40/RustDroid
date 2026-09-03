@@ -35,14 +35,19 @@ object ProcEnv {
      * Environment for cargo/rustc invocations. [extraPath] is prepended
      * after the toolchain bin (e.g. system bin dir on device).
      *
-     * The CA bundle is generated here (idempotent, cheap after first run)
-     * unless an explicit [caBundle] is injected (unit tests).
+     * The CA bundle is generated here (idempotent, cheap after first run,
+     * self-healing when the on-disk bundle is missing or invalid) unless
+     * an explicit [caBundle] is injected (unit tests). [assetProvider]
+     * supplies the APK's pinned Mozilla PEM store for devices whose
+     * system CA store is empty or unreadable (Android 14+ / OEM builds);
+     * pass `{ CaBundle.readAssetPem(context.assets) }` from UI/repo layers.
      */
     fun env(
         prefix: File,
         filesDir: File,
         extraPath: String = "/system/bin",
-        caBundle: File? = CaBundle.ensure(filesDir, prefix),
+        assetProvider: (() -> ByteArray?)? = null,
+        caBundle: File? = CaBundle.ensure(filesDir, prefix, assetProvider = assetProvider),
     ): Map<String, String> {
         ensureDirs(filesDir)
         return buildMap {
@@ -71,8 +76,12 @@ object ProcEnv {
                 // libcurl's own env fallback
                 put("CURL_CA_BUNDLE", caBundle.absolutePath)
             }
-            if (File(SYSTEM_CA_DIR).isDirectory) {
-                // no-bundle fallback: the system store is a hashed CApath
+            val systemCaDir = File(SYSTEM_CA_DIR)
+            if (systemCaDir.isDirectory && systemCaDir.canRead()) {
+                // no-bundle fallback: the system store is a hashed CApath.
+                // Only export it when actually readable — pointing OpenSSL
+                // at a stub/protected dir fails verify-location setup and
+                // surfaces as curl error 77 even with a valid CAfile.
                 put("SSL_CERT_DIR", SYSTEM_CA_DIR)
             }
         }

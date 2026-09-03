@@ -3,6 +3,7 @@ package dev.rustdroid.ide.di
 import android.content.Context
 import dev.rustdroid.ide.projects.CratesIoClient
 import dev.rustdroid.ide.projects.ProjectRepository
+import dev.rustdroid.ide.runtime.CaBundle
 import dev.rustdroid.ide.runtime.CargoRunner
 import dev.rustdroid.ide.runtime.ProcEnv
 import dev.rustdroid.ide.toolchain.ToolchainManager
@@ -39,7 +40,13 @@ class AppContainer(val context: Context) {
         ProjectRepository(
             projectsRoot = projectsRoot,
             runner = cargoRunner,
-            envProvider = { ProcEnv.env(toolchainPaths.prefix, context.filesDir) },
+            envProvider = {
+                ProcEnv.env(
+                    toolchainPaths.prefix,
+                    context.filesDir,
+                    assetProvider = { CaBundle.readAssetPem(context.assets) },
+                )
+            },
             cargoPath = { ProcEnv.toolchainCommand(toolchainPaths.prefix, "cargo") },
         )
     }

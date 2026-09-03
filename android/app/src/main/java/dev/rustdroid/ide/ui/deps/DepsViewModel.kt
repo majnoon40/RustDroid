@@ -66,6 +66,13 @@ class DepsViewModel(
     private val env: Map<String, String> by lazy {
         dev.rustdroid.ide.runtime.ProcEnv.env(
             container.toolchainPaths.prefix, container.context.filesDir,
+            // APK-pinned CA store: keeps `cargo fetch` working on devices
+            // whose system trust store is empty/unreadable (curl err 77).
+            assetProvider = {
+                dev.rustdroid.ide.runtime.CaBundle.readAssetPem(
+                    container.context.assets,
+                )
+            },
         )
     }
 
