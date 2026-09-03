@@ -206,9 +206,14 @@ class EditorViewModel(
 
     // ---------------- runs ----------------
 
-    fun run() = startCargo(listOf("cargo", "run"))
-    fun build() = startCargo(listOf("cargo", "build"))
-    fun clean() = startCargo(listOf("cargo", "clean"))
+    // Absolute path: Android's JVM does not resolve bare command names
+    // against the child env's PATH — only absolute paths exec reliably.
+    private val cargoPath: String
+        get() = ProcEnv.toolchainCommand(container.toolchainPaths.prefix, "cargo")
+
+    fun run() = startCargo(listOf(cargoPath, "run"))
+    fun build() = startCargo(listOf(cargoPath, "build"))
+    fun clean() = startCargo(listOf(cargoPath, "clean"))
 
     private fun startCargo(command: List<String>) {
         if (_running.value) return
@@ -219,7 +224,10 @@ class EditorViewModel(
             _problems.value = emptyList()
             parser.reset()
             console.clear()
-            console.system("\$ ${command.joinToString(" ")}")
+            // Show the tool's short name, not its full path
+            val display = command.first().substringAfterLast('/') +
+                command.drop(1).joinToString("", prefix = " ")
+            console.system("\$ $display")
             try {
                 val result = runner.run(
                     command, cwd = projectDir, env = env, stdin = stdinPipe,

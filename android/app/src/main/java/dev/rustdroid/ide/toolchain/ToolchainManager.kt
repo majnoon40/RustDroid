@@ -45,24 +45,22 @@ class ToolchainManager(
     val logTail = ArrayDeque<String>()
 
     private fun initialState(): ToolchainState {
-        return if (paths.readyMarker.isFile && paths.isInstalled()) {
-            val env = ProcEnv.env(paths.prefix, context.filesDir)
-            val rustc = kotlinx.coroutines.runBlocking {
-                runner.probe(listOf(paths.rustc.absolutePath, "--version"), env)
-            }
-            val cargo = kotlinx.coroutines.runBlocking {
-                runner.probe(listOf(paths.cargo.absolutePath, "--version"), env)
-            }
-            if (rustc.startsWith("rustc ") && cargo.startsWith("cargo ")) {
-                ToolchainState.Ready(firstLine(rustc), firstLine(cargo))
-            } else {
-                ToolchainState.Failed(
-                    "startup", "installed toolchain no longer runs — reinstall it (Settings)"
-                )
-            }
-        } else {
-            ToolchainState.NotInstalled
+        // Fast path: the ready marker is only written after a fully green
+        // verification (including the compile+link+run smoke test), so its
+        // presence + structural isInstalled() is sufficient to be Ready.
+        // This keeps app startup off subprocess probes (no runBlocking on
+        // the main thread); Settings "Re-verify health" re-runs everything.
+        if (paths.isInstalled() && paths.readyMarker.isFile) {
+            val lines = runCatching { paths.readyMarker.readLines() }
+                .getOrDefault(emptyList())
+            fun value(key: String) =
+                lines.firstOrNull { it.startsWith("$key=") }?.removePrefix("$key=")
+            return ToolchainState.Ready(
+                value("rustc_version") ?: "rustc ${ToolchainDistro.RUST_VERSION}",
+                value("cargo_version") ?: "cargo ${ToolchainDistro.RUST_VERSION}",
+            )
         }
+        return ToolchainState.NotInstalled
     }
 
     private fun firstLine(s: String) = s.lineSequence().firstOrNull() ?: s
@@ -187,9 +185,11 @@ class ToolchainManager(
             paths.readyMarker.writeText(
                 buildString {
                     appendLine("verified=${System.currentTimeMillis()}")
-                    appendLine("rust_version=${firstLine(rustc)}")
+                    appendLine("rustc_version=${firstLine(rustc)}")
+                    appendLine("cargo_version=${firstLine(cargo)}")
                 }
             )
+            writeCargoDefaults()
             _state.value = ToolchainState.Ready(firstLine(rustc), firstLine(cargo))
             log("verification PASSED — toolchain ready")
         } else {
@@ -212,6 +212,22 @@ class ToolchainManager(
         paths.bundleZip.delete()
         _state.value = ToolchainState.NotInstalled
         log("toolchain removed")
+    }
+
+    /**
+     * Writes $CARGO_HOME/config.toml with `new.vcs = "none"` — the bundle
+     * ships no git binary, and cargo's default is vcs=git. Created only if
+     * absent, so user edits are never clobbered.
+     */
+    private fun writeCargoDefaults() {
+        runCatching {
+            val cargoHome = ProcEnv.cargoHome(context.filesDir)
+            cargoHome.mkdirs()
+            val cfg = File(cargoHome, "config.toml")
+            if (!cfg.isFile) {
+                cfg.writeText("[new]\nvcs = \"none\"\n")
+            }
+        }
     }
 
     /** Convenience: [uri] content import via SAF (fire-and-forget from UI). */

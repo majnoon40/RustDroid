@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Matches md_dark_background in ui/theme/Color.kt -->
+    <color name="rd_window_background">#191714</color>
+</resources>

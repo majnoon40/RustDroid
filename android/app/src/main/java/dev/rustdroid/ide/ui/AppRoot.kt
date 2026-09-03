@@ -1,10 +1,12 @@
 package dev.rustdroid.ide.ui
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -45,42 +47,39 @@ fun AppRoot(container: AppContainer) {
     )
     val state by vm.toolchainState.collectAsState()
     val nav = rememberNavController()
-    val started = remember { arrayOf(false) }
 
     val startDest = if (state is ToolchainState.Ready) Routes.HOME else Routes.GATE
 
+    // If the toolchain is removed or fails health mid-session (e.g. a
+    // re-verify fails in Settings), take the user back to the Gate where
+    // the failure is explained and retry is offered. Guarded by the
+    // current destination so a normal start never double-pushes.
     LaunchedEffect(state) {
-        when (state) {
-            is ToolchainState.Ready -> {
-                if (!started[0]) {
-                    started[0] = true
-                    nav.navigate(Routes.HOME) {
-                        popUpTo(Routes.GATE) { inclusive = true }
-                    }
-                } else {
-                    // re-verified from settings — stay put
+        if (state is ToolchainState.NotInstalled || state is ToolchainState.Failed) {
+            val route = nav.currentDestination?.route
+            if (route != null && route != Routes.GATE) {
+                nav.navigate(Routes.GATE) {
+                    popUpTo(0) { inclusive = true }
                 }
             }
-            is ToolchainState.NotInstalled, is ToolchainState.Failed -> {
-                if (started[0]) {
-                    // toolchain removed/failed after being ready — back to gate
-                    nav.navigate(Routes.GATE) {
-                        popUpTo(0) { inclusive = true }
-                    }
-                    started[0] = false
-                }
-            }
-            else -> {}
         }
     }
 
     NavHost(navController = nav, startDestination = startDest) {
         composable(Routes.GATE) {
-            GateScreen(container, onReady = {
-                nav.navigate(Routes.HOME) {
-                    popUpTo(Routes.GATE) { inclusive = true }
-                }
-            })
+            GateScreen(
+                container,
+                onReady = {
+                    // Guarded: when the app already started at HOME (toolchain
+                    // ready), this screen isn't reachable; when arriving here
+                    // from an in-session install, exactly one navigate runs.
+                    if (nav.currentDestination?.route == Routes.GATE) {
+                        nav.navigate(Routes.HOME) {
+                            popUpTo(Routes.GATE) { inclusive = true }
+                        }
+                    }
+                },
+            )
         }
         composable(Routes.HOME) {
             HomeScreen(container, onOpenProject = { name ->
@@ -96,6 +95,20 @@ fun AppRoot(container: AppContainer) {
             DepsScreen(container, project, onBack = { nav.popBackStack() })
         }
         composable(Routes.SETTINGS) {
+            // "Re-verify health" ends here: once verification completes
+            // successfully, return the user to their projects instead of
+            // leaving them staring at the Settings screen. Failures stay
+            // on Settings (the toolchain card shows what broke).
+            var sawVerifying by remember { mutableStateOf(false) }
+            val st by container.toolchainManager.state.collectAsState()
+            LaunchedEffect(st) {
+                if (st is ToolchainState.Verifying) {
+                    sawVerifying = true
+                } else if (st is ToolchainState.Ready && sawVerifying) {
+                    sawVerifying = false
+                    nav.popBackStack()
+                }
+            }
             SettingsScreen(container)
         }
     }

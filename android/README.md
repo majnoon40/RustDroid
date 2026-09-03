@@ -14,8 +14,12 @@ cd android
 adb install app/build/outputs/apk/debug/app-debug.apk
 ```
 
+No local SDK? The **Android app** GitHub Actions workflow builds the debug
+APK on every push touching `android/` (and on manual dispatch): grab
+`rustdroid-debug-apk` from the run's artifacts page.
+
 First launch downloads the toolchain bundle (~117 MB) from the project's
-GitHub release and verifies it (10 checks, incl. compiling and running a test
+GitHub release and verifies it (12 checks, incl. compiling and running a test
 program). Offline alternative: download the bundle on a PC, push it to the
 phone, and use **Import zip** in the Gate screen.
 
@@ -35,7 +39,7 @@ Four layers, no DI framework (manual `AppContainer`):
 |---|---|---|
 | UI | `ui/` | Compose screens + VMs: Gate, Home, Editor, Deps, Settings |
 | Runtime | `runtime/` | subprocess contract: env assembly, streaming exec, diagnostics parsing, stdin, cancellation |
-| Toolchain | `toolchain/` | install state machine: download (SHA-256 pinned), zip→tar.xz extraction with unix modes, 10-check verifier, foreground service |
+| Toolchain | `toolchain/` | install state machine: download (SHA-256 pinned), zip→tar.xz extraction with unix modes, 12-check verifier, foreground service |
 | Projects | `projects/` | cargo project CRUD, Cargo.toml surgery, crates.io search |
 
 Pure-JVM layers (`runtime`, `toolchain` minus the service, `projects`) carry
@@ -48,12 +52,21 @@ The Phase-1-validated recipe, adjusted for the app sandbox:
 
 ```
 HOME      = files/home            (.cargo registry/cache live here)
-CARGO_HOME= files/home/.cargo
+CARGO_HOME= files/home/.cargo     (+ config.toml: new.vcs = "none" — no git in the bundle)
 PATH      = files/usr/bin:/system/bin
 LD_LIBRARY_PATH = files/usr/lib   (libc++_shared.so)
 TMPDIR    = files/home/tmp         (untrusted_app can't write /data/local/tmp)
 CARGO_TERM_COLOR = never
 ```
+
+**Every tool invocation uses the absolute binary path**
+(`files/usr/bin/cargo`, never bare `cargo`): Android's JVM does not resolve
+bare command names against the child env's `PATH` — `ProcessBuilder("cargo")`
+with `PATH=files/usr/bin:…` fails with `error=2` (empirically verified).
+Bare names only search the *JVM process's* PATH, which is `/system/bin` — no
+cargo there. The bundled tools' own children (cargo → rustc → cc shim) resolve
+through the child env's PATH normally (POSIX execvp), so only the Java exec
+hop needed the fix.
 
 rustc's default linker is `cc` — resolved to the kit's shim at
 `files/usr/bin/cc`, which execs `files/usr/lib/rustdroid-link/…` chain:
@@ -91,6 +104,9 @@ via `setSelection(line, col, makeVisible)`.
   (vim-style) won't be usable.
 - No C compilation: the cc shim is link-only (build scripts using the `cc`
   crate fail with a clear message) — real clang is later-phase work.
+- No git in the bundle: `cargo new` runs with `--vcs none` (+ the same default
+  is written to `$CARGO_HOME/config.toml`); anything expecting a git checkout
+  (cargo install from a local path with git deps) is out of scope for v1.
 - cargo builds run in-process (user-watched); backgrounding mid-build can
   be killed by the OS — incremental cache softens restarts.
 - One build per project at a time (by design; `cargo` locks target/ anyway).

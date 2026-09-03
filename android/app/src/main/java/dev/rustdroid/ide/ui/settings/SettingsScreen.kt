@@ -26,6 +26,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -34,6 +35,9 @@ import dev.rustdroid.ide.model.ToolchainState
 import dev.rustdroid.ide.toolchain.ToolchainDistro
 import dev.rustdroid.ide.ui.components.CheckRow
 import dev.rustdroid.ide.ui.components.StorageRow
+
+// Same green CheckRow uses for PASS — readable on both light and dark.
+private val HealthyGreen = Color(0xFF4CAF50)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -68,6 +72,11 @@ fun SettingsScreen(container: AppContainer) {
                     Text("Toolchain", style = MaterialTheme.typography.titleMedium)
                     when (state) {
                         is ToolchainState.Ready -> {
+                            Text(
+                                "✓ verified healthy — all checks passed",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = HealthyGreen,
+                            )
                             Text(
                                 (state as ToolchainState.Ready).rustcVersion,
                                 fontFamily = FontFamily.Monospace,
@@ -107,7 +116,7 @@ fun SettingsScreen(container: AppContainer) {
                         }
                     }
                     Text(
-                        "Re-verify runs the full 10-check suite incl. compiling and running a test program.",
+                        "Re-verify runs the full 12-check suite incl. compiling and running a test program. When it passes you are returned to your projects.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )

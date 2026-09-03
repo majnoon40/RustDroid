@@ -1,0 +1,67 @@
+# Android app CI: JVM unit tests + debug APK.
+#
+# Delivers a downloadable APK on every push touching android/ (and on
+# manual dispatch), so the app can be iterated on without a local Android
+# SDK. The toolchain build itself stays in main.yml — this file never
+# builds rust.
+name: Android app
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  app:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK pieces
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;34.0.0" > /dev/null
+
+      - name: Gradle cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/gradle/libs.versions.toml', 'android/app/build.gradle.kts', 'android/build.gradle.kts') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: JVM unit tests
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:testDebugUnitTest --console=plain
+
+      - name: Assemble debug APK
+        run: ./gradlew :app:assembleDebug --console=plain
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdroid-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error

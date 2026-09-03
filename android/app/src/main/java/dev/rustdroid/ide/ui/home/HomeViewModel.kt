@@ -52,7 +52,12 @@ class HomeViewModel(val container: AppContainer) : ViewModel() {
                 _projects.value = repo.list()
                 onDone(true)
             } catch (e: Exception) {
-                _createLog.value = (e as? IOException)?.message ?: e.message ?: "failed"
+                // Append the failure detail to whatever cargo printed, so
+                // the dialog shows the real cause (not just an exit code).
+                val detail = e.message ?: "failed"
+                _createLog.value =
+                    if (_createLog.value.isNullOrBlank()) detail
+                    else "${_createLog.value}\n$detail"
                 onDone(false)
             } finally {
                 _creating.value = false

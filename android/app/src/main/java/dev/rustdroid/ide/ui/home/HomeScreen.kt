@@ -230,10 +230,10 @@ private fun NewProjectDialog(
                 }
                 if (log != null) {
                     Text(
-                        log.takeLast(400),
+                        log.takeLast(800),
                         style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 6,
+                        maxLines = 10,
                     )
                 }
             }

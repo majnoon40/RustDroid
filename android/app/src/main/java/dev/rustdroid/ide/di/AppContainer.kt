@@ -36,9 +36,12 @@ class AppContainer(val context: Context) {
     val projectsRoot: File by lazy { File(context.filesDir, "projects") }
 
     val projectRepository: ProjectRepository by lazy {
-        ProjectRepository(projectsRoot, cargoRunner) {
-            ProcEnv.env(toolchainPaths.prefix, context.filesDir)
-        }
+        ProjectRepository(
+            projectsRoot = projectsRoot,
+            runner = cargoRunner,
+            envProvider = { ProcEnv.env(toolchainPaths.prefix, context.filesDir) },
+            cargoPath = { ProcEnv.toolchainCommand(toolchainPaths.prefix, "cargo") },
+        )
     }
 
     val cratesIoClient: CratesIoClient by lazy { CratesIoClient(http) }
