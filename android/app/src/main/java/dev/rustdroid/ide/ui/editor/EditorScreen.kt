@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
@@ -20,7 +21,10 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -58,7 +62,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -355,45 +361,84 @@ private fun ConsolePanel(
 ) {
     val palette = LocalEditorPalette.current
     Column(Modifier.fillMaxSize()) {
-        LazyColumn(
-            state = listState,
-            modifier = Modifier.weight(1f),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(8.dp),
-        ) {
-            itemsIndexed(lines) { _, line ->
-                val color = when (line.stream) {
-                    Stream.STDOUT -> palette.stdout
-                    Stream.STDERR -> palette.stderr
-                    Stream.SYSTEM -> palette.system
+        // Selectable: long-press any build/run output to copy it (error
+        // messages, compiler output, backtraces).
+        SelectionContainer(Modifier.weight(1f)) {
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(8.dp),
+            ) {
+                itemsIndexed(lines) { _, line ->
+                    val color = when (line.stream) {
+                        Stream.STDOUT -> palette.stdout
+                        Stream.STDERR -> palette.stderr
+                        Stream.SYSTEM -> palette.system
+                    }
+                    Text(
+                        line.text.ifEmpty { " " },
+                        style = MonoSmall,
+                        color = color,
+                    )
                 }
-                Text(
-                    line.text.ifEmpty { " " },
-                    style = MonoSmall,
-                    color = color,
-                )
             }
         }
-        // stdin
-        var input by remember { mutableStateOf("") }
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 8.dp, vertical = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text("> ", color = palette.system, style = MonoSmall)
-            BasicTextField(
-                value = input,
-                onValueChange = { input = it },
-                singleLine = true,
-                textStyle = MonoSmall.copy(color = palette.stdout),
-                modifier = Modifier.weight(1f),
-                enabled = true,
+        // stdin is only meaningful while a program is actually running —
+        // hiding it otherwise removes the dead send button confusion.
+        if (running) {
+            StdinBar(onSend = onSend)
+        }
+    }
+}
+
+@Composable
+private fun StdinBar(onSend: (String) -> Unit) {
+    val palette = LocalEditorPalette.current
+    var input by remember { mutableStateOf("") }
+
+    fun submit() {
+        val text = input
+        if (text.isNotEmpty()) {
+            onSend(text)
+            input = ""
+        }
+    }
+
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 6.dp)
+            .background(
+                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                RoundedCornerShape(8.dp),
             )
-            TextButton(
-                onClick = { if (input.isNotEmpty()) { onSend(input); input = "" } },
-                enabled = input.isNotEmpty() && running,
-            ) { Text("send") }
+            .padding(horizontal = 10.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("> ", color = MaterialTheme.colorScheme.primary, style = MonoSmall)
+        BasicTextField(
+            value = input,
+            onValueChange = { input = it },
+            singleLine = true,
+            textStyle = MonoSmall.copy(color = palette.stdout),
+            cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+            keyboardActions = KeyboardActions(onSend = { submit() }),
+            modifier = Modifier.weight(1f),
+        )
+        Spacer(Modifier.width(8.dp))
+        IconButton(
+            onClick = { submit() },
+            enabled = input.isNotEmpty(),
+            modifier = Modifier.size(32.dp),
+        ) {
+            Icon(
+                RdIcons.Send,
+                contentDescription = "Send to program",
+                tint = if (input.isNotEmpty()) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(18.dp),
+            )
         }
     }
 }

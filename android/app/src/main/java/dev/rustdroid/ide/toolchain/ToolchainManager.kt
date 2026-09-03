@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import dev.rustdroid.ide.model.CheckStatus
 import dev.rustdroid.ide.model.ToolchainState
+import dev.rustdroid.ide.runtime.CaBundle
 import dev.rustdroid.ide.runtime.CargoRunner
 import dev.rustdroid.ide.runtime.ProcEnv
 import dev.rustdroid.ide.util.Fs
@@ -40,6 +41,15 @@ class ToolchainManager(
     private val downloader = ArtifactDownloader(http)
     private val extractor = ArtifactExtractor(paths)
     private val verifier = ToolchainVerifier(paths, context.filesDir, runner)
+
+    init {
+        // Installs marked Ready by an older app version never re-run verify,
+        // so backfill config.toml CA trust + warm the bundle once at startup.
+        // Idempotent and IO-dispatched; skips entirely when not installed.
+        if (_state.value is ToolchainState.Ready) {
+            uiScope.launch { writeCargoDefaults() }
+        }
+    }
 
     /** Extra log lines surfaced by the UI (extraction/verify output tail). */
     val logTail = ArrayDeque<String>()
@@ -215,17 +225,44 @@ class ToolchainManager(
     }
 
     /**
-     * Writes $CARGO_HOME/config.toml with `new.vcs = "none"` — the bundle
-     * ships no git binary, and cargo's default is vcs=git. Created only if
-     * absent, so user edits are never clobbered.
+     * Writes $CARGO_HOME/config.toml with `new.vcs = "none"` (the bundle
+     * ships no git binary, and cargo's default is vcs=git) and merges
+     * `http.cainfo` pointing at the generated CA bundle — cargo's
+     * crates.io downloads die with libcurl error 60 otherwise (statically
+     * linked OpenSSL has no Android trust store). User-set values are
+     * never clobbered.
      */
-    private fun writeCargoDefaults() {
+    private suspend fun writeCargoDefaults() = withContext(Dispatchers.IO) {
         runCatching {
+            // Warm the bundle first so cainfo points at a real file even
+            // if the first cargo invocation races ProcEnv's lazy ensure().
+            val bundle = CaBundle.ensure(context.filesDir, paths.prefix)
+                ?: return@runCatching
+            val cainfo = bundle.absolutePath
             val cargoHome = ProcEnv.cargoHome(context.filesDir)
             cargoHome.mkdirs()
             val cfg = File(cargoHome, "config.toml")
             if (!cfg.isFile) {
-                cfg.writeText("[new]\nvcs = \"none\"\n")
+                cfg.writeText(
+                    "[new]\nvcs = \"none\"\n\n[http]\ncainfo = \"$cainfo\"\n"
+                )
+                return@runCatching
+            }
+            val text = cfg.readText()
+            if (Regex("""(?m)^\s*cainfo\s*=""").containsMatchIn(text)) {
+                return@runCatching // user-set: leave it alone
+            }
+            if (Regex("""(?m)^\[http\]""").containsMatchIn(text)) {
+                cfg.writeText(
+                    text.replaceFirst(
+                        Regex("""(?m)^(\[http\])[ \t]*$"""),
+                        "$1\ncainfo = \"$cainfo\"",
+                    )
+                )
+            } else {
+                cfg.writeText(
+                    text.trimEnd() + "\n\n[http]\ncainfo = \"$cainfo\"\n"
+                )
             }
         }
     }

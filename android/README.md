@@ -52,12 +52,27 @@ The Phase-1-validated recipe, adjusted for the app sandbox:
 
 ```
 HOME      = files/home            (.cargo registry/cache live here)
-CARGO_HOME= files/home/.cargo     (+ config.toml: new.vcs = "none" — no git in the bundle)
+CARGO_HOME= files/home/.cargo     (+ config.toml: new.vcs = "none", http.cainfo)
 PATH      = files/usr/bin:/system/bin
 LD_LIBRARY_PATH = files/usr/lib   (libc++_shared.so)
 TMPDIR    = files/home/tmp         (untrusted_app can't write /data/local/tmp)
 CARGO_TERM_COLOR = never
 ```
+
+**TLS trust (`runtime/CaBundle`).** cargo's libcurl is linked against a
+statically built OpenSSL that knows nothing about Android's CA stores, so
+crate downloads fail with libcurl error 60 ("SSL peer certificate or SSH
+remote key was not OK"). The app builds a concatenated PEM bundle from
+`/system/etc/security/cacerts` (+ the Android 14+ Conscrypt APEX store) into
+`files/home/.ssl/cacert.pem` and exposes it through every trust channel:
+`CARGO_HTTP_CAINFO` (cargo's `http.cainfo` override → `CURLOPT_CAINFO`,
+also merged into `$CARGO_HOME/config.toml`), `SSL_CERT_FILE` +
+`CURL_CA_BUNDLE` (OpenSSL/libcurl defaults), and `SSL_CERT_DIR` (the
+system store itself, as a hashed CApath fallback). A mirror lands at
+`files/usr/etc/tls/cert.pem` so the toolchain's patched `openssl-probe`
+finds it via `RUSTDROID_PREFIX` even without env vars. The app's own
+crates.io search (OkHttp) uses the platform trust store and is unaffected.
+
 
 **Every tool invocation uses the absolute binary path**
 (`files/usr/bin/cargo`, never bare `cargo`): Android's JVM does not resolve

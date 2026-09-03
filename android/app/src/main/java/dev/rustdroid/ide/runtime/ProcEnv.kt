@@ -21,6 +21,9 @@ object ProcEnv {
     fun tmpDir(filesDir: File): File = File(homeDir(filesDir), "tmp")
     fun scratchDir(filesDir: File): File = File(homeDir(filesDir), "scratch")
 
+    /** Android's hashed CApath — usable directly by OpenSSL as a trust dir. */
+    val SYSTEM_CA_DIR = "/system/etc/security/cacerts"
+
     fun ensureDirs(filesDir: File) {
         homeDir(filesDir).mkdirs()
         cargoHome(filesDir).mkdirs()
@@ -31,8 +34,16 @@ object ProcEnv {
     /**
      * Environment for cargo/rustc invocations. [extraPath] is prepended
      * after the toolchain bin (e.g. system bin dir on device).
+     *
+     * The CA bundle is generated here (idempotent, cheap after first run)
+     * unless an explicit [caBundle] is injected (unit tests).
      */
-    fun env(prefix: File, filesDir: File, extraPath: String = "/system/bin"): Map<String, String> {
+    fun env(
+        prefix: File,
+        filesDir: File,
+        extraPath: String = "/system/bin",
+        caBundle: File? = CaBundle.ensure(filesDir, prefix),
+    ): Map<String, String> {
         ensureDirs(filesDir)
         return buildMap {
             put("HOME", homeDir(filesDir).absolutePath)
@@ -46,6 +57,24 @@ object ProcEnv {
             // stable ordering for reproducible diagnostics
             put("LC_ALL", "C")
             put("TERM", "dumb")
+
+            // ---- TLS trust for cargo's libcurl ----
+            // The patched openssl-probe in the toolchain probes
+            // $RUSTDROID_PREFIX/etc/{tls,ssl,etc} first.
+            put("RUSTDROID_PREFIX", prefix.absolutePath)
+            if (caBundle != null) {
+                // authoritative: cargo's http.cainfo config override ->
+                // CURLOPT_CAINFO
+                put("CARGO_HTTP_CAINFO", caBundle.absolutePath)
+                // OpenSSL default verify paths + curl-sys's openssl-probe
+                put("SSL_CERT_FILE", caBundle.absolutePath)
+                // libcurl's own env fallback
+                put("CURL_CA_BUNDLE", caBundle.absolutePath)
+            }
+            if (File(SYSTEM_CA_DIR).isDirectory) {
+                // no-bundle fallback: the system store is a hashed CApath
+                put("SSL_CERT_DIR", SYSTEM_CA_DIR)
+            }
         }
     }
 

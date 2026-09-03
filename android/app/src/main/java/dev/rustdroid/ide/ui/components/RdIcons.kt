@@ -41,6 +41,21 @@ object RdIcons {
         }
     }
 
+    val Send: ImageVector by lazy {
+        materialIcon(name = "RdSend") {
+            materialPath {
+                // Material "send" (paper plane)
+                moveTo(2.01f, 21.0f)
+                lineTo(23.0f, 12.0f)
+                lineTo(2.01f, 3.0f)
+                lineTo(2.0f, 10.0f)
+                lineTo(17.0f, 12.0f)
+                lineTo(2.0f, 14.0f)
+                close()
+            }
+        }
+    }
+
     val Terminal: ImageVector by lazy {
         materialIcon(name = "RdTerminal") {
             materialPath {

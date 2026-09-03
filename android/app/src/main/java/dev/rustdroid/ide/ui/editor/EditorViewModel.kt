@@ -259,6 +259,9 @@ class EditorViewModel(
     }
 
     fun sendStdin(line: String) {
+        // echo into the (selectable) console so the input is visible in
+        // the output history and can be copied with the rest
+        console.system("> $line")
         stdinPipe.sendLine(line)
     }
 
