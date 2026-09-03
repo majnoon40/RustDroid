@@ -203,6 +203,15 @@ class DepsViewModel(
                     // (selectable/copyable) error output is in fetchLog.
                     _message.value =
                         "cargo fetch failed (exit ${result.exitCode}) — see fetch output"
+                    // libcurl 77/60 = TLS trust store could not be loaded —
+                    // bare curl codes confuse users; surface an actionable hint.
+                    val tlsFailed = synchronized(log) { log.toList() }.any {
+                        it.contains("error setting certificate verify locations") ||
+                            it.contains("[77]") || it.contains("[60]")
+                    }
+                    if (tlsFailed) {
+                        _fetchLog.value = _fetchLog.value + TLS_HINT
+                    }
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
@@ -224,6 +233,12 @@ class DepsViewModel(
     }
 
     companion object {
+        /** Appended to the fetch log when cargo output shows a TLS trust failure. */
+        const val TLS_HINT =
+            "hint: TLS trust failure (curl 77/60). RustDroid ships its own CA bundle and " +
+                "rebuilds it automatically on every run — if this persists, update to the " +
+                "latest app build and retry the fetch"
+
         fun factory(container: AppContainer, projectName: String) =
             object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")

@@ -284,6 +284,20 @@ class EditorViewModel(
                     },
                 )
                 _lastResult.value = result
+                // libcurl 77/60 = TLS trust store could not be loaded — bare
+                // curl codes confuse users; surface an actionable hint.
+                if (!result.cancelled && result.exitCode != 0 &&
+                    console.lines.value.any {
+                        it.text.contains("error setting certificate verify locations") ||
+                            it.text.contains("[77]") || it.text.contains("[60]")
+                    }
+                ) {
+                    console.system(
+                        "hint: TLS trust failure (curl 77/60). RustDroid ships its own CA bundle and " +
+                            "rebuilds it automatically on every run — if this persists, update to " +
+                            "the latest app build and retry"
+                    )
+                }
                 console.system(
                     if (result.cancelled) "(terminated)"
                     else "(exit ${result.exitCode} in ${result.durationMs / 1000.0}s)"

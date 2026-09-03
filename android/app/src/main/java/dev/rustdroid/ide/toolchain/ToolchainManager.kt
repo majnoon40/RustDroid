@@ -86,12 +86,14 @@ class ToolchainManager(
     suspend fun installFromNetwork() =
         installWith { zip ->
             _state.value = ToolchainState.Downloading(0, ToolchainDistro.expectedSizeBytes)
-            downloader.downloadBlocking(
-                ToolchainDistro.url,
-                zip,
-                ToolchainDistro.SHA256.takeIf { it.length == 64 },
-            ) { bytes, total ->
-                _state.value = ToolchainState.Downloading(bytes, total)
+            withContext(Dispatchers.IO) {
+                downloader.downloadBlocking(
+                    ToolchainDistro.url,
+                    zip,
+                    ToolchainDistro.SHA256.takeIf { it.length == 64 },
+                ) { bytes, total ->
+                    _state.value = ToolchainState.Downloading(bytes, total)
+                }
             }
             log("download complete: ${Fs.humanBytes(zip.length())}")
             zip
