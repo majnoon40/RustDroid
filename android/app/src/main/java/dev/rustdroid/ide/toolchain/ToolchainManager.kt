@@ -40,7 +40,10 @@ class ToolchainManager(
 
     private val downloader = ArtifactDownloader(http)
     private val extractor = ArtifactExtractor(paths)
-    private val verifier = ToolchainVerifier(paths, context.filesDir, runner)
+    private val verifier = ToolchainVerifier(
+        paths, context.filesDir, runner,
+        caAssetProvider = { CaBundle.readAssetPem(context.assets) },
+    )
 
     init {
         // Installs marked Ready by an older app version never re-run verify,

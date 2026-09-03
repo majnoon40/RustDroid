@@ -10,6 +10,7 @@ import dev.rustdroid.ide.model.FileNode
 import dev.rustdroid.ide.model.JumpRequest
 import dev.rustdroid.ide.model.RunResult
 import dev.rustdroid.ide.runtime.CargoRunner
+import dev.rustdroid.ide.runtime.CaBundle
 import dev.rustdroid.ide.runtime.ConsoleBuffer
 import dev.rustdroid.ide.runtime.DiagnosticsParser
 import dev.rustdroid.ide.runtime.ProcEnv
@@ -27,6 +28,11 @@ import java.io.IOException
  * Drives the editor screen: tabs, file tree, console, problems, runs.
  * One build at a time — [runJob] is the single in-flight invocation.
  */
+private const val TLS_HINT =
+    "hint: TLS trust failure (curl 77/60). RustDroid ships its own CA bundle and " +
+        "rebuilds it automatically on every run — if this persists, update to the " +
+        "latest app build and retry"
+
 class EditorViewModel(
     val container: AppContainer,
     val projectName: String,
@@ -292,11 +298,8 @@ class EditorViewModel(
                             it.text.contains("[77]") || it.text.contains("[60]")
                     }
                 ) {
-                    console.system(
-                        "hint: TLS trust failure (curl 77/60). RustDroid ships its own CA bundle and " +
-                            "rebuilds it automatically on every run — if this persists, update to " +
-                            "the latest app build and retry"
-                    )
+                    console.system(TLS_HINT)
+                    console.system(tlsDiagnostics())
                 }
                 console.system(
                     if (result.cancelled) "(terminated)"
@@ -308,6 +311,17 @@ class EditorViewModel(
                 _running.value = false
             }
         }
+    }
+
+    /** See DepsViewModel.tlsDiagnostics — same one-line on-device truth. */
+    private fun tlsDiagnostics(): String {
+        val version = runCatching {
+            container.context.packageManager
+                .getPackageInfo(container.context.packageName, 0).versionName
+        }.getOrNull() ?: "?"
+        val cainfo = env["CARGO_HTTP_CAINFO"] ?: "<not set — bundle could not be built>"
+        return "diag: app=$version | CA ${CaBundle.bundleStatus(container.context.filesDir)} | " +
+            "CARGO_HTTP_CAINFO=$cainfo"
     }
 
     fun stop() {

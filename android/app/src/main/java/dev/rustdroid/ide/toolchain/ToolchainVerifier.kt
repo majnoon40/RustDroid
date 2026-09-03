@@ -2,6 +2,7 @@ package dev.rustdroid.ide.toolchain
 
 import dev.rustdroid.ide.model.CheckStatus
 import dev.rustdroid.ide.model.VerifyCheck
+import dev.rustdroid.ide.runtime.CaBundle
 import dev.rustdroid.ide.runtime.CargoRunner
 import dev.rustdroid.ide.runtime.ProcEnv
 import java.io.File
@@ -17,6 +18,7 @@ class ToolchainVerifier(
     private val paths: ToolchainPaths,
     private val filesDir: File,
     private val runner: CargoRunner,
+    private val caAssetProvider: (() -> ByteArray?)? = null,
 ) {
     /** Runs all checks; [onCheck] fires after each one for live UI. */
     fun verify(onCheck: (VerifyCheck) -> Unit = {}): List<VerifyCheck> {
@@ -119,6 +121,23 @@ class ToolchainVerifier(
 
         runCheck("libcxx", "libc++_shared.so present in prefix lib") {
             if (!paths.libcxx.isFile) "missing ${paths.libcxx.path} (DT_NEEDED of rustc/cargo)" else null
+        }
+
+        // TLS trust warms + validates the CA bundle cargo will use for
+        // crates.io — failing here means every dependency download dies
+        // with libcurl 77/60, so make it loud BEFORE the user hits it.
+        runCheck("tls", "CA bundle usable by cargo (TLS trust)") {
+            val bundle = CaBundle.ensure(
+                filesDir, paths.prefix, assetProvider = caAssetProvider,
+            )
+            when {
+                bundle == null ->
+                    "no CA bundle could be built (APK asset + system stores failed) — " +
+                        "crates.io downloads will fail with curl 77/60"
+                !CaBundle.isUsable(bundle) ->
+                    "CA bundle unusable: ${CaBundle.bundleStatus(filesDir)}"
+                else -> null
+            }
         }
 
         // 9. version probes (subprocess)

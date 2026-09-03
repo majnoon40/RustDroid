@@ -211,6 +211,7 @@ class DepsViewModel(
                     }
                     if (tlsFailed) {
                         _fetchLog.value = _fetchLog.value + TLS_HINT
+                        _fetchLog.value = _fetchLog.value + tlsDiagnostics()
                     }
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
@@ -230,6 +231,22 @@ class DepsViewModel(
 
     fun clearMessage() {
         _message.value = null
+    }
+
+    /**
+     * One-line on-device truth for TLS debugging: app version (so we can
+     * tell an outdated build from a broken fix) + the CA bundle state +
+     * whether cargo will actually receive CARGO_HTTP_CAINFO.
+     */
+    private fun tlsDiagnostics(): String {
+        val version = runCatching {
+            container.context.packageManager
+                .getPackageInfo(container.context.packageName, 0).versionName
+        }.getOrNull() ?: "?"
+        val cainfo = env["CARGO_HTTP_CAINFO"] ?: "<not set — bundle could not be built>"
+        return "diag: app=$version | CA ${
+            dev.rustdroid.ide.runtime.CaBundle.bundleStatus(container.context.filesDir)
+        } | CARGO_HTTP_CAINFO=$cainfo"
     }
 
     companion object {

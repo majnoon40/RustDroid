@@ -83,6 +83,27 @@ object CaBundle {
         }.getOrDefault(false)
     }
 
+    /**
+     * Human-readable one-liner about the on-disk bundle state, for
+     * diagnostics surfaces (console hints, verify checks). Never throws.
+     */
+    fun bundleStatus(filesDir: File): String {
+        val target = bundleFile(filesDir)
+        val path = target.path
+        if (!target.exists()) return "MISSING: $path"
+        if (!target.isFile) return "NOT-A-FILE: $path"
+        if (!target.canRead()) return "UNREADABLE: $path"
+        val kb = "%.1f KB".format(target.length() / 1024.0)
+        val certs = runCatching {
+            Regex(Regex.escape(BEGIN_MARKER)).findAll(target.readText()).count()
+        }.getOrDefault(-1)
+        return when {
+            certs > 0 -> "OK: $certs cert(s), $kb — $path"
+            certs == 0 -> "INVALID: no PEM certs ($kb) — $path"
+            else -> "UNREADABLE-CONTENT: $path"
+        }
+    }
+
     private fun hasPem(content: ByteArray): Boolean {
         if (content.isEmpty()) return false
         val text = runCatching { String(content, Charsets.UTF_8) }.getOrNull() ?: return false

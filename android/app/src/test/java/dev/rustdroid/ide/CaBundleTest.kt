@@ -134,6 +134,27 @@ class CaBundleTest {
     }
 
     @Test
+    fun `bundleStatus describes missing and usable bundles`() {
+        val files = tmp.newFolder("files7")
+        // missing
+        assertTrue(CaBundle.bundleStatus(files).startsWith("MISSING:"))
+
+        // usable: build from asset, then report OK with cert count
+        val prefix = tmp.newFolder("usr7")
+        val asset =
+            "-----BEGIN CERTIFICATE-----\nA\n-----END CERTIFICATE-----\n" +
+            "-----BEGIN CERTIFICATE-----\nB\n-----END CERTIFICATE-----\n"
+        CaBundle.ensure(
+            files, prefix,
+            sources = listOf(File(tmp.root, "nope-7")),
+            assetProvider = { asset.toByteArray() },
+        )
+        val status = CaBundle.bundleStatus(files)
+        assertTrue("got: $status", status.startsWith("OK: 2 cert(s)"))
+        assertTrue("got: $status", status.contains(".ssl/cacert.pem"))
+    }
+
+    @Test
     fun `isUsable rejects missing empty and non-pem files`() {
         assertFalse(CaBundle.isUsable(File(tmp.root, "absent.pem")))
         val empty = tmp.newFile("empty.pem")
