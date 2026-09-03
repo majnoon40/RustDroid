@@ -85,7 +85,7 @@ class ProjectRepository(
             if (!result.success || !File(dir, "Cargo.toml").isFile) {
                 Fs.deleteRecursively(dir)
                 val tail = synchronized(output) { output.toString().trim() }
-                    .lineSequence().takeLast(12).joinToString("\n")
+                    .lines().takeLast(12).joinToString("\n")
                 throw IOException(
                     if (tail.isEmpty()) "cargo new failed (exit ${result.exitCode})"
                     else "cargo new failed (exit ${result.exitCode}):\n$tail"
