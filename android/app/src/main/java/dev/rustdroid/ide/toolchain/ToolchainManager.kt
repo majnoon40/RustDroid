@@ -104,25 +104,28 @@ class ToolchainManager(
     suspend fun installFromImport(open: () -> java.io.InputStream) =
         installWith { zip ->
             _state.value = ToolchainState.Downloading(0, null)
-            zip.parentFile?.mkdirs()
-            val tmp = File(zip.parentFile, zip.name + ".part")
-            open().use { input ->
-                tmp.outputStream().use { output ->
-                    val buf = ByteArray(64 * 1024)
-                    var copied = 0L
-                    while (true) {
-                        val n = input.read(buf)
-                        if (n < 0) break
-                        output.write(buf, 0, n)
-                        copied += n
-                        if (copied % (4 * 1024 * 1024) == 0L) {
-                            _state.value = ToolchainState.Downloading(copied, null)
+            // multi-GB spool copy — must not run on the caller (Main) thread
+            withContext(Dispatchers.IO) {
+                zip.parentFile?.mkdirs()
+                val tmp = File(zip.parentFile, zip.name + ".part")
+                open().use { input ->
+                    tmp.outputStream().use { output ->
+                        val buf = ByteArray(64 * 1024)
+                        var copied = 0L
+                        while (true) {
+                            val n = input.read(buf)
+                            if (n < 0) break
+                            output.write(buf, 0, n)
+                            copied += n
+                            if (copied % (4 * 1024 * 1024) == 0L) {
+                                _state.value = ToolchainState.Downloading(copied, null)
+                            }
                         }
                     }
                 }
+                if (zip.exists()) zip.delete()
+                check(tmp.renameTo(zip)) { "cannot finalize imported zip" }
             }
-            if (zip.exists()) zip.delete()
-            check(tmp.renameTo(zip)) { "cannot finalize imported zip" }
             log("import complete: ${Fs.humanBytes(zip.length())}")
             zip
         }

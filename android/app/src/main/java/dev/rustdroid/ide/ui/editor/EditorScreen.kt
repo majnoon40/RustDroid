@@ -15,6 +15,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -102,6 +104,11 @@ fun EditorScreen(
     val showCloseConfirm by vm.showCloseConfirm.collectAsState()
     val allFiles by vm.treeAllFiles.collectAsState()
     val consoleLines by vm.console.lines.collectAsState()
+
+    // Re-entering this screen (e.g. back from the Deps screen) re-runs this
+    // effect: pull fresh bytes for any tab that has no unsaved edits, so a
+    // Cargo.toml updated by the Deps screen is never shown stale here.
+    LaunchedEffect(Unit) { vm.reloadUnchangedTabs() }
 
     val dark = isSystemInDarkTheme()
     val palette = LocalEditorPalette.current
@@ -247,7 +254,7 @@ fun EditorScreen(
                 // ---- bottom panel ----
                 val errorCount = problems.count { it.severity == Severity.ERROR }
                 val warningCount = problems.count { it.severity == Severity.WARNING }
-                Surface(tonalElevation = 2.dp) {
+                Surface(tonalElevation = 2.dp, modifier = Modifier.imePadding()) {
                     Column(Modifier.fillMaxWidth()) {
                         TabRow(selectedTabIndex = if (bottomTab == EditorViewModel.BottomTab.CONSOLE) 0 else 1) {
                             Tab(
@@ -296,6 +303,7 @@ fun EditorScreen(
                                     lines = consoleLines,
                                     running = running,
                                     onSend = { vm.sendStdin(it) },
+                                    onClear = { vm.clearConsole() },
                                     listState = consoleListState,
                                 )
                                 EditorViewModel.BottomTab.PROBLEMS -> ProblemsPanel(
@@ -357,10 +365,57 @@ private fun ConsolePanel(
     lines: List<ConsoleLine>,
     running: Boolean,
     onSend: (String) -> Unit,
+    onClear: () -> Unit,
     listState: androidx.compose.foundation.lazy.LazyListState,
 ) {
     val palette = LocalEditorPalette.current
+    val clipboard = LocalClipboardManager.current
     Column(Modifier.fillMaxSize()) {
+        // Console toolbar: guaranteed copy path. Long-press selection
+        // (SelectionContainer below) can be fiddly on some devices and is
+        // limited to on-screen lines — "Copy all" always works.
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .background(palette.consoleBg),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "${lines.size} lines",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 10.dp),
+            )
+            Spacer(Modifier.weight(1f))
+            IconButton(
+                onClick = {
+                    clipboard.setText(AnnotatedString(lines.joinToString("\n") { it.text }))
+                },
+                enabled = lines.isNotEmpty(),
+                modifier = Modifier.size(32.dp),
+            ) {
+                Icon(
+                    RdIcons.Copy,
+                    contentDescription = "Copy all output",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(16.dp),
+                )
+            }
+            IconButton(
+                onClick = onClear,
+                enabled = lines.isNotEmpty() && !running,
+                modifier = Modifier
+                    .size(32.dp)
+                    .padding(end = 6.dp),
+            ) {
+                Icon(
+                    Icons.Filled.Close,
+                    contentDescription = "Clear console",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(16.dp),
+                )
+            }
+        }
         // Selectable: long-press any build/run output to copy it (error
         // messages, compiler output, backtraces).
         SelectionContainer(Modifier.weight(1f)) {

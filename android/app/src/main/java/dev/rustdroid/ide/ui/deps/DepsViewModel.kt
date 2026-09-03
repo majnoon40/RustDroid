@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.IOException
 
@@ -43,7 +44,30 @@ class DepsViewModel(
     private val _message = MutableStateFlow<String?>(null)
     val message: StateFlow<String?> = _message.asStateFlow()
 
+    /** True while `cargo fetch` (the actual dependency download) is running. */
+    private val _fetching = MutableStateFlow(false)
+    val fetching: StateFlow<Boolean> = _fetching.asStateFlow()
+
+    /**
+     * Tail of the last `cargo fetch` output — shown (selectable) in the
+     * deps screen so download errors are visible, not a mystery snackbar.
+     */
+    private val _fetchLog = MutableStateFlow<List<String>>(emptyList())
+    val fetchLog: StateFlow<List<String>> = _fetchLog.asStateFlow()
+
     private var searchJob: Job? = null
+    private var fetchJob: Job? = null
+
+    private val cargoPath: String
+        get() = dev.rustdroid.ide.runtime.ProcEnv.toolchainCommand(
+            container.toolchainPaths.prefix, "cargo",
+        )
+
+    private val env: Map<String, String> by lazy {
+        dev.rustdroid.ide.runtime.ProcEnv.env(
+            container.toolchainPaths.prefix, container.context.filesDir,
+        )
+    }
 
     init {
         refresh()
@@ -57,27 +81,41 @@ class DepsViewModel(
                 }
                 searchJob = launch {
                     delay(350)
-                    _searching.value = true
-                    try {
-                        _results.value = crates.search(q)
-                        if (_results.value.isEmpty()) {
-                            _message.value = "no crates matched '$q'"
-                        }
-                    } catch (e: Exception) {
-                        _results.value = emptyList()
-                        _message.value = "crates.io unreachable: ${e.message}"
-                    } finally {
-                        _searching.value = false
-                    }
+                    runSearch(q)
                 }
             }
         }
     }
 
+    private suspend fun runSearch(q: String) {
+        _searching.value = true
+        try {
+            _results.value = crates.search(q)
+            if (_results.value.isEmpty()) {
+                _message.value = "no crates matched '$q'"
+            }
+        } catch (e: Exception) {
+            _results.value = emptyList()
+            _message.value = "crates.io unreachable: ${e.message}"
+        } finally {
+            _searching.value = false
+        }
+    }
+
+    /** Runs the search immediately (IME "Search" action), skipping the debounce. */
+    fun searchNow() {
+        val q = _query.value.trim()
+        if (q.length < 2) return
+        searchJob?.cancel()
+        searchJob = viewModelScope.launch { runSearch(q) }
+    }
+
     fun refresh() {
         viewModelScope.launch {
             try {
-                _deps.value = CargoToml.readDependencies(manifest)
+                _deps.value = withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    CargoToml.readDependencies(manifest)
+                }
             } catch (e: IOException) {
                 _message.value = "Cargo.toml: ${e.message}"
             }
@@ -91,9 +129,16 @@ class DepsViewModel(
     fun add(crate: CrateSummary) {
         viewModelScope.launch {
             try {
-                CargoToml.addDependency(manifest, crate.name, crate.max_version.ifEmpty { "0.0.0" })
-                _message.value = "added ${crate.name} = \"${crate.max_version}\" — fetched at next build"
+                withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    CargoToml.addDependency(
+                        manifest, crate.name, crate.max_version.ifEmpty { "0.0.0" },
+                    )
+                }
+                _message.value = "added ${crate.name} = \"${crate.max_version}\" — downloading…"
                 refresh()
+                // Download right away so errors surface here (with the real
+                // cargo output) instead of as a mysterious build failure later.
+                fetchNow()
             } catch (e: Exception) {
                 _message.value = "add failed: ${e.message}"
             }
@@ -103,14 +148,68 @@ class DepsViewModel(
     fun remove(name: String) {
         viewModelScope.launch {
             try {
-                if (CargoToml.removeDependency(manifest, name)) {
-                    _message.value = "removed $name"
+                val removed = withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    CargoToml.removeDependency(manifest, name)
                 }
+                if (removed) _message.value = "removed $name"
                 refresh()
             } catch (e: Exception) {
                 _message.value = "remove failed: ${e.message}"
             }
         }
+    }
+
+    /**
+     * Downloads all dependencies now via `cargo fetch`. Single-flight.
+     * Output streams into [fetchLog]; on failure the last error lines are
+     * surfaced in the snackbar AND kept selectable in the log area.
+     */
+    fun fetchNow() {
+        if (_fetching.value) return
+        if (!container.toolchainPaths.isInstalled()) {
+            _message.value = "toolchain not installed — install it from Settings first"
+            return
+        }
+        fetchJob?.cancel()
+        fetchJob = viewModelScope.launch {
+            _fetching.value = true
+            // first access builds the CA bundle (disk) — keep it off Main
+            val fetchEnv = withContext(kotlinx.coroutines.Dispatchers.IO) { env }
+            val log = mutableListOf<String>()
+            try {
+                val result = container.cargoRunner.run(
+                    listOf(cargoPath, "fetch"),
+                    cwd = projectDir,
+                    env = fetchEnv,
+                    onLine = { line ->
+                        synchronized(log) {
+                            log.add(line.text)
+                            if (log.size > 400) log.removeAt(0)
+                        }
+                        _fetchLog.value = synchronized(log) { log.toList() }
+                    },
+                )
+                if (result.success) {
+                    _message.value = "dependencies downloaded"
+                } else {
+                    // Snackbar is 2-line-capped — keep it a pointer; the full
+                    // (selectable/copyable) error output is in fetchLog.
+                    _message.value =
+                        "cargo fetch failed (exit ${result.exitCode}) — see fetch output"
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _message.value = "fetch error: ${e.message}"
+            } finally {
+                _fetching.value = false
+            }
+        }
+    }
+
+    fun clearFetchLog() {
+        fetchJob?.cancel()
+        _fetchLog.value = emptyList()
     }
 
     fun clearMessage() {

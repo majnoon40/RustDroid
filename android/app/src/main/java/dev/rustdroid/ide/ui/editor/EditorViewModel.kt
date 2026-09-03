@@ -148,8 +148,11 @@ class EditorViewModel(
         val idx = _pendingClose
         _showCloseConfirm.value = false
         if (save) {
-            setActive(idx)
-            saveActive()
+            // the pending tab may not be the active one; cachedText is kept
+            // current for both cases (onTextChange / setActive flush it)
+            _tabs.value.getOrNull(idx)?.let { tab ->
+                viewModelScope.launch { saveTab(tab, tab.cachedText) }
+            }
         }
         doClose(idx)
     }
@@ -167,26 +170,55 @@ class EditorViewModel(
         }
     }
 
-    fun saveActive(): Boolean = activeTab?.let { tab ->
+    /** Writes one tab's text to disk off the main thread. */
+    private suspend fun saveTab(tab: EditorTab, text: String) = withContext(Dispatchers.IO) {
         try {
-            repo.writeFile(tab.file, _activeText.value)
+            repo.writeFile(tab.file, text)
             tab.dirty = false
-            true
         } catch (e: IOException) {
-            console.system("save failed: ${e.message}")
-            false
+            console.system("save failed (${tab.relativePath}): ${e.message}")
         }
-    } ?: false
+    }
 
-    fun saveAll() {
-        // flush active text first
+    /**
+     * Saves every DIRTY tab. Deliberately skips clean tabs: their cached
+     * text can be stale (e.g. Cargo.toml changed by the Deps screen while
+     * its tab sat open) and rewriting them would clobber external edits —
+     * the bug that made freshly added dependencies vanish on Run.
+     */
+    private suspend fun saveAllChanged() = withContext(Dispatchers.IO) {
         activeTab?.let { it.cachedText = _activeText.value }
-        _tabs.value.forEach { tab ->
+        _tabs.value.filter { it.dirty }.forEach { tab ->
             try {
                 repo.writeFile(tab.file, tab.cachedText)
                 tab.dirty = false
             } catch (e: IOException) {
                 console.system("save failed (${tab.relativePath}): ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * Re-reads tabs that have no unsaved edits. Called when the editor
+     * screen re-enters composition (back-navigation from Deps), so files
+     * changed elsewhere are refreshed instead of being overwritten later
+     * with stale content.
+     */
+    fun reloadUnchangedTabs() {
+        viewModelScope.launch {
+            val changed = withContext(Dispatchers.IO) {
+                _tabs.value.filter { !it.dirty }.mapNotNull { tab ->
+                    val fresh = runCatching { repo.readFile(tab.file) }.getOrNull()
+                    if (fresh != null && fresh != tab.cachedText) tab to fresh else null
+                }
+            }
+            if (changed.isEmpty()) return@launch
+            changed.forEach { (tab, fresh) -> tab.cachedText = fresh }
+            // refresh the visible text if the active tab was one of them
+            _activeIndex.value.takeIf { it >= 0 }?.let { idx ->
+                _tabs.value.getOrNull(idx)?.let { tab ->
+                    if (changed.any { it.first === tab }) _activeText.value = tab.cachedText
+                }
             }
         }
     }
@@ -217,8 +249,9 @@ class EditorViewModel(
 
     private fun startCargo(command: List<String>) {
         if (_running.value) return
-        saveAll()
         runJob = viewModelScope.launch {
+            // persist unsaved edits BEFORE the toolchain reads them
+            saveAllChanged()
             _running.value = true
             _lastResult.value = null
             _problems.value = emptyList()
@@ -256,6 +289,11 @@ class EditorViewModel(
 
     fun stop() {
         runJob?.cancel()
+    }
+
+    /** Manual console clear (toolbar button); disabled while a build streams. */
+    fun clearConsole() {
+        console.clear()
     }
 
     fun sendStdin(line: String) {
