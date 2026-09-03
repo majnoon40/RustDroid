@@ -67,8 +67,10 @@ object CaBundle {
             for (f in files.sortedBy { it.name }) {
                 val pem = runCatching { f.readText() }.getOrNull() ?: continue
                 if (!pem.contains(BEGIN_MARKER)) continue
-                if (!pem.endsWith("\n")) certs.append('\n')
                 certs.append(pem)
+                // repair a missing trailing newline so the next BEGIN
+                // marker starts on its own line (PEM parsers require it)
+                if (!pem.endsWith("\n")) certs.append('\n')
                 count++
             }
         }
