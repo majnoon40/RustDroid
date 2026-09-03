@@ -130,7 +130,7 @@ class ToolchainManager(
             zip
         }
 
-    private suspend fun installWith(fetch: (File) -> File) = mutex.withLock {
+    private suspend fun installWith(fetch: suspend (File) -> File) = mutex.withLock {
         try {
             if (paths.isInstalled()) {
                 uninstallLocked()
