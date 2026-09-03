@@ -61,14 +61,18 @@ CARGO_TERM_COLOR = never
 
 **TLS trust (`runtime/CaBundle`).** cargo's libcurl is linked against a
 statically built OpenSSL that knows nothing about Android's CA stores, so
-crate downloads fail with libcurl error 60 ("SSL peer certificate or SSH
-remote key was not OK"). The app builds a concatenated PEM bundle from
-`/system/etc/security/cacerts` (+ the Android 14+ Conscrypt APEX store) into
-`files/home/.ssl/cacert.pem` and exposes it through every trust channel:
-`CARGO_HTTP_CAINFO` (cargo's `http.cainfo` override → `CURLOPT_CAINFO`,
-also merged into `$CARGO_HOME/config.toml`), `SSL_CERT_FILE` +
-`CURL_CA_BUNDLE` (OpenSSL/libcurl defaults), and `SSL_CERT_DIR` (the
-system store itself, as a hashed CApath fallback). A mirror lands at
+crate downloads fail with libcurl error 77/60 without explicit trust. The
+app ships a pinned Mozilla PEM bundle as an APK asset
+(`src/main/assets/ssl/cacert.pem`) and materializes it (validated,
+self-healing, asset-first — system stores are only a fallback) into
+`files/home/.ssl/cacert.pem`, exposing it through the explicit CAfile
+channels: `CARGO_HTTP_CAINFO` (cargo's `http.cainfo` override →
+`CURLOPT_CAINFO`, also merged into `$CARGO_HOME/config.toml`), and
+`SSL_CERT_FILE` + `CURL_CA_BUNDLE` (OpenSSL/libcurl defaults).
+`SSL_CERT_DIR` is deliberately NOT exported: libcurl maps it to a hashed
+`CApath`, which the statically-linked TLS backend rejects during
+verify-location setup (curl 77 even with a valid CAfile — see the root
+README's Troubleshooting for the full history). A mirror lands at
 `files/usr/etc/tls/cert.pem` so the toolchain's patched `openssl-probe`
 finds it via `RUSTDROID_PREFIX` even without env vars. The app's own
 crates.io search (OkHttp) uses the platform trust store and is unaffected.

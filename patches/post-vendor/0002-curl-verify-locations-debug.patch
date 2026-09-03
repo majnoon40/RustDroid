@@ -1,0 +1,49 @@
+diff --git a/vendor/curl-sys/curl/lib/vtls/openssl.c b/vendor/curl-sys/curl/lib/vtls/openssl.c
+index 2b60f7f..c1f7f07 100644
+--- a/vendor/curl-sys/curl/lib/vtls/openssl.c
++++ b/vendor/curl-sys/curl/lib/vtls/openssl.c
+@@ -3193,9 +3193,44 @@ static CURLcode populate_x509_store(struct Curl_cfilter *cf,
+ #else
+       /* tell OpenSSL where to find CA certificates that are used to verify the
+          server's certificate. */
++      /* RUSTDROID-DEBUG: dump the CAfile exactly as this process sees it */
++      if(ssl_cafile) {
++        FILE *rbdbg = fopen(ssl_cafile, "rb");
++        if(!rbdbg) {
++          fprintf(stderr, "RUSTDROID-DEBUG: fopen(%s) FAILED errno=%d (%s)\n",
++                  ssl_cafile, errno, strerror(errno));
++        }
++        else {
++          unsigned char rbhdr[32];
++          size_t rbn = fread(rbhdr, 1, sizeof(rbhdr), rbdbg);
++          long rbtot;
++          size_t rbi;
++          fseek(rbdbg, 0, SEEK_END);
++          rbtot = ftell(rbdbg);
++          fclose(rbdbg);
++          fprintf(stderr, "RUSTDROID-DEBUG: fopen(%s) OK size=%ld first=%zu:",
++                  ssl_cafile, rbtot, rbn);
++          for(rbi = 0; rbi < rbn; rbi++)
++            fprintf(stderr, " %02x", rbhdr[rbi]);
++          fprintf(stderr, "\n");
++          fprintf(stderr, "RUSTDROID-DEBUG: text: '%.*s'\n",
++                  (int)(rbn > 24 ? 24 : rbn), (const char *)rbhdr);
++        }
++      }
+       if(!X509_STORE_load_locations(store, ssl_cafile, ssl_capath)) {
+         if(!imported_native_ca && !imported_ca_info_blob) {
+           /* Fail if we insist on successfully verifying the server. */
++          /* RUSTDROID-DEBUG: dump the OpenSSL error queue for this failure */
++          {
++            unsigned long rbe;
++            while((rbe = ERR_get_error()) != 0) {
++              char rbbuf[256];
++              ERR_error_string_n(rbe, rbbuf, sizeof(rbbuf));
++              fprintf(stderr, "RUSTDROID-DEBUG: openssl error 0x%08lx: %s\n",
++                      rbe, rbbuf);
++            }
++            fflush(stderr);
++          }
+           failf(data, "error setting certificate verify locations:"
+                 "  CAfile: %s CApath: %s",
+                 ssl_cafile ? ssl_cafile : "none",
