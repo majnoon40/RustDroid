@@ -57,9 +57,42 @@ class ProcEnvTest {
         assertEquals(bundle.absolutePath, env["CARGO_HTTP_CAINFO"])
         assertEquals(bundle.absolutePath, env["SSL_CERT_FILE"])
         assertEquals(bundle.absolutePath, env["CURL_CA_BUNDLE"])
-        if (File(ProcEnv.SYSTEM_CA_DIR).isDirectory) {
-            assertEquals(ProcEnv.SYSTEM_CA_DIR, env["SSL_CERT_DIR"])
-        }
+    }
+
+    @Test
+    fun `TLS trust - SSL_CERT_DIR is never exported (CApath poisons verify setup)`() {
+        // libcurl maps SSL_CERT_DIR to CURLOPT_CAPATH; some statically-linked
+        // TLS backends in Android cargo builds fail the whole
+        // SSL_CTX_load_verify_locations when a CApath is present — curl 77
+        // even with a valid CAfile. The env must stay CAfile-only.
+        val prefix = tmp.newFolder("usr-capath")
+        val files = tmp.newFolder("files-capath")
+        val bundle = tmp.newFile("cacert-capath.pem")
+        val withBundle = ProcEnv.env(prefix, files, caBundle = bundle)
+        assertNull(withBundle["SSL_CERT_DIR"])
+        val withoutBundle = ProcEnv.env(prefix, files, caBundle = null)
+        assertNull(withoutBundle["SSL_CERT_DIR"])
+    }
+
+    @Test
+    fun `TLS escape hatch - marker file or flag enables danger-accept-invalid-certs`() {
+        val prefix = tmp.newFolder("usr-hatch")
+        val files = tmp.newFolder("files-hatch")
+
+        // default: off
+        val plain = ProcEnv.env(prefix, files, caBundle = null)
+        assertNull(plain["CARGO_HTTP_DANGER_ACCEPT_INVALID_CERTS"])
+
+        // per-invocation flag (project marker found by the caller)
+        val flagged = ProcEnv.env(prefix, files, caBundle = null, insecureTlsOk = true)
+        assertEquals("true", flagged["CARGO_HTTP_DANGER_ACCEPT_INVALID_CERTS"])
+
+        // $HOME marker file
+        val marker = File(ProcEnv.homeDir(files), ProcEnv.INSECURE_TLS_MARKER_HOME)
+        marker.parentFile!!.mkdirs()
+        assertTrue(marker.createNewFile())
+        val marked = ProcEnv.env(prefix, files, caBundle = null)
+        assertEquals("true", marked["CARGO_HTTP_DANGER_ACCEPT_INVALID_CERTS"])
     }
 
     @Test

@@ -27,8 +27,13 @@ import java.io.File
  *  - [ProcEnv] sets CARGO_HTTP_CAINFO / SSL_CERT_FILE / CURL_CA_BUNDLE
  *    to the bundle (cargo -> CURLOPT_CAINFO, the authoritative path),
  *  - a mirror is placed at $prefix/etc/tls/cert.pem so the patched
- *    openssl-probe finds it via RUSTDROID_PREFIX even without env vars,
- *  - SSL_CERT_DIR points at the system CApath as a no-bundle fallback.
+ *    openssl-probe finds it via RUSTDROID_PREFIX even without env vars.
+ *
+ * SSL_CERT_DIR is deliberately NOT exported: libcurl turns that env var
+ * into CURLOPT_CAPATH, and the statically-linked TLS backend in Android
+ * cargo builds fails the whole verify-location setup whenever a CApath
+ * is configured (curl error 77) — even with a valid CAfile. Trust is
+ * CAfile-only.
  *
  * Every [ensure] call re-validates the on-disk bundle and self-heals
  * (rebuilds from the asset or the system store) when it is missing,
@@ -113,7 +118,7 @@ object CaBundle {
     /**
      * Ensures a usable bundle exists and returns it, or null when neither
      * the APK asset nor any system store yields a certificate (callers
-     * then rely on SSL_CERT_DIR alone). Idempotent; cheap stat fast-path
+     * then have no CAfile to configure). Idempotent; cheap stat fast-path
      * when the bundle is already present and valid. Self-heals an
      * existing-but-unusable bundle by rebuilding. Called from
      * [ProcEnv.env] on arbitrary threads, hence synchronized.

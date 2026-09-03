@@ -25,14 +25,21 @@ import java.io.File
 import java.io.IOException
 
 /**
+ * Shown when cargo output reports a TLS trust failure. Points at the
+ * on-console curl debug trace (CARGO_HTTP_DEBUG is on) and at the
+ * README-documented last-resort escape hatch.
+ */
+private const val TLS_HINT =
+    "hint: TLS trust failure (curl 77/60). Cargo now runs with HTTP debugging — " +
+        "the verbose curl output above shows the exact TLS setup failure; paste it " +
+        "when reporting. As a last resort, create an empty file named " +
+        ".rustdroid-insecure-tls in the project root to skip certificate " +
+        "verification for this project (see README → Troubleshooting)"
+
+/**
  * Drives the editor screen: tabs, file tree, console, problems, runs.
  * One build at a time — [runJob] is the single in-flight invocation.
  */
-private const val TLS_HINT =
-    "hint: TLS trust failure (curl 77/60). RustDroid ships its own CA bundle and " +
-        "rebuilds it automatically on every run — if this persists, update to the " +
-        "latest app build and retry"
-
 class EditorViewModel(
     val container: AppContainer,
     val projectName: String,
@@ -42,18 +49,24 @@ class EditorViewModel(
 
     private val repo = container.projectRepository
     private val runner = container.cargoRunner
-    private val env by lazy {
-        ProcEnv.env(
-            container.toolchainPaths.prefix, container.context.filesDir,
-            // APK-pinned CA store: cargo fetch/build must reach crates.io
-            // even when the device system trust store is unusable.
-            assetProvider = {
-                dev.rustdroid.ide.runtime.CaBundle.readAssetPem(
-                    container.context.assets,
-                )
-            },
-        )
-    }
+    /**
+     * Built per invocation (not cached): cheap after first run (stat
+     * fast-path bundle ensure), and rebuilt envs pick up the last-resort
+     * TLS escape-hatch marker the moment it appears on disk.
+     */
+    private fun buildEnv(): Map<String, String> = ProcEnv.env(
+        container.toolchainPaths.prefix, container.context.filesDir,
+        // APK-pinned CA store: cargo fetch/build must reach crates.io
+        // even when the device system trust store is unusable.
+        assetProvider = {
+            dev.rustdroid.ide.runtime.CaBundle.readAssetPem(
+                container.context.assets,
+            )
+        },
+        // last-resort TLS escape hatch: empty marker file in the project
+        // root opts THIS project out of certificate verification
+        insecureTlsOk = File(projectDir, ProcEnv.PROJECT_INSECURE_TLS_MARKER).isFile,
+    )
 
     // ---- tabs ----
     private val _tabs = MutableStateFlow<List<EditorTab>>(emptyList())
@@ -277,8 +290,12 @@ class EditorViewModel(
                 command.drop(1).joinToString("", prefix = " ")
             console.system("\$ $display")
             try {
+                // built here (not at class init) so bundle warm-up and the
+                // escape-hatch marker check happen off the main thread and
+                // reflect the state at the moment of invocation
+                val runEnv = withContext(Dispatchers.IO) { buildEnv() }
                 val result = runner.run(
-                    command, cwd = projectDir, env = env, stdin = stdinPipe,
+                    command, cwd = projectDir, env = runEnv, stdin = stdinPipe,
                     onLine = { line ->
                         console.append(line)
                         if (line.stream == dev.rustdroid.ide.model.Stream.STDERR) {
@@ -299,7 +316,7 @@ class EditorViewModel(
                     }
                 ) {
                     console.system(TLS_HINT)
-                    console.system(tlsDiagnostics())
+                    console.system(tlsDiagnostics(runEnv))
                 }
                 console.system(
                     if (result.cancelled) "(terminated)"
@@ -314,14 +331,18 @@ class EditorViewModel(
     }
 
     /** See DepsViewModel.tlsDiagnostics — same one-line on-device truth. */
-    private fun tlsDiagnostics(): String {
+    private fun tlsDiagnostics(env: Map<String, String>): String {
         val version = runCatching {
             container.context.packageManager
                 .getPackageInfo(container.context.packageName, 0).versionName
         }.getOrNull() ?: "?"
         val cainfo = env["CARGO_HTTP_CAINFO"] ?: "<not set — bundle could not be built>"
+        // SSL_CERT_DIR must print "unset" on builds from 2026-09-03 onwards:
+        // a non-empty CApath (from that env var) makes some statically-linked
+        // TLS backends reject the whole verify-location setup (curl 77)
+        val certDir = env["SSL_CERT_DIR"] ?: "unset"
         return "diag: app=$version | CA ${CaBundle.bundleStatus(container.context.filesDir)} | " +
-            "CARGO_HTTP_CAINFO=$cainfo"
+            "CARGO_HTTP_CAINFO=$cainfo | SSL_CERT_DIR=$certDir"
     }
 
     fun stop() {

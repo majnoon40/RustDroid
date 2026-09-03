@@ -63,7 +63,12 @@ class DepsViewModel(
             container.toolchainPaths.prefix, "cargo",
         )
 
-    private val env: Map<String, String> by lazy {
+    /**
+     * Built per invocation (not cached): cheap after first run (stat
+     * fast-path bundle ensure), and rebuilt envs pick up the last-resort
+     * TLS escape-hatch marker the moment it appears on disk.
+     */
+    private fun buildEnv(): Map<String, String> =
         dev.rustdroid.ide.runtime.ProcEnv.env(
             container.toolchainPaths.prefix, container.context.filesDir,
             // APK-pinned CA store: keeps `cargo fetch` working on devices
@@ -73,8 +78,13 @@ class DepsViewModel(
                     container.context.assets,
                 )
             },
+            // last-resort TLS escape hatch: empty marker file in the project
+            // root opts THIS project out of certificate verification
+            insecureTlsOk = File(
+                projectDir,
+                dev.rustdroid.ide.runtime.ProcEnv.PROJECT_INSECURE_TLS_MARKER,
+            ).isFile,
         )
-    }
 
     init {
         refresh()
@@ -180,8 +190,9 @@ class DepsViewModel(
         fetchJob?.cancel()
         fetchJob = viewModelScope.launch {
             _fetching.value = true
-            // first access builds the CA bundle (disk) — keep it off Main
-            val fetchEnv = withContext(kotlinx.coroutines.Dispatchers.IO) { env }
+            // first access warms the CA bundle (disk) — keep it off Main;
+            // rebuilt per fetch so the escape-hatch marker is honored live
+            val fetchEnv = withContext(kotlinx.coroutines.Dispatchers.IO) { buildEnv() }
             val log = mutableListOf<String>()
             try {
                 val result = container.cargoRunner.run(
@@ -211,7 +222,7 @@ class DepsViewModel(
                     }
                     if (tlsFailed) {
                         _fetchLog.value = _fetchLog.value + TLS_HINT
-                        _fetchLog.value = _fetchLog.value + tlsDiagnostics()
+                        _fetchLog.value = _fetchLog.value + tlsDiagnostics(fetchEnv)
                     }
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
@@ -236,25 +247,32 @@ class DepsViewModel(
     /**
      * One-line on-device truth for TLS debugging: app version (so we can
      * tell an outdated build from a broken fix) + the CA bundle state +
-     * whether cargo will actually receive CARGO_HTTP_CAINFO.
+     * whether cargo will actually receive CARGO_HTTP_CAINFO + whether the
+     * CApath channel (SSL_CERT_DIR) is gone.
      */
-    private fun tlsDiagnostics(): String {
+    private fun tlsDiagnostics(env: Map<String, String>): String {
         val version = runCatching {
             container.context.packageManager
                 .getPackageInfo(container.context.packageName, 0).versionName
         }.getOrNull() ?: "?"
         val cainfo = env["CARGO_HTTP_CAINFO"] ?: "<not set — bundle could not be built>"
+        // SSL_CERT_DIR must print "unset" on builds from 2026-09-03 onwards:
+        // a non-empty CApath (from that env var) makes some statically-linked
+        // TLS backends reject the whole verify-location setup (curl 77)
+        val certDir = env["SSL_CERT_DIR"] ?: "unset"
         return "diag: app=$version | CA ${
             dev.rustdroid.ide.runtime.CaBundle.bundleStatus(container.context.filesDir)
-        } | CARGO_HTTP_CAINFO=$cainfo"
+        } | CARGO_HTTP_CAINFO=$cainfo | SSL_CERT_DIR=$certDir"
     }
 
     companion object {
         /** Appended to the fetch log when cargo output shows a TLS trust failure. */
         const val TLS_HINT =
-            "hint: TLS trust failure (curl 77/60). RustDroid ships its own CA bundle and " +
-                "rebuilds it automatically on every run — if this persists, update to the " +
-                "latest app build and retry the fetch"
+            "hint: TLS trust failure (curl 77/60). Cargo now runs with HTTP debugging — " +
+                "the verbose curl output above shows the exact TLS setup failure; paste it " +
+                "when reporting. As a last resort, create an empty file named " +
+                ".rustdroid-insecure-tls in the project root to skip certificate " +
+                "verification for this project (see README → Troubleshooting)"
 
         fun factory(container: AppContainer, projectName: String) =
             object : ViewModelProvider.Factory {
