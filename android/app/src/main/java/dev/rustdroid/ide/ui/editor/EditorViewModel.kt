@@ -172,6 +172,41 @@ class EditorViewModel(
     private val _showCloseConfirm = MutableStateFlow(false)
     val showCloseConfirm: StateFlow<Boolean> = _showCloseConfirm.asStateFlow()
 
+    // ---------------- new file ----------------
+
+    /** One-shot: relative path of the last created file (closes the dialog). */
+    private val _createdFile = MutableStateFlow<String?>(null)
+    val createdFile: StateFlow<String?> = _createdFile.asStateFlow()
+
+    /** Error of the last createFile attempt (shown inline in the dialog). */
+    private val _createFileError = MutableStateFlow<String?>(null)
+    val createFileError: StateFlow<String?> = _createFileError.asStateFlow()
+
+    fun clearNewFileSignals() {
+        _createdFile.value = null
+        _createFileError.value = null
+    }
+
+    /**
+     * Creates an empty file (mkdirs parents) inside the project and opens it
+     * in a new tab. Path safety lives in the repository (Fs.resolveChild);
+     * existing files are never overwritten.
+     */
+    fun createFile(relativePath: String) {
+        viewModelScope.launch {
+            val rel = relativePath.trim()
+            try {
+                withContext(Dispatchers.IO) { repo.createFile(projectDir, rel) }
+                _createFileError.value = null
+                refreshTree()
+                openFile(rel)
+                _createdFile.value = rel
+            } catch (e: Exception) {
+                _createFileError.value = e.message ?: "could not create '$rel'"
+            }
+        }
+    }
+
     fun confirmClose(save: Boolean) {
         val idx = _pendingClose
         _showCloseConfirm.value = false

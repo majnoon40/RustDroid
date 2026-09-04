@@ -119,6 +119,25 @@ dark/light themes (`assets/textmate/`). Programmatic `setText` events are
 filtered so tab loads don't mark files dirty; diagnostics tap-through jumps
 via `setSelection(line, col, makeVisible)`.
 
+The file drawer is a Material3 `ModalNavigationDrawer` with
+`gesturesEnabled = false` — deliberate, not an oversight. The editor is an
+Android View behind `AndroidView` interop, so it scrolls and long-press
+selects inside the View system and never consumes pointer events in
+Compose's gesture pipeline. With drawer gestures on, M3's
+`anchoredDraggable` watches the same pointer stream over the content area
+and (a) steals a long-press once the finger drifts past touch slop —
+cancelling the editor mid-hold, so text selection never fires — and (b)
+reads scroll/fling motion as a horizontal drag, popping the drawer open
+while scrolling long files. Compose-native scrollables consume their
+deltas first, so only interop children are exposed. The drawer opens via
+the toolbar folder button; the scrim tap still closes it.
+
+New files: the drawer header has a `+` button that creates an empty file
+at a project-relative path (`src/foo.rs`, `notes.md`), making parent
+directories as needed. Path safety is `Fs.resolveChild` (no `..`, no
+absolute paths), existing files are never overwritten, and the created
+file opens in a tab immediately (covered by `FileCreateTest`).
+
 ## Known v1 limits
 
 - No PTY: stdin is a line-send field; programs needing raw tty interaction
