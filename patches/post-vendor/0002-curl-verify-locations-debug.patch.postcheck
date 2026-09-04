@@ -1,1 +1,1 @@
-RUSTDROID-DEBUG: fopen|^curl-sys 0\.4\.74
+RUSTDROID-DEBUG: fopen|curl-sys-0.4.74+curl-8.9.0

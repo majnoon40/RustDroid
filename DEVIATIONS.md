@@ -290,6 +290,40 @@ runs (not theory):
   (e) verify.sh `check_cargo_instrumentation`: end-to-end `strings` gate
   on the shipped cargo binary, auto-disabled when the diagnostic patch is
   removed from the repo.
+- **Run #28 (main@6c84d99) — the postcheck gate itself crashed (self-inflicted,
+  cheap failure ~8min in, LLVM cache preserved)**: the retargeted 0002 patch
+  DID land correctly this time (`post-vendor patches summary: 2 applied
+  cleanly, 0 drifted` + `resynced 664 entries in
+  curl-sys-0.4.74+curl-8.9.0/.cargo-checksum.json`), and the build died only
+  at the new postcheck with `TypeError: expected string or bytes-like object,
+  got 'NoneType'`. Root cause: postcheck v1 scanned ALL vendored
+  `.cargo-checksum.json` `"package"` fields assuming `"name version
+  (registry+…)"` strings. In x.py-produced vendor trees that field is NOT
+  reliable: at least one vendored crate carries `"package": null` (→
+  `re.search(None)` crash), and the crates we care about carry a BARE sha256
+  hex instead — run #28's `target crate:` probe printed `8af10b98…` for
+  curl-sys-0.4.74+curl-8.9.0 and `ff011a30…` for openssl-probe — so the
+  `^curl-sys 0\.4\.74` regex could never match even without the crash.
+  Additionally the local dry-run twin (`postcheck_dryrun.py`) validated
+  dir-NAME matching while build.sh shipped package-FIELD matching — the
+  twin never exercised the code that actually ran. Fixes (defense in depth,
+  v2):
+  (a) postcheck v2 is DIR-ANCHORED: spec line is `GREP_PATTERN|CRATE_DIR`
+  (`RUSTDROID-DEBUG: fopen|curl-sys-0.4.74+curl-8.9.0`); the patch's first
+  `+++ b/` target must live under `vendor/<CRATE_DIR>/` with the pattern
+  present in the touched file — no JSON field scanning at all, nothing left
+  to crash on "package": null;
+  (b) the per-patch identity probe now prints
+  `dir=<crate-dir> package=<value-or-uninformative>` — the directory name is
+  the authoritative identity;
+  (c) the dry-run twin and the build.sh heredoc are the same algorithm again;
+  (d) NEW end-to-end gate inside `do_dist`: while
+  `patches/post-vendor/0002-*.patch` exists, ANY `*stage2/bin/cargo` x.py
+  produced must contain `RUSTDROID-DEBUG:` strings (grep -c, not grep -q —
+  under `set -o pipefail` a `-q` early-match SIGPIPE (141) would misread a
+  hit as a miss) or the build fails BEFORE artifacts reach publish. This
+  closes the gap that let run #27 ship: verify.sh's equivalent check runs on
+  extracted artifacts and was never wired into CI.
 - Sandbox blockers (no root → no cmake; 4GB RAM; 9GB disk) are all
   irrelevant on Actions runners.
 

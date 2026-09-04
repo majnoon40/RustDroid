@@ -429,15 +429,26 @@ do_patches_post_vendor() {
 import json, os, sys
 rust_src, rel = sys.argv[1], sys.argv[2]
 d = os.path.dirname(os.path.join(rust_src, rel))
-crate_id = None
+crate_dir = raw_pkg = None
 while d.startswith(os.path.join(rust_src, 'vendor')):
     cj = os.path.join(d, '.cargo-checksum.json')
     if os.path.isfile(cj):
+        crate_dir = os.path.basename(d)
         with open(cj) as f:
-            crate_id = json.load(f).get('package', '?')
+            raw_pkg = json.load(f).get('package')
         break
     d = os.path.dirname(d)
-print(crate_id or 'UNKNOWN (no .cargo-checksum.json ancestor)')
+if crate_dir is None:
+    print('UNKNOWN (no .cargo-checksum.json ancestor)')
+elif isinstance(raw_pkg, str) and len(raw_pkg) < 80:
+    print(f'dir={crate_dir} package={raw_pkg}')
+else:
+    # Run #28 evidence: in x.py-produced vendor trees the "package" field
+    # can be a bare sha256 hex (curl-sys: 8af10b98..., openssl-probe:
+    # ff011a30...) or null — useless for identification. The DIRECTORY
+    # name is the reliable identity (versioned dirs when multiple
+    # versions of a crate are vendored).
+    print(f'dir={crate_dir} package=<uninformative: {type(raw_pkg).__name__}>')
 PYEOF
 )" || crate_id="UNKNOWN (identity probe failed)"
                 log "    target crate: $crate_id"
@@ -515,79 +526,68 @@ PYEOF
 
     # ------------------------------------------------------------------------
     # Postcheck enforcement — a <patch>.postcheck file (same directory, same
-    # basename) holds ONE line:  GREP_PATTERN|PACKAGE_REGEX
+    # basename) holds ONE line:  GREP_PATTERN|CRATE_DIR
     #
-    # Semantics: after patching, the file at the patch's first '+++ b/'
-    # target path's SUBPATH (everything after vendor/<crate-dir>/) must
-    # contain GREP_PATTERN, looked up in the vendored crate whose
-    # .cargo-checksum.json "package" field matches PACKAGE_REGEX.
+    # Semantics: the patch's first '+++ b/' target must live under
+    # vendor/<CRATE_DIR>/ and the file it touches must contain GREP_PATTERN.
     #
-    # Keying on the package version instead of the patch's own directory is
-    # deliberate (run #27 forensics): the first revision of this check
-    # grepped the file the patch touched — which passes trivially even when
-    # the patch landed in the WRONG crate. x.py vendor hands the
-    # unversioned dir (vendor/curl-sys/) to one crate version and versioned
-    # dirs to others; cargo compiles the crate its lockfile pins
-    # (curl-sys 0.4.74+curl-8.9.0 for rust 1.85.0's cargo), so the check
-    # must locate THAT crate by version and inspect ITS file.
+    # DESIGN NOTE (run #28 forensics): the first revision of this check keyed
+    # vendored crates by their .cargo-checksum.json "package" field and
+    # scanned ALL of vendor/ for a regex match. That assumption is invalid
+    # in x.py-produced vendor trees: at least one vendored crate carries
+    # "package": null (-> re.search(None) -> "TypeError: expected string or
+    # bytes-like object, got 'NoneType'" crashed the whole build), and the
+    # crates we care about carry a BARE sha256 hex (curl-sys -> 8af10b98...,
+    # openssl-probe -> ff011a30...) instead of "name version (registry+...)",
+    # so the version regex could never match regardless. The DIRECTORY name
+    # is the only stable identity: x.py vendor uses versioned dirs
+    # (vendor/curl-sys-0.4.74+curl-8.9.0/) when the workspace pins multiple
+    # versions of one crate, and cargo compiles the version its lockfile
+    # pins — curl-sys 0.4.74+curl-8.9.0 for rust 1.85.0's cargo (run #27
+    # build log: "Compiling curl-sys v0.4.74+curl-8.9.0"). This check
+    # therefore pins the EXACT directory and refuses to build when the
+    # patch landed anywhere else. The end-to-end strings gate in do_dist()
+    # and verify.sh check_cargo_instrumentation remain the last-line
+    # defenses against anything this static check cannot see.
     # ------------------------------------------------------------------------
-    local pc pc_target pc_pattern pc_pkg pc_info
+    local pc pc_target pc_pattern pc_dir pc_info
     for pc in "$PATCHES_DIR/post-vendor"/*.postcheck; do
         [[ -f "$pc" ]] || continue
-        IFS='|' read -r pc_pattern pc_pkg < <(head -n 1 "$pc")
+        IFS='|' read -r pc_pattern pc_dir < <(head -n 1 "$pc")
         pc_target="$(awk '/^\+\+\+ b\//{print substr($0, 7); exit}' "${pc%.postcheck}")"
         [[ -n "$pc_target" ]] \
             || fail "postcheck $(basename "$pc"): cannot derive target path from $(basename "${pc%.postcheck}")"
         local pc_status=0
-        pc_info="$(python3 - "$RUST_SRC" "$pc_target" "$pc_pattern" "$pc_pkg" <<'PYEOF'
-import json, os, re, sys
-rust_src, target, pattern, pkg_re = sys.argv[1:5]
+        pc_info="$(python3 - "$RUST_SRC" "$pc_target" "$pc_pattern" "$pc_dir" <<'PYEOF'
+import os, sys
+rust_src, target, pattern, crate_dir = sys.argv[1:5]
 parts = target.split('/')
 if len(parts) < 3 or parts[0] != 'vendor':
     print(f'postcheck: cannot parse vendor target path: {target}', file=sys.stderr)
     sys.exit(2)
-subpath = '/'.join(parts[2:])
-pat = re.compile(pkg_re)
-hits = []
-vend = os.path.join(rust_src, 'vendor')
-for entry in sorted(os.listdir(vend)):
-    cj = os.path.join(vend, entry, '.cargo-checksum.json')
-    if not os.path.isfile(cj):
-        continue
-    try:
-        with open(cj) as f:
-            pkg = json.load(f).get('package', '')
-    except Exception:
-        continue
-    if pat.search(pkg):
-        hits.append((entry, pkg))
-if not hits:
-    print(f'postcheck: no vendored crate matches package regex {pkg_re!r} '
-          f'— the crate this patch instruments is not in vendor/', file=sys.stderr)
-    sys.exit(3)
-if len(hits) > 1:
-    print(f'postcheck: package regex {pkg_re!r} matches multiple vendored '
-          f'crates: {hits}', file=sys.stderr)
-    sys.exit(4)
-entry, pkg = hits[0]
-fpath = os.path.join(vend, entry, subpath)
+touched_dir, subpath = parts[1], '/'.join(parts[2:])
+if touched_dir != crate_dir:
+    print(f'postcheck: patch touched vendor/{touched_dir}/ but the crate cargo '
+          f'compiles is vendor/{crate_dir}/ — run #27 failure mode (x.py vendor '
+          f'hands the unversioned dir to a different crate version)', file=sys.stderr)
+    sys.exit(6)
+fpath = os.path.join(rust_src, 'vendor', crate_dir, subpath)
 if not os.path.isfile(fpath):
-    print(f'postcheck: expected file missing in crate {pkg}: {subpath}', file=sys.stderr)
+    print(f'postcheck: expected file missing in vendor/{crate_dir}/: {subpath}', file=sys.stderr)
     sys.exit(5)
 with open(fpath, 'rb') as fh:
     if pattern.encode() not in fh.read():
-        print(f'postcheck: pattern {pattern!r} NOT found in {pkg} :: {subpath} '
-              f'— the patch did not reach the crate version cargo compiles '
-              f'(wrong vendored dir? drifted?)', file=sys.stderr)
+        print(f'postcheck: pattern {pattern!r} NOT found in vendor/{crate_dir}/{subpath} '
+              f'— patch drifted or landed elsewhere', file=sys.stderr)
         sys.exit(6)
-print(f'{pkg} :: {subpath}')
+print(f'vendor/{crate_dir}/{subpath}')
 PYEOF
 )" || pc_status=$?
         # NOTE: `|| pc_status=$?` above is load-bearing: build.sh runs under
         # `set -euo pipefail`, so an unguarded failing command substitution
         # would abort before the fail() below could print its message.
         [[ $pc_status -eq 0 ]] \
-            || fail "postcheck FAILED for $(basename "$pc") (pattern '$pc_pattern' vs package regex '$pc_pkg') — see the python error above. The instrumented source is NOT the crate version cargo compiles; refusing to build. Run #27 failure mode — see DEVIATIONS.md section 5."
+            || fail "postcheck FAILED for $(basename "$pc") (pattern '$pc_pattern' vs crate dir '$pc_dir') — see the python error above. The instrumented source is NOT the crate version cargo compiles; refusing to build. Run #27 failure mode — see DEVIATIONS.md section 5."
         log "  postcheck OK: $(basename "$pc") -> $pc_info"
     done
 
@@ -778,6 +778,34 @@ do_dist() {
     log "  copying artifacts: $xpy_dist_dir -> $DIST_DIR"
     cp -a "$xpy_dist_dir"/. "$DIST_DIR"/ \
         || fail "copying dist artifacts into $DIST_DIR failed"
+
+    # ------------------------------------------------------------------------
+    # END-TO-END instrumentation gate (runs #27/#28 forensics).
+    #
+    # verify.sh's check_cargo_instrumentation runs on EXTRACTED artifacts
+    # and is NOT wired into CI — a gate nobody runs cannot stop a bad
+    # release (run #27 shipped a pristine-source cargo exactly that way).
+    # While the diagnostic patch is in the repo, ANY stage2 cargo x.py
+    # produced must carry the RUSTDROID-DEBUG: strings (every in-tree cargo
+    # build compiles the same vendored curl-sys), so check whichever one
+    # exists; refuse to hand artifacts to publish otherwise.
+    # ------------------------------------------------------------------------
+    local diag_patch="$SCRIPT_DIR/patches/post-vendor/0002-curl-verify-locations-debug.patch"
+    if [[ -f "$diag_patch" ]] && command -v strings >/dev/null 2>&1; then
+        local gate_bin n_debug
+        gate_bin="$(find "$RUST_SRC/build" -type f -path '*stage2/bin/cargo' -print -quit 2>/dev/null)"
+        # grep -c (NOT -q): under `set -o pipefail`, `strings | grep -q` can
+        # die with SIGPIPE (141) on a SUCCESSFUL early match and read as a
+        # miss; -c consumes all input, so the count is always trustworthy.
+        n_debug="$(strings -a -n 8 "$gate_bin" 2>/dev/null | grep -c 'RUSTDROID-DEBUG:' || true)"
+        if [[ -z "$gate_bin" ]]; then
+            log "  WARN: instrumentation gate: no *stage2/bin/cargo under $RUST_SRC/build — cannot pre-check here (verify.sh still enforces on extracted artifacts)"
+        elif [[ "${n_debug:-0}" -gt 0 ]]; then
+            log "  instrumentation gate OK: $gate_bin carries RUSTDROID-DEBUG: strings ($n_debug occurrences)"
+        else
+            fail "END-TO-END instrumentation gate FAILED: $gate_bin contains NO RUSTDROID-DEBUG: strings although 0002-curl-verify-locations-debug.patch is in the repo — the patch did not reach the curl-sys crate cargo compiled. See DEVIATIONS.md section 5."
+        fi
+    fi
 
     # Bundle the NDK's libc++_shared.so alongside the tarballs.
     # Rationale: do_dist links stage2 rustc (and any extended tools) with
