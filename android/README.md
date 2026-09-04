@@ -70,9 +70,11 @@ channels: `CARGO_HTTP_CAINFO` (cargo's `http.cainfo` override →
 `CURLOPT_CAINFO`, also merged into `$CARGO_HOME/config.toml`), and
 `SSL_CERT_FILE` + `CURL_CA_BUNDLE` (OpenSSL/libcurl defaults).
 `SSL_CERT_DIR` is deliberately NOT exported: libcurl maps it to a hashed
-`CApath`, which the statically-linked TLS backend rejects during
-verify-location setup (curl 77 even with a valid CAfile — see the root
-README's Troubleshooting for the full history). A mirror lands at
+`CApath`, and the real error-77 root cause turned out to be elsewhere
+entirely — `openssl-src` compiles OpenSSL with `no-stdio` on Android, stubbing
+`BIO_new_file()`, so no CA *file* could be loaded at all (fixed in the
+toolchain by post-vendor patch 0003 + a curl-side fallback loader; see the
+root README's Troubleshooting for the full history). A mirror lands at
 `files/usr/etc/tls/cert.pem` so the toolchain's patched `openssl-probe`
 finds it via `RUSTDROID_PREFIX` even without env vars. The app's own
 crates.io search (OkHttp) uses the platform trust store and is unaffected.

@@ -355,6 +355,50 @@ runs (not theory):
   exit-1 (old code + newline-less spec → no output, exit 1) proving the
   diagnosis. Harness: `/home/z/my-project/scripts/test_postcheck.sh`
   (not committed — dev-only).
+- **Run #30 (33864029660, main@f46bc60) — GREEN, instrumentation verified
+  on-device, and THE ACTUAL TLS BUG ROOT-CAUSED**. The postcheck v3 fix
+  held ("postcheck OK: 0002-… -> vendor/curl-sys-0.4.74+curl-8.9.0/curl/
+  lib/vtls/openssl.c"), verify.sh passed 105/105 (including the strings
+  gate), and the published bundle's cargo binary carried all 4
+  RUSTDROID-DEBUG format strings (independently re-verified by extracting
+  the release asset). On-device output of `cargo fetch`:
+  `fopen(…/.ssl/cacert.pem) OK size=188900 first=32: 23 23 0a 23 23 …`
+  (byte-perfect Mozilla bundle header — file layer CLEAN, SELinux/app
+  write-path ruled out) followed by exactly ONE OpenSSL error:
+  `error:0B084002:x509 certificate routines:X509_load_cert_crl_file:system
+  lib`. Cross-referenced against openssl-1.1.1w sources: that error is
+  raised in exactly one place — crypto/x509/by_file.c:199, when
+  `BIO_new_file(file, "r")` returns NULL. And a BIO fopen failure would
+  queue SYS+BIO errors BEFORE it (3 total) — we saw 1. The single-error
+  signature points at the `OPENSSL_NO_STDIO` build of bss_file.c, where
+  `BIO_new_file()` is `return NULL;` with NO error queued. Root cause
+  CONFIRMED in openssl-src 111.28.2+1.1.1w's src/lib.rs: it passes
+  `no-stdio` to OpenSSL's Configure for EVERY android target (workaround
+  for openssl-src-rs#13, a 2016 OpenSSL-1.0.x/old-NDK issue). With the
+  file BIO compiled out, EVERY X509_STORE_load_locations() fails —
+  path-independent, pre-network, ~0.3s, exactly the observed error-77
+  pattern; curl's own stdio fopen works fine, which is why the fopen
+  probe succeeded. The CApath/SSL_CERT_DIR theory from the older README
+  troubleshooting is DISPROVEN (CApath was already `none`). Fixes
+  (defense in depth):
+  (a) NEW post-vendor patch 0003-openssl-src-enable-stdio.patch: removes
+      the no-stdio block from vendor/openssl-src/src/lib.rs so the real
+      bss_file.c (plain bionic fopen/fread) is compiled — the root fix;
+      anchored by its own .postcheck (pattern
+      "RUSTDROID-FIX: the `no-stdio` block" vs crate dir openssl-src);
+  (b) 0002 upgraded: populate_x509_store now probes BIO_new_file directly
+      (runtime proof of the root fix — prints `RUSTDROID-DEBUG:
+      BIO_new_file=<ptr>`; NULL means the stub is still there) and on
+      X509_STORE_load_locations failure falls back to
+      rustdroid_load_ca_fallback(): C-stdio read → BIO_new_mem_buf →
+      PEM_X509_INFO_read_bio → X509_STORE_add_cert, i.e. a working CA
+      load even on a no-stdio OpenSSL. The fallback body was
+      compile-checked AND live-tested on the host against a real OpenSSL
+      (150 certs loaded from the system bundle through the exact code
+      path). Forward+reverse git-apply validated against pristine
+      curl-8.9.0 sources;
+  (c) regression harness extended to 10 scenarios (0003 marker absent /
+      wrong crate dir now covered) — 10/10 pass.
 - Sandbox blockers (no root → no cmake; 4GB RAM; 9GB disk) are all
   irrelevant on Actions runners.
 

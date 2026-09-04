@@ -1,8 +1,93 @@
 diff --git a/vendor/curl-sys-0.4.74+curl-8.9.0/curl/lib/vtls/openssl.c b/vendor/curl-sys-0.4.74+curl-8.9.0/curl/lib/vtls/openssl.c
-index 2b60f7f..c1f7f07 100644
+index 2b60f7f..f3e819e 100644
 --- a/vendor/curl-sys-0.4.74+curl-8.9.0/curl/lib/vtls/openssl.c
 +++ b/vendor/curl-sys-0.4.74+curl-8.9.0/curl/lib/vtls/openssl.c
-@@ -3193,9 +3193,44 @@ static CURLcode populate_x509_store(struct Curl_cfilter *cf,
+@@ -3105,6 +3105,84 @@ static CURLcode import_windows_cert_store(struct Curl_easy *data,
+ }
+ #endif
+ 
++/* RUSTDROID-FIX: fallback CA loader for OpenSSL builds where the file BIO is
++ * compiled out (OPENSSL_NO_STDIO). openssl-src-rs passes `no-stdio` for every
++ * Android target (workaround for openssl-src-rs#13, a 2016 OpenSSL-1.0.x era
++ * issue), which compiles bss_file.c's BIO_new_file() as a stub that always
++ * returns NULL WITHOUT queueing an error. X509_STORE_load_locations() then
++ * fails with exactly one queued error:
++ *   x509 certificate routines:X509_load_cert_crl_file:system lib
++ * and every HTTPS request dies with CURLE_SSL_CACERT_BADFILE (curl 77)
++ * regardless of the CA bundle being perfectly readable through plain stdio.
++ * This fallback reads the bundle with C stdio (unaffected by OPENSSL_NO_STDIO)
++ * and parses it via a read-only memory BIO into the X509_STORE. */
++static CURLcode rustdroid_load_ca_fallback(struct Curl_easy *data,
++                                           X509_STORE *store,
++                                           const char *cafile)
++{
++  CURLcode result = CURLE_SSL_CACERT_BADFILE;
++  FILE *caf = NULL;
++  unsigned char *cbuf = NULL;
++  long casize;
++  size_t canread;
++  BIO *mem = NULL;
++  STACK_OF(X509_INFO) *sk = NULL;
++  int i, added = 0;
++
++  caf = fopen(cafile, "rb");
++  if(!caf) {
++    failf(data, "RUSTDROID-DEBUG: fallback fopen(%s) FAILED errno=%d (%s)",
++          cafile, errno, strerror(errno));
++    goto done;
++  }
++  fseek(caf, 0, SEEK_END);
++  casize = ftell(caf);
++  fseek(caf, 0, SEEK_SET);
++  if(casize <= 0) {
++    failf(data, "RUSTDROID-DEBUG: fallback stat %s size=%ld", cafile, casize);
++    goto done;
++  }
++  cbuf = malloc((size_t)casize);
++  if(!cbuf) {
++    result = CURLE_OUT_OF_MEMORY;
++    goto done;
++  }
++  canread = fread(cbuf, 1, (size_t)casize, caf);
++  if(canread != (size_t)casize) {
++    failf(data, "RUSTDROID-DEBUG: fallback fread short: %zu of %ld bytes",
++          canread, casize);
++    goto done;
++  }
++  mem = BIO_new_mem_buf(cbuf, (int)casize);
++  if(!mem) {
++    failf(data, "RUSTDROID-DEBUG: fallback BIO_new_mem_buf FAILED");
++    goto done;
++  }
++  sk = PEM_X509_INFO_read_bio(mem, NULL, NULL, "");
++  if(!sk) {
++    failf(data, "RUSTDROID-DEBUG: fallback PEM parse FAILED (not PEM?)");
++    goto done;
++  }
++  for(i = 0; i < sk_X509_INFO_num(sk); i++) {
++    X509_INFO *itmp = sk_X509_INFO_value(sk, i);
++    if(itmp->x509 && X509_STORE_add_cert(store, itmp->x509))
++      added++;
++    if(itmp->crl && X509_STORE_add_crl(store, itmp->crl))
++      added++;
++  }
++  infof(data, "RUSTDROID-DEBUG: fallback CA load: %d entries from %s",
++        added, cafile);
++  if(added > 0)
++    result = CURLE_OK;
++done:
++  sk_X509_INFO_pop_free(sk, X509_INFO_free);
++  BIO_free(mem);            /* read-only mem BIO does not own cbuf */
++  free(cbuf);
++  if(caf)
++    fclose(caf);
++  return result;
++}
++
+ static CURLcode populate_x509_store(struct Curl_cfilter *cf,
+                                     struct Curl_easy *data,
+                                     X509_STORE *store)
+@@ -3193,14 +3271,68 @@ static CURLcode populate_x509_store(struct Curl_cfilter *cf,
  #else
        /* tell OpenSSL where to find CA certificates that are used to verify the
           server's certificate. */
@@ -30,9 +115,23 @@ index 2b60f7f..c1f7f07 100644
 +                  (int)(rbn > 24 ? 24 : rbn), (const char *)rbhdr);
 +        }
 +      }
++      /* RUSTDROID-DEBUG: probe whether OpenSSL's own file BIO works. NULL
++         means this build compiled bss_file.c with OPENSSL_NO_STDIO (openssl-src
++         passes no-stdio for Android) — the root cause of curl 77 on RustDroid. */
++      if(ssl_cafile) {
++        BIO *rbprobe = BIO_new_file(ssl_cafile, "r");
++        fprintf(stderr, "RUSTDROID-DEBUG: BIO_new_file=%p\n", (void *)rbprobe);
++        if(rbprobe)
++          BIO_free(rbprobe);
++      }
        if(!X509_STORE_load_locations(store, ssl_cafile, ssl_capath)) {
          if(!imported_native_ca && !imported_ca_info_blob) {
            /* Fail if we insist on successfully verifying the server. */
+-          failf(data, "error setting certificate verify locations:"
+-                "  CAfile: %s CApath: %s",
+-                ssl_cafile ? ssl_cafile : "none",
+-                ssl_capath ? ssl_capath : "none");
+-          return CURLE_SSL_CACERT_BADFILE;
 +          /* RUSTDROID-DEBUG: dump the OpenSSL error queue for this failure */
 +          {
 +            unsigned long rbe;
@@ -44,6 +143,21 @@ index 2b60f7f..c1f7f07 100644
 +            }
 +            fflush(stderr);
 +          }
-           failf(data, "error setting certificate verify locations:"
-                 "  CAfile: %s CApath: %s",
-                 ssl_cafile ? ssl_cafile : "none",
++          /* RUSTDROID-FIX: the failure above is EXPECTED on no-stdio OpenSSL
++             builds (see rustdroid_load_ca_fallback). Load the CA bundle via
++             stdio + memory BIO instead of failing the request. */
++          if(ssl_cafile) {
++            result = rustdroid_load_ca_fallback(data, store, ssl_cafile);
++            if(result)
++              return result;
++          }
++          else {
++            failf(data, "error setting certificate verify locations:"
++                  "  CAfile: %s CApath: %s",
++                  ssl_cafile ? ssl_cafile : "none",
++                  ssl_capath ? ssl_capath : "none");
++            return CURLE_SSL_CACERT_BADFILE;
++          }
+         }
+         else {
+           infof(data, "error setting certificate verify locations,"

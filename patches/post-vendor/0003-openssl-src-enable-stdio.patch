@@ -1,0 +1,26 @@
+diff --git a/vendor/openssl-src/src/lib.rs b/vendor/openssl-src/src/lib.rs
+index 1ef0180..d2941e4 100644
+--- a/vendor/openssl-src/src/lib.rs
++++ b/vendor/openssl-src/src/lib.rs
+@@ -206,12 +206,15 @@ impl Build {
+             configure.arg("no-async");
+         }
+ 
+-        // On Android it looks like not passing no-stdio may cause a build
+-        // failure (#13), but most other platforms need it for things like
+-        // loading system certificates so only disable it on Android.
+-        if target.contains("android") {
+-            configure.arg("no-stdio");
+-        }
++        // RUSTDROID-FIX: the `no-stdio` block that used to live here (added as
++        // a workaround for openssl-src-rs#13, 2016, OpenSSL 1.0.x + ancient
++        // NDKs) is REMOVED. It compiled OpenSSL with OPENSSL_NO_STDIO, turning
++        // crypto/bio/bss_file.c's BIO_new_file() into a stub that
++        // unconditionally returns NULL, so EVERY X509_STORE_load_locations()
++        // failed with `x509 certificate routines:X509_load_cert_crl_file:
++        // system lib` — libcurl HTTPS with a CA bundle died with curl 77
++        // (RustDroid run #30 on-device forensics). OpenSSL 1.1.1w with NDK
++        // r27c compiles the stdio paths (plain bionic fopen/fread) fine.
+ 
+         if target.contains("msvc") {
+             // On MSVC we need nasm.exe to compile the assembly files.
