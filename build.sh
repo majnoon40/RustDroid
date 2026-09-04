@@ -553,7 +553,24 @@ PYEOF
     local pc pc_target pc_pattern pc_dir pc_info
     for pc in "$PATCHES_DIR/post-vendor"/*.postcheck; do
         [[ -f "$pc" ]] || continue
-        IFS='|' read -r pc_pattern pc_dir < <(head -n 1 "$pc")
+        # `|| true` is LOAD-BEARING (run #29 forensics): bash's `read`
+        # returns 1 when the input's last line has no trailing newline —
+        # the fields are still populated correctly, but under
+        # `set -euo pipefail` the unguarded nonzero return killed the
+        # whole build SILENTLY (exit 1, no postcheck verdict, no fail()
+        # message — run #29 died exactly here, 0.01s after the checksum
+        # resync prints). The 9e8cb5d rewrite of the .postcheck spec
+        # shipped without its final newline; this guard makes that class
+        # of spec-file formatting mistake loud-or-harmless instead of
+        # silent-fatal, and the validation below turns a truly malformed
+        # spec into a named, actionable error.
+        IFS='|' read -r pc_pattern pc_dir < <(head -n 1 "$pc") || true
+        # CRLF safety: a stray \r would silently corrupt CRATE_DIR/pattern
+        # matching (spec files are edited on diverse platforms).
+        pc_pattern="${pc_pattern%$'\r'}"
+        pc_dir="${pc_dir%$'\r'}"
+        [[ -n "$pc_pattern" && -n "$pc_dir" ]] \
+            || fail "postcheck $(basename "$pc"): malformed spec — line 1 must be 'GREP_PATTERN|CRATE_DIR' (got pattern='${pc_pattern:-<empty>}' dir='${pc_dir:-<empty>}'). Fix the .postcheck file (and make sure it ends with a newline)."
         pc_target="$(awk '/^\+\+\+ b\//{print substr($0, 7); exit}' "${pc%.postcheck}")"
         [[ -n "$pc_target" ]] \
             || fail "postcheck $(basename "$pc"): cannot derive target path from $(basename "${pc%.postcheck}")"

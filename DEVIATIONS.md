@@ -324,6 +324,37 @@ runs (not theory):
   hit as a miss) or the build fails BEFORE artifacts reach publish. This
   closes the gap that let run #27 ship: verify.sh's equivalent check runs on
   extracted artifacts and was never wired into CI.
+- **Run #29 (33860610050, main@9e8cb5d) — postcheck v2 shipped with its
+  spec file missing the trailing newline; `read` + `set -e` killed the
+  build SILENTLY (self-inflicted, cheap failure ~8min in, LLVM cache
+  preserved)**. Forensics: the run got past everything that killed run #28
+  — both patches applied cleanly to the right crate dirs
+  (`dir=curl-sys-0.4.74+curl-8.9.0 package=8af10b98…`,
+  `dir=openssl-probe package=ff011a30…`), 664+7 checksum entries resynced —
+  and then died 0.01s later with `exit code 1` and ZERO further output: no
+  postcheck verdict, no fail() message, no traceback. Root cause: the v2
+  rewrite of `0002-….patch.postcheck` (9e8cb5d) dropped the file's final
+  newline (`…+curl-8.9.0` with no `\n`; 6c84d99's v1 file had it). Bash's
+  `read` returns 1 on EOF-without-newline even though it still populates
+  the variables, and the unguarded
+  `IFS='|' read -r pc_pattern pc_dir < <(head -n 1 "$pc")` under
+  `set -euo pipefail` therefore aborted the whole script BEFORE the
+  postcheck body could run or report anything. Fixes (v3):
+  (a) the spec file ends with `\n` again;
+  (b) the read is now guarded with `|| true` (fields are populated —
+  losing the newline must be harmless, not fatal), stray `\r` is
+  stripped (CRLF-edited spec files), and an empty pattern/dir is caught
+  by an explicit validation that names the file and the expected
+  `GREP_PATTERN|CRATE_DIR` format;
+  (c) regression-tested by a harness that sed-extracts the EXACT block
+  from build.sh (marker-anchored, so the test can never drift from the
+  shipped code — the run #28 twin-drift lesson): 8 scenarios — happy
+  path, run #29's exact newline-less spec (now passes), CRLF spec, wrong
+  crate dir (exit 6), pattern absent (exit 6), file missing (exit 5),
+  malformed spec (named error), and a reproduction of the pre-fix silent
+  exit-1 (old code + newline-less spec → no output, exit 1) proving the
+  diagnosis. Harness: `/home/z/my-project/scripts/test_postcheck.sh`
+  (not committed — dev-only).
 - Sandbox blockers (no root → no cmake; 4GB RAM; 9GB disk) are all
   irrelevant on Actions runners.
 
