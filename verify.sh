@@ -7,6 +7,11 @@
 #   [S]  grep for "com.termux" in all ELF files     (bare minimum)
 #   [S]  readelf -d: DT_RPATH / DT_RUNPATH entries (must point at $RUSTDROID_PREFIX)
 #   [S]  readelf -l: PT_INTERP dynamic linker        (must be /system/bin/linker64)
+#   [S]  strings: cargo must carry RUSTDROID-DEBUG: instrumentation
+#        (only enforced while patches/post-vendor/0002-*.patch is in the
+#        repo — CI run #27 shipped a cargo built from PRISTINE curl-sys
+#        because the patch had applied to the wrong vendored crate version
+#        and nothing else in the pipeline could notice)
 #   [D]  smoke-compile: $PREFIX/bin/rustc hello.rs   (requires on-device Android)
 #
 # [S] = static (runs on any Linux host with readelf)
@@ -145,6 +150,41 @@ check_termux_strings() {
         else
             warn "rustc does NOT contain $RUSTDROID_PREFIX; check install prefix config"
         fi
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# Check 1b: cargo instrumentation marker (diagnostic patch 0002)
+# ----------------------------------------------------------------------------
+# While patches/post-vendor/0002-curl-verify-locations-debug.patch exists in
+# the repo, the shipped cargo binary MUST contain the RUSTDROID-DEBUG:
+# instrumentation strings. CI run #27 proved that "patch applied cleanly" +
+# "checksums resynced" + a green build can still produce a cargo built from
+# PRISTINE vendored sources (the patch had landed in the unversioned
+# vendor/curl-sys/ dir = curl-sys 0.4.78+curl-8.11.0, while cargo compiles
+# the versioned vendor/curl-sys-0.4.74+curl-8.9.0/). This is the end-to-end
+# gate: it fails if the patch was skipped, drifted, mis-targeted, or if a
+# future x.py vendor dir-naming change reroutes it — regardless of cause.
+# Removing the diagnostic patch from the repo auto-disables this check.
+check_cargo_instrumentation() {
+    local diag_patch="patches/post-vendor/0002-curl-verify-locations-debug.patch"
+    if [[ ! -f "${SCRIPT_DIR}/${diag_patch}" ]]; then
+        log "SKIP cargo-instrumentation check ($diag_patch not in repo — diagnostic patch removed)"
+        return 0
+    fi
+    local cargo_bin="" f
+    for f in "${ELF_FILES[@]}"; do
+        if [[ "$f" == */cargo/bin/cargo ]]; then
+            cargo_bin="$f"
+            break
+        fi
+    done
+    [[ -n "$cargo_bin" ]] \
+        || fail "cargo binary (path */cargo/bin/cargo) not found among ${#ELF_FILES[@]} ELF files — cannot run instrumentation check"
+    if strings -a -n 8 "$cargo_bin" 2>/dev/null | grep -q 'RUSTDROID-DEBUG:'; then
+        pass "cargo binary carries RUSTDROID-DEBUG: instrumentation ($cargo_bin)"
+    else
+        fail "cargo binary $cargo_bin contains NO RUSTDROID-DEBUG: strings although $diag_patch is in the repo — the patch did NOT reach the compiled curl-sys crate (wrong vendored crate dir? drifted? silently skipped?). See DEVIATIONS.md section 5, run #27 forensics."
     fi
 }
 
@@ -506,6 +546,7 @@ log "RUSTDROID_PREFIX = $RUSTDROID_PREFIX"
 log "ELF file count   = ${#ELF_FILES[@]}"
 
 check_termux_strings
+check_cargo_instrumentation
 check_rpath
 check_interp
 check_link_kit

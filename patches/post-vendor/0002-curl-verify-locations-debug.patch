@@ -1,7 +1,7 @@
-diff --git a/vendor/curl-sys/curl/lib/vtls/openssl.c b/vendor/curl-sys/curl/lib/vtls/openssl.c
+diff --git a/vendor/curl-sys-0.4.74+curl-8.9.0/curl/lib/vtls/openssl.c b/vendor/curl-sys-0.4.74+curl-8.9.0/curl/lib/vtls/openssl.c
 index 2b60f7f..c1f7f07 100644
---- a/vendor/curl-sys/curl/lib/vtls/openssl.c
-+++ b/vendor/curl-sys/curl/lib/vtls/openssl.c
+--- a/vendor/curl-sys-0.4.74+curl-8.9.0/curl/lib/vtls/openssl.c
++++ b/vendor/curl-sys-0.4.74+curl-8.9.0/curl/lib/vtls/openssl.c
 @@ -3193,9 +3193,44 @@ static CURLcode populate_x509_store(struct Curl_cfilter *cf,
  #else
        /* tell OpenSSL where to find CA certificates that are used to verify the

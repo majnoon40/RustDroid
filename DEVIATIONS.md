@@ -263,6 +263,33 @@ runs (not theory):
 - **The openssl-probe patch must live in `patches/post-vendor/`**: it sat
   at the repo root and was silently never attempted (warn-not-fail).
   Moved in `4db13a2`.
+- **Run #27 (1h07m, main@7f7d146) — "applied cleanly" is not "compiled
+  in"**: the curl verify-locations instrumentation patch
+  (`0002-curl-verify-locations-debug.patch`) reported `2 applied cleanly,
+  0 drifted`, checksums were resynced, the build went green — yet the
+  published cargo binary contained ZERO `RUSTDROID-DEBUG:` strings
+  (confirmed by `strings` on the extracted release binary). Root cause:
+  the workspace lockfile pins TWO curl-sys versions, and `x.py vendor`
+  hands the *unversioned* dir to one of them:
+  `Vendoring curl-sys v0.4.74+curl-8.9.0 ... to vendor/curl-sys-0.4.74+curl-8.9.0`
+  `Vendoring curl-sys v0.4.78+curl-8.11.0 ... to vendor/curl-sys`
+  The patch targeted `vendor/curl-sys/` (= 0.4.78+curl-8.11.0), but cargo
+  1.85.0 compiles `curl-sys v0.4.74+curl-8.9.0` from the *versioned* dir
+  (CI log: `Compiling curl-sys v0.4.74+curl-8.9.0`). 0001 got lucky
+  because openssl-probe has a single version in the lockfile. Fixes:
+  (a) 0002 retargeted to `vendor/curl-sys-0.4.74+curl-8.9.0/curl/lib/vtls/openssl.c`;
+  (b) post-vendor patch drift is now FATAL, not warn-and-continue;
+  (c) per-patch `target crate:` identity log (reads the touched crate's
+  `.cargo-checksum.json` `package` field) so future logs show WHICH crate
+  version a patch actually landed in;
+  (d) `<patch>.postcheck` gate: GREP_PATTERN|PACKAGE_REGEX — the pattern
+  must be present in the file of the vendored crate matching the package
+  regex (`RUSTDROID-DEBUG: fopen|^curl-sys 0\.4\.74`), keyed on the
+  version cargo's lockfile pins, not on the dir the patch happened to
+  touch (locally validated: run-#27 scenario correctly rejected, exit 6);
+  (e) verify.sh `check_cargo_instrumentation`: end-to-end `strings` gate
+  on the shipped cargo binary, auto-disabled when the diagnostic patch is
+  removed from the repo.
 - Sandbox blockers (no root → no cmake; 4GB RAM; 9GB disk) are all
   irrelevant on Actions runners.
 
