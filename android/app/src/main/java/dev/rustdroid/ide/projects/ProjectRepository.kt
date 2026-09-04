@@ -149,4 +149,20 @@ class ProjectRepository(
         file.parentFile?.mkdirs()
         Fs.writeAtomic(file, content)
     }
+
+    /**
+     * Creates an empty file at [relativePath] inside [projectDir], making
+     * parent directories as needed. Traversal/escape is rejected via
+     * [Fs.resolveChild]; an existing file is never overwritten.
+     */
+    fun createFile(projectDir: File, relativePath: String): File {
+        val rel = relativePath.trim()
+        if (rel.isEmpty()) throw IOException("file name is empty")
+        val file = Fs.resolveChild(projectDir, rel)
+        if (file.isDirectory) throw IOException("'$rel' is a directory")
+        if (file.exists()) throw IOException("'$rel' already exists")
+        file.parentFile?.mkdirs()
+        Fs.writeAtomic(file, "")
+        return file
+    }
 }

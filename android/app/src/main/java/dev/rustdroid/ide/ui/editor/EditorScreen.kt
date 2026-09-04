@@ -32,6 +32,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 
 
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 
 import androidx.compose.material.icons.filled.PlayArrow
@@ -46,6 +47,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Tab
@@ -105,6 +107,12 @@ fun EditorScreen(
     val allFiles by vm.treeAllFiles.collectAsState()
     val consoleLines by vm.console.lines.collectAsState()
 
+    // new-file dialog state: name lives locally; success/error come from the
+    // VM (one-shot createdFile closes the dialog, createFileError shows inline)
+    val createdFile by vm.createdFile.collectAsState()
+    val createFileError by vm.createFileError.collectAsState()
+    var showNewFile by remember { mutableStateOf(false) }
+
     // Re-entering this screen (e.g. back from the Deps screen) re-runs this
     // effect: pull fresh bytes for any tab that has no unsaved edits, so a
     // Cargo.toml updated by the Deps screen is never shown stale here.
@@ -129,8 +137,28 @@ fun EditorScreen(
     LaunchedEffect(jump, activeText) {
         if (jump != null) vm.clearJump()
     }
+    // close the new-file dialog once the VM reports the file was created
+    LaunchedEffect(createdFile) {
+        if (createdFile != null) {
+            showNewFile = false
+            vm.clearNewFileSignals()
+        }
+    }
 
     ModalNavigationDrawer(
+        // The editor is a sora-editor Android View (AndroidView interop): it
+        // scrolls and long-press-selects inside the View system and never
+        // consumes pointer events in Compose's gesture pipeline. With drawer
+        // gestures enabled, M3's anchoredDraggable watches the same pointer
+        // stream over the content area and (a) steals a long-press once the
+        // finger drifts past touch slop — cancelling the editor mid-hold, so
+        // text selection never fires, and (b) reads scroll/fling motion as a
+        // horizontal drag, popping the drawer open while scrolling long
+        // files. Compose-native scrollables (the console LazyColumn) consume
+        // their deltas first, so only interop children are exposed. The file
+        // tree opens via the toolbar folder button instead; the scrim tap
+        // still closes it.
+        gesturesEnabled = false,
         drawerContent = {
             ModalDrawerSheet {
                 Column(Modifier.fillMaxHeight()) {
@@ -142,6 +170,18 @@ fun EditorScreen(
                         Spacer(Modifier.width(8.dp))
                         Text("Files", style = MaterialTheme.typography.titleMedium)
                         Spacer(Modifier.weight(1f))
+                        IconButton(
+                            onClick = { showNewFile = true },
+                            modifier = Modifier.size(32.dp),
+                        ) {
+                            Icon(
+                                Icons.Filled.Add,
+                                contentDescription = "New file",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
+                        Spacer(Modifier.width(4.dp))
                         TextButton(onClick = { vm.toggleAllFiles() }) {
                             Text(if (allFiles) "Sources" else "All files")
                         }
@@ -327,6 +367,70 @@ fun EditorScreen(
             dismissButton = { TextButton(onClick = { vm.confirmClose(save = false) }) { Text("Discard") } },
         )
     }
+
+    if (showNewFile) {
+        NewFileDialog(
+            error = createFileError,
+            onCreate = { vm.createFile(it) },
+            onDismiss = {
+                vm.clearNewFileSignals()
+                showNewFile = false
+            },
+        )
+    }
+}
+
+/**
+ * Creates an empty file inside the project. Accepts a path relative to the
+ * project root ("src/foo.rs" or "notes.md"); the name is validated for
+ * traversal/escape and must not already exist (errors show inline).
+ */
+@Composable
+private fun NewFileDialog(
+    error: String?,
+    onCreate: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var name by remember { mutableStateOf("") }
+    val trimmed = name.trim()
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("New file") },
+        text = {
+            Column {
+                Text(
+                    "Path relative to the project root, e.g. src/main.rs or notes.md",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    singleLine = true,
+                    label = { Text("File name") },
+                    isError = error != null,
+                    supportingText = if (error != null) {
+                        { Text(error, color = MaterialTheme.colorScheme.error) }
+                    } else {
+                        null
+                    },
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                    keyboardActions = KeyboardActions(
+                        onDone = { if (trimmed.isNotEmpty()) onCreate(trimmed) },
+                    ),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onCreate(trimmed) },
+                enabled = trimmed.isNotEmpty(),
+            ) { Text("Create") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 @Composable
