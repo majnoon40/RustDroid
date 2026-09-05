@@ -31,6 +31,13 @@ the toolchain runs on Android 5–15. This pins the distribution channel to
 F-Droid (Play requires target 34+) — which was the plan anyway. Only
 permission: `INTERNET` (+ foreground service for the download).
 
+The flip side: targetSdk 28 does NOT make shared storage executable.
+`/storage/emulated/0` is mounted **noexec** for everyone — folders opened
+in place can hold a `target/` directory but `cargo run` dies there with
+`Permission denied (os error 13)`. The app therefore redirects build
+output for external projects into app data (see "Folders as projects"
+below); app data + targetSdk 28 is exec-allowed, shared storage never is.
+
 ## Architecture
 
 Four layers, no DI framework (manual `AppContainer`):
@@ -143,6 +150,21 @@ directories as needed. Path safety is `Fs.resolveChild` (no `..`, no
 absolute paths), existing files are never overwritten, and the created
 file opens in a tab immediately (covered by `FileCreateTest`).
 
+Deleting files: long-press any drawer row and a confirm dialog offers to
+delete it — a single file or a whole subtree when the row is a directory
+("and everything inside it", spelled out). Guards mirror the create
+side: `Fs.resolveChild` blocks traversal/escape, the project root is
+refused, and the root `Cargo.toml` is protected with an actionable message
+(a folder without a manifest stops being a project — delete the whole
+project from Home instead; nested workspace manifests stay deletable as
+the deliberate, advanced edit they are). Any open tab pointing into the
+deleted path closes without a save prompt — saving would only resurrect
+a stale copy — and the tree refreshes at once. Errors keep the dialog
+open and show inline, exactly like `NewFileDialog` (covered by
+`FileDeleteTest`). The long-press lives on the drawer's Compose-native
+rows, so it never touches the sora-editor interop pointer stream (see
+the gesture notes above).
+
 Opening .rs files from outside the app: `ACTION_VIEW` intent filters
 (`text/x-rust` MIME + `.*\.rs` pathPattern) make RustDroid appear in the
 file manager's "Open with" sheet. A dialog then asks where the file goes:
@@ -167,8 +189,8 @@ there (`ensureCargoProject` writes `Cargo.toml` + `src/main.rs` only when
 missing — existing files are never overwritten) or opened for plain
 editing. The folder is remembered in `files/external-projects.txt` (one
 canonical path per line, pure JVM + `ExternalProjectsTest`), stays where
-the user put it, and every edit — new files, saves, `cargo` `target/`
-output — lands straight in it. "Remove" on an external card forgets it
+the user put it, and every edit — new files, saves, deletions — lands straight
+in it. "Remove" on an external card forgets it
 WITHOUT deleting anything (`ProjectRepository.delete` refuses registered
 external folders as a safety net). External projects navigate by
 absolute path (`Routes.editor` takes a ref: bare name or `/path`, both
@@ -176,6 +198,22 @@ resolve in `ProjectRepository.resolve`); editing-before-install works for
 them too. Storage access rides the legacy model kept by targetSdk 28:
 one `WRITE_EXTERNAL_STORAGE` runtime grant, requested only when the user
 actually opens a folder.
+
+**Running builds from external folders (the noexec problem):** shared
+storage is mounted `noexec` — compiling into the folder works, but the
+moment `cargo run` tries to spawn `target/debug/<bin>` the kernel answers
+EACCES and cargo dies with `"could not execute process … Permission
+denied (os error 13)"`. The fix is env-level, not file-level:
+`ProcEnv.redirectedTargetDir` points `CARGO_TARGET_DIR` at
+`files/build/<16-hex sha of the project's canonical path>` whenever the
+project lives outside app data (internal projects keep their in-tree
+`target/` untouched). Build output then sits on the same exec-allowed
+ground the toolchain itself runs from, `cargo run`/`build`/`clean` work
+unchanged, and the hash key means two same-named folders never share
+build state. The console says so once per run ("this folder is on shared
+storage (noexec) — binaries are built and run from app storage") so the
+missing `target/` in the folder is never a surprise. Covered by
+`ProcEnvTest` redirect cases.
 
 Screen real estate: the file tab strip is a custom 30dp row (M3 `Tab`
 enforces a 48dp minimum that ate a quarter of the screen on small

@@ -1,7 +1,9 @@
 package dev.rustdroid.ide.ui.editor
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -122,6 +124,13 @@ fun EditorScreen(
     val createFileError by vm.createFileError.collectAsState()
     var showNewFile by remember { mutableStateOf(false) }
 
+    // delete-file dialog state: the row long-press picks the target; the
+    // VM's one-shot deletedFile closes the dialog, deleteFileError shows
+    // inline (e.g. the root Cargo.toml guard)
+    val deletedFile by vm.deletedFile.collectAsState()
+    val deleteFileError by vm.deleteFileError.collectAsState()
+    var pendingDelete by remember { mutableStateOf<FileNode?>(null) }
+
     // Re-entering this screen (e.g. back from the Deps screen) re-runs this
     // effect: pull fresh bytes for any tab that has no unsaved edits AND
     // re-list the file tree, so files changed on disk elsewhere (another
@@ -166,6 +175,13 @@ fun EditorScreen(
         if (createdFile != null) {
             showNewFile = false
             vm.clearNewFileSignals()
+        }
+    }
+    // close the delete dialog once the VM reports the file is gone
+    LaunchedEffect(deletedFile) {
+        if (deletedFile != null) {
+            pendingDelete = null
+            vm.clearDeleteSignals()
         }
     }
 
@@ -217,10 +233,14 @@ fun EditorScreen(
                     }
                     LazyColumn(Modifier.weight(1f)) {
                         items(tree, key = { it.relativePath }) { node ->
-                            FileTreeRow(node) { rel, isDir ->
-                                if (!isDir) vm.openFile(rel)
-                                drawerScope.launch { drawerState.close() }
-                            }
+                            FileTreeRow(
+                                node,
+                                onOpen = { rel, isDir ->
+                                    if (!isDir) vm.openFile(rel)
+                                    drawerScope.launch { drawerState.close() }
+                                },
+                                onDelete = { pendingDelete = node },
+                            )
                         }
                     }
                 }
@@ -453,6 +473,18 @@ fun EditorScreen(
             },
         )
     }
+
+    pendingDelete?.let { node ->
+        DeleteFileDialog(
+            node = node,
+            error = deleteFileError,
+            onDelete = { vm.deleteFile(node.relativePath) },
+            onDismiss = {
+                vm.clearDeleteSignals()
+                pendingDelete = null
+            },
+        )
+    }
 }
 
 /**
@@ -508,12 +540,27 @@ private fun NewFileDialog(
     )
 }
 
+/**
+ * One drawer row. Tap opens (files) / toggles nothing (dirs close the
+ * drawer as before); long-press offers deletion via [onDelete]. The drawer
+ * sheet is pure Compose, so combinedClickable's long-press does not fight
+ * the sora-editor interop view (which only ever sits under the CLOSED
+ * drawer — see ModalNavigationDrawer gesturesEnabled note above).
+ */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun FileTreeRow(node: FileNode, onOpen: (String, Boolean) -> Unit) {
+private fun FileTreeRow(
+    node: FileNode,
+    onOpen: (String, Boolean) -> Unit,
+    onDelete: () -> Unit,
+) {
     Row(
         Modifier
             .fillMaxWidth()
-            .clickable { onOpen(node.relativePath, node.isDirectory) }
+            .combinedClickable(
+                onClick = { onOpen(node.relativePath, node.isDirectory) },
+                onLongClick = onDelete,
+            )
             .padding(
                 start = (12 + node.depth * 16).dp,
                 top = 8.dp, bottom = 8.dp, end = 12.dp,
@@ -537,6 +584,53 @@ private fun FileTreeRow(node: FileNode, onOpen: (String, Boolean) -> Unit) {
             else MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
+}
+
+/**
+ * Confirms deleting [node] (a whole subtree when it is a directory).
+ * Errors from the repository guards (root Cargo.toml, root itself, …)
+ * show inline and keep the dialog open, mirroring NewFileDialog.
+ */
+@Composable
+private fun DeleteFileDialog(
+    node: FileNode,
+    error: String?,
+    onDelete: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (node.isDirectory) "Delete folder?" else "Delete file?") },
+        text = {
+            Column {
+                Text(
+                    node.relativePath +
+                        if (node.isDirectory) " and everything inside it" else "",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "This cannot be undone.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (error != null) {
+                    Spacer(Modifier.height(12.dp))
+                    Text(
+                        error,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDelete) {
+                Text("Delete", color = MaterialTheme.colorScheme.error)
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 @Composable

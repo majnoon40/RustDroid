@@ -133,6 +133,7 @@ Status legend:
 | `RUSTDROID_PREFIX` env var is read by openssl-probe at runtime | ⚠️ | Patch is correctly designed but not applied/verified. Needs `cargo vendor` → patch application → on-device `cargo build` of an openssl-dep crate. |
 | `libandroid_shims.a` weak `syncfs` symbol resolves at runtime on API 24 | ⚠️ | Weak symbol approach is correct in theory. On API 30+ Bionic's syncfs wins; on API 24-29 our syscall-based fallback wins. Needs on-device test to confirm the actual binary's symbol resolution. |
 | `lld` from NDK r27c produces correct DT_RUNPATH in stage2 binaries | ⚠️ | Verified for the hello.c binary (cross-compiled). For stage2 rustc binaries, lld is invoked by rustc with the same `-Wl,--enable-new-dtags` flag we set in CARGO_TARGET_..._RUSTFLAGS, so should be fine. Needs on-device readelf of the actual stage2 binaries. |
+| `cargo run` of a user project stored on shared storage (`/storage/emulated/0/…`) | ✅→fixed | **On-device confirmed (2026-09-05):** shared storage is mounted `noexec`, so cargo builds fine but dies spawning `target/debug/<bin>` with `Permission denied (os error 13)`. App-side fix (no toolchain change): `ProcEnv.redirectedTargetDir` exports `CARGO_TARGET_DIR=files/build/<sha16(projectPath)>` for projects outside app data — build output joins the toolchain on exec-allowed app-data ground (targetSdk 28), internal projects keep their in-tree `target/`. See android/README.md → "Running builds from external folders". |
 
 ## 3. Open questions / risk register
 

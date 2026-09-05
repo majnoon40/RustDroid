@@ -73,6 +73,12 @@ class EditorViewModel(
         // last-resort TLS escape hatch: empty marker file in the project
         // root opts THIS project out of certificate verification
         insecureTlsOk = File(projectDir, ProcEnv.PROJECT_INSECURE_TLS_MARKER).isFile,
+        // noexec-storage workaround: folders opened in place (Download, …)
+        // can hold build output but never execute it — run the artifacts
+        // from app storage instead (see ProcEnv.redirectedTargetDir)
+        cargoTargetDir = ProcEnv.redirectedTargetDir(
+            container.context.filesDir, projectDir,
+        ),
     )
 
     // ---- tabs ----
@@ -216,6 +222,53 @@ class EditorViewModel(
         }
     }
 
+    // ---------------- delete file ----------------
+
+    /** One-shot: relative path of the last deleted file (closes the dialog). */
+    private val _deletedFile = MutableStateFlow<String?>(null)
+    val deletedFile: StateFlow<String?> = _deletedFile.asStateFlow()
+
+    /** Error of the last deleteFile attempt (shown inline in the dialog). */
+    private val _deleteFileError = MutableStateFlow<String?>(null)
+    val deleteFileError: StateFlow<String?> = _deleteFileError.asStateFlow()
+
+    fun clearDeleteSignals() {
+        _deletedFile.value = null
+        _deleteFileError.value = null
+    }
+
+    /**
+     * Deletes a file (or folder, recursively) inside the project. Any open
+     * tab pointing INTO the deleted path is closed without a save prompt —
+     * the file is gone, saving would only resurrect a stale copy. Guards
+     * (root, root Cargo.toml, traversal) live in the repository.
+     */
+    fun deleteFile(relativePath: String) {
+        viewModelScope.launch {
+            val rel = relativePath.trim().replace('\\', '/')
+            try {
+                withContext(Dispatchers.IO) { repo.deleteFile(projectDir, rel) }
+                _deleteFileError.value = null
+                closeTabsUnder(rel)
+                refreshTree()
+                _deletedFile.value = rel
+            } catch (e: Exception) {
+                _deleteFileError.value = e.message ?: "could not delete '$rel'"
+            }
+        }
+    }
+
+    /** Closes every tab at [rel] or nested under it (dir delete). */
+    private fun closeTabsUnder(rel: String) {
+        val prefix = rel.trimEnd('/') + "/"
+        // high indices first: doClose shifts the list, removing from the
+        // top down keeps the collected indices valid
+        _tabs.value.withIndex()
+            .filter { (i, tab) -> tab.relativePath == rel || tab.relativePath.startsWith(prefix) }
+            .sortedByDescending { it.index }
+            .forEach { doClose(it.index) }
+    }
+
     fun confirmClose(save: Boolean) {
         val idx = _pendingClose
         _showCloseConfirm.value = false
@@ -338,6 +391,15 @@ class EditorViewModel(
                 // escape-hatch marker check happen off the main thread and
                 // reflect the state at the moment of invocation
                 val runEnv = withContext(Dispatchers.IO) { buildEnv() }
+                // external folder: build output runs from app storage
+                // because shared storage is noexec — say so once per run,
+                // right where "Permission denied (os error 13)" used to be
+                if (runEnv.containsKey("CARGO_TARGET_DIR")) {
+                    console.system(
+                        "note: this folder is on shared storage (noexec) — " +
+                            "binaries are built and run from app storage",
+                    )
+                }
                 val result = runner.run(
                     command, cwd = projectDir, env = runEnv, stdin = stdinPipe,
                     onLine = { line ->

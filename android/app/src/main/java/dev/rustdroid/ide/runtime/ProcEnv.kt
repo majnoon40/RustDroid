@@ -1,6 +1,7 @@
 package dev.rustdroid.ide.runtime
 
 import java.io.File
+import java.security.MessageDigest
 
 /**
  * The subprocess environment contract. This is the Phase-1-validated recipe
@@ -39,6 +40,46 @@ object ProcEnv {
     }
 
     /**
+     * App-internal, exec-allowed build root for external projects:
+     * files/build/<16-hex sha of the project's canonical path>.
+     */
+    fun redirectedTargetRoot(filesDir: File): File = File(filesDir, "build")
+
+    /**
+     * CARGO_TARGET_DIR for a project whose folder lives OUTSIDE app data.
+     *
+     * External projects (folders opened in place) sit on shared storage
+     * (/storage/emulated/0/…), which Android mounts **noexec** — writing
+     * target/ there works, but the moment `cargo run` tries to spawn
+     * target/debug/<bin> the kernel answers EACCES and cargo dies with
+     * "Permission denied (os error 13)". Redirecting the target dir into
+     * app data (files/build/…) puts build output on the same exec-allowed
+     * ground the toolchain itself runs from (targetSdk 28 — see
+     * app/build.gradle.kts), so `cargo run` works unchanged.
+     *
+     * Projects already under [filesDir] (internal projects, scratch) get
+     * null: their target/ is exec-allowed right where it is, and keeping
+     * it in-project keeps `cargo clean` semantics obvious.
+     *
+     * Keyed by a hash of the canonical project path (not the basename) so
+     * two folders with the same name in different places never share build
+     * state, and the mapping survives folder renames of siblings. Pure
+     * string/digest work — unit-testable on the JVM.
+     */
+    fun redirectedTargetDir(filesDir: File, projectDir: File): File? {
+        val project = projectDir.canonicalPath
+        val internalRoot = filesDir.canonicalPath
+        if (project == internalRoot || project.startsWith(internalRoot + File.separator)) {
+            return null
+        }
+        val sha = MessageDigest.getInstance("SHA-256")
+            .digest(project.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+            .take(16)
+        return File(redirectedTargetRoot(filesDir), sha)
+    }
+
+    /**
      * Environment for cargo/rustc invocations. [extraPath] is prepended
      * after the toolchain bin (e.g. system bin dir on device).
      *
@@ -72,6 +113,9 @@ object ProcEnv {
         assetProvider: (() -> ByteArray?)? = null,
         caBundle: File? = CaBundle.ensure(filesDir, prefix, assetProvider = assetProvider),
         insecureTlsOk: Boolean = false,
+        /** Non-null adds CARGO_TARGET_DIR — the noexec-storage workaround
+         *  for external projects (see [redirectedTargetDir]). */
+        cargoTargetDir: File? = null,
     ): Map<String, String> {
         ensureDirs(filesDir)
         return buildMap {
@@ -113,6 +157,11 @@ object ProcEnv {
                 File(homeDir(filesDir), INSECURE_TLS_MARKER_HOME).isFile
             ) {
                 put("CARGO_HTTP_DANGER_ACCEPT_INVALID_CERTS", "true")
+            }
+
+            // ---- noexec-storage workaround (external projects) ----
+            if (cargoTargetDir != null) {
+                put("CARGO_TARGET_DIR", cargoTargetDir.absolutePath)
             }
         }
     }

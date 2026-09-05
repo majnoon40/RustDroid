@@ -2,6 +2,7 @@ package dev.rustdroid.ide
 
 import dev.rustdroid.ide.runtime.ProcEnv
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -104,5 +105,63 @@ class ProcEnvTest {
         assertNull(env["CARGO_HTTP_CAINFO"])
         assertNull(env["SSL_CERT_FILE"])
         assertNull(env["CURL_CA_BUNDLE"])
+    }
+
+    // ---- noexec-storage workaround: CARGO_TARGET_DIR redirect ----
+
+    @Test
+    fun `redirectedTargetDir is null for anything under app data`() {
+        val files = tmp.newFolder("files-redirect")
+        // internal projects live under files/projects
+        assertNull(ProcEnv.redirectedTargetDir(files, File(files, "projects/hello")))
+        // toolchain scratch lives under files/home/scratch
+        assertNull(ProcEnv.redirectedTargetDir(files, File(files, "home/scratch")))
+        // filesDir itself (defensive) and a deeper synthetic path
+        assertNull(ProcEnv.redirectedTargetDir(files, files))
+        assertNull(ProcEnv.redirectedTargetDir(files, File(files, "a/b/c/d")))
+    }
+
+    @Test
+    fun `redirectedTargetDir is stable, hashed and lives under files build`() {
+        val files = tmp.newFolder("files-redirect2")
+        val external = tmp.newFolder("storage").resolve("Download/proj")
+        val dir = ProcEnv.redirectedTargetDir(files, external)
+        assertNotNull(dir)
+        // always under files/build, keyed by a 16-hex digest…
+        assertEquals(
+            File(ProcEnv.redirectedTargetRoot(files), dir!!.name).canonicalPath,
+            dir.canonicalPath,
+        )
+        assertTrue(dir.name.matches(Regex("^[0-9a-f]{16}$")))
+        // …derived from the project PATH, never its basename…
+        assertTrue(dir.name != "proj")
+        // …and stable across calls
+        assertEquals(
+            dir.canonicalPath,
+            ProcEnv.redirectedTargetDir(files, external)!!.canonicalPath,
+        )
+    }
+
+    @Test
+    fun `redirectedTargetDir separates same-named folders in different places`() {
+        val files = tmp.newFolder("files-redirect3")
+        val storage = tmp.newFolder("storage-redirect3")
+        val a = ProcEnv.redirectedTargetDir(files, File(storage, "Download/proj"))!!
+        val b = ProcEnv.redirectedTargetDir(files, File(storage, "Documents/proj"))!!
+        assertTrue(a.name != b.name)
+    }
+
+    @Test
+    fun `env exports CARGO_TARGET_DIR only when a redirect is supplied`() {
+        val prefix = tmp.newFolder("usr-targetdir")
+        val files = tmp.newFolder("files-targetdir")
+        val external = tmp.newFolder("ext-targetdir")
+        val redirect = ProcEnv.redirectedTargetDir(files, external)
+
+        val plain = ProcEnv.env(prefix, files, caBundle = null)
+        assertNull(plain["CARGO_TARGET_DIR"])
+
+        val redirected = ProcEnv.env(prefix, files, caBundle = null, cargoTargetDir = redirect)
+        assertEquals(redirect!!.absolutePath, redirected["CARGO_TARGET_DIR"])
     }
 }

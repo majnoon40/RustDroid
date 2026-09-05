@@ -299,6 +299,35 @@ class ProjectRepository(
         return file
     }
 
+    /**
+     * Deletes a file — or a whole directory tree — at [relativePath] inside
+     * [projectDir]. Same safety envelope as [createFile]: traversal/escape
+     * is rejected via [Fs.resolveChild], and two more guards keep the
+     * project itself intact: the project root ("." or an empty path) and
+     * the root Cargo.toml (a folder without a manifest stops being a
+     * project — remove the whole project from the Home screen instead)
+     * are refused. Deleting the manifest of a nested workspace member is
+     * allowed: that is a deliberate, advanced edit.
+     */
+    fun deleteFile(projectDir: File, relativePath: String) {
+        val rel = relativePath.trim().replace('\\', '/')
+        if (rel.isEmpty() || rel == ".") throw IOException("nothing to delete")
+        val target = Fs.resolveChild(projectDir, rel)
+        if (target.canonicalPath == projectDir.canonicalPath) {
+            throw IOException("cannot delete the project root")
+        }
+        if (target.parentFile?.canonicalPath == projectDir.canonicalPath &&
+            target.name == "Cargo.toml"
+        ) {
+            throw IOException(
+                "Cargo.toml is what makes this folder a project — " +
+                    "delete the whole project from the Home screen instead",
+            )
+        }
+        if (!target.exists()) throw IOException("'$rel' does not exist")
+        if (!Fs.deleteRecursively(target)) throw IOException("could not delete '$rel'")
+    }
+
     // ---- .rs intake (ACTION_VIEW from file managers) ----
 
     /**
