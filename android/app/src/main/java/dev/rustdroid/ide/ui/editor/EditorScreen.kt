@@ -15,6 +15,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.isImeVisible
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.foundation.layout.width
@@ -23,6 +26,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
@@ -65,6 +69,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.font.FontFamily
@@ -83,16 +91,17 @@ import dev.rustdroid.ide.model.Stream
 import dev.rustdroid.ide.ui.theme.LocalEditorPalette
 import dev.rustdroid.ide.ui.theme.MonoSmall
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun EditorScreen(
     container: AppContainer,
     projectName: String,
     onOpenDeps: (String) -> Unit,
+    initialFile: String? = null,
 ) {
     val vm: EditorViewModel = viewModel(
         key = "editor-$projectName",
-        factory = EditorViewModel.factory(container, projectName),
+        factory = EditorViewModel.factory(container, projectName, initialFile),
     )
     val tabs by vm.tabs.collectAsState()
     val activeIndex by vm.activeIndex.collectAsState()
@@ -118,8 +127,21 @@ fun EditorScreen(
     // Cargo.toml updated by the Deps screen is never shown stale here.
     LaunchedEffect(Unit) { vm.reloadUnchangedTabs() }
 
+    // Deep-linked file ("open with" import): the VM init already opened it
+    // for fresh instances; this covers re-entering an existing VM for the
+    // same project with a different file. openFile is idempotent (focuses
+    // the tab when already open).
+    LaunchedEffect(initialFile) {
+        initialFile?.let { vm.openFile(it) }
+    }
+
     val dark = isSystemInDarkTheme()
     val palette = LocalEditorPalette.current
+
+    // IME-aware layout: editor focus + visible keyboard => hide the console
+    // panel so the script gets the whole space above the IME (see bottom
+    // panel below). Track View-level focus from sora-editor.
+    var editorFocused by remember { mutableStateOf(false) }
 
     val drawerState = androidx.compose.material3.rememberDrawerState(
         initialValue = androidx.compose.material3.DrawerValue.Closed,
@@ -223,50 +245,78 @@ fun EditorScreen(
                 )
             },
         ) { padding ->
-            Column(Modifier.fillMaxSize().padding(padding)) {
-                // ---- tabs row ----
+            // imePadding on the whole column: with edge-to-edge + decor not
+            // fitting system windows, adjustResize is neutralized — IME
+            // insets flow through WindowInsets and must be applied manually.
+            // Children (editor / bottom panel) then always sit above the
+            // keyboard, whichever of them owns the input focus.
+            Column(Modifier.fillMaxSize().padding(padding).imePadding()) {
+                // ---- tabs row (compact 30dp strip — M3 Tab's 48dp minimum
+                // + padding ate a quarter of the screen; every dp counts on a
+                // phone with the keyboard open) ----
                 if (tabs.isNotEmpty()) {
                     Row(
                         Modifier
                             .fillMaxWidth()
+                            .height(30.dp)
                             .horizontalScroll(rememberScrollState())
                             .background(MaterialTheme.colorScheme.surfaceVariant)
                     ) {
                         tabs.forEachIndexed { i, tab ->
-                            Tab(
-                                selected = i == activeIndex,
-                                onClick = { vm.setActive(i) },
-                                text = {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        if (tab.dirty) {
-                                            Box(
-                                                Modifier
-                                                    .width(6.dp).height(6.dp)
-                                                    .background(
-                                                        MaterialTheme.colorScheme.primary,
-                                                        androidx.compose.foundation.shape.CircleShape
-                                                    )
-                                            )
-                                            Spacer(Modifier.width(6.dp))
-                                        }
-                                        Text(
-                                            tab.relativePath.substringAfterLast('/'),
-                                            maxLines = 1,
-                                            style = MaterialTheme.typography.labelSmall,
-                                        )
-                                        Spacer(Modifier.width(4.dp))
-                                        IconButton(
-                                            onClick = { vm.closeTab(i, force = false) },
-                                            modifier = Modifier.height(24.dp).width(24.dp),
-                                        ) {
-                                            Icon(
-                                                Icons.Filled.Close, contentDescription = "Close",
-                                                modifier = Modifier.height(14.dp).width(14.dp),
+                            val selected = i == activeIndex
+                            val indicator = MaterialTheme.colorScheme.primary
+                            val activeBg = MaterialTheme.colorScheme.surface
+                            Row(
+                                Modifier
+                                    .height(30.dp)
+                                    .background(if (selected) activeBg else Color.Transparent)
+                                    .drawBehind {
+                                        if (selected) {
+                                            val h = 2.dp.toPx()
+                                            drawRect(
+                                                color = indicator,
+                                                topLeft = Offset(0f, size.height - h),
+                                                size = Size(size.width, h),
                                             )
                                         }
                                     }
-                                },
-                            )
+                                    .clickable { vm.setActive(i) }
+                                    .padding(start = 10.dp, end = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                if (tab.dirty) {
+                                    Box(
+                                        Modifier
+                                            .width(6.dp).height(6.dp)
+                                            .background(MaterialTheme.colorScheme.primary, CircleShape)
+                                    )
+                                    Spacer(Modifier.width(6.dp))
+                                }
+                                Text(
+                                    tab.relativePath.substringAfterLast('/'),
+                                    maxLines = 1,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (selected) MaterialTheme.colorScheme.onSurface
+                                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Spacer(Modifier.width(4.dp))
+                                // close: 22dp hit area (touch targets shrink for
+                                // icon-only affordances); inner clickable consumes
+                                // the tap so the tab itself doesn't also switch
+                                Box(
+                                    Modifier
+                                        .width(22.dp).height(22.dp)
+                                        .clickable { vm.closeTab(i, force = false) },
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Icon(
+                                        Icons.Filled.Close,
+                                        contentDescription = "Close tab",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.height(13.dp).width(13.dp),
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -286,15 +336,26 @@ fun EditorScreen(
                             dark = dark,
                             onTextChange = { vm.onTextChange(it) },
                             jumpRequest = jump,
+                            onFocusChanged = { editorFocused = it },
                             modifier = Modifier.fillMaxSize(),
                         )
                     }
                 }
 
                 // ---- bottom panel ----
+                // Hidden while the editor is focused with the IME open: the
+                // keyboard already eats half the screen, and a 220dp console
+                // + its tab row on top of that left only a sliver of code
+                // visible (the "tiny portion of the script" report). The
+                // panel comes back the moment the keyboard closes. Typing in
+                // the console's stdin bar keeps the panel (it owns focus
+                // there) with the console shrunk to 88dp instead of 220dp.
+                val imeVisible = WindowInsets.isImeVisible
+                val hideBottom = imeVisible && editorFocused
                 val errorCount = problems.count { it.severity == Severity.ERROR }
                 val warningCount = problems.count { it.severity == Severity.WARNING }
-                Surface(tonalElevation = 2.dp, modifier = Modifier.imePadding()) {
+                if (!hideBottom) {
+                    Surface(tonalElevation = 2.dp) {
                     Column(Modifier.fillMaxWidth()) {
                         TabRow(selectedTabIndex = if (bottomTab == EditorViewModel.BottomTab.CONSOLE) 0 else 1) {
                             Tab(
@@ -335,7 +396,7 @@ fun EditorScreen(
                         Box(
                             Modifier
                                 .fillMaxWidth()
-                                .height(220.dp)
+                                .height(if (imeVisible) 88.dp else 220.dp)
                                 .background(palette.consoleBg)
                         ) {
                             when (bottomTab) {
@@ -352,6 +413,7 @@ fun EditorScreen(
                                 )
                             }
                         }
+                    }
                     }
                 }
             }

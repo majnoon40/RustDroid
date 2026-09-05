@@ -165,4 +165,68 @@ class ProjectRepository(
         Fs.writeAtomic(file, "")
         return file
     }
+
+    // ---- .rs import (ACTION_VIEW from file managers) ----
+
+    /** Name of the catch-all project files are imported into. */
+    val importProjectName: String get() = "imported"
+
+    /**
+     * Ensures the "imported" scratch project exists, WITHOUT touching the
+     * toolchain: `cargo new` would require a working rustc, but a user
+     * opening a .rs attachment may not have installed one yet (they still
+     * get view/edit). The template is the smallest valid cargo bin project;
+     * an existing project is left untouched (idempotent).
+     */
+    fun ensureImportProject(): File {
+        val dir = File(projectsRoot, importProjectName)
+        val toml = File(dir, "Cargo.toml")
+        if (!toml.isFile) {
+            dir.resolve("src").mkdirs()
+            Fs.writeAtomic(
+                toml,
+                """
+                [package]
+                name = "imported"
+                version = "0.1.0"
+                edition = "2021"
+                """.trimIndent(),
+            )
+            Fs.writeAtomic(
+                dir.resolve("src/main.rs"),
+                "fn main() {\n    println!(\"Replace this stub with mod declarations, or open your imported file.\");\n}\n",
+            )
+        }
+        return dir
+    }
+
+    /**
+     * Places imported .rs content into the project as `src/<name>`. A file
+     * named main.rs replaces the template stub; any other name that already
+     * exists gets a `-1`, `-2`… suffix instead of being overwritten.
+     * Returns the path relative to the project root (for opening a tab).
+     */
+    fun importRsContent(projectDir: File, fileName: String, content: String): String {
+        val clean = fileName.substringAfterLast('/').substringAfterLast('\\').trim()
+        if (clean.isEmpty() || !clean.endsWith(".rs")) {
+            throw IOException("not a Rust source name: '$fileName'")
+        }
+        if (!clean.matches(Regex("[A-Za-z0-9._-]+"))) {
+            throw IOException("unsupported file name: '$clean'")
+        }
+        val src = projectDir.resolve("src")
+        var target = src.resolve(clean)
+        if (clean == "main.rs") {
+            // the template stub exists precisely to be replaced
+            Fs.writeAtomic(target, content)
+            return "src/main.rs"
+        }
+        var n = 0
+        while (target.exists()) {
+            n += 1
+            target = src.resolve(clean.removeSuffix(".rs") + "-$n.rs")
+        }
+        Fs.writeAtomic(target, content)
+        return target.relativeTo(projectDir).path
+    }
 }

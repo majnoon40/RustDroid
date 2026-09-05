@@ -25,7 +25,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  * sora-editor interop: Rust grammar + TextMate color scheme + jump-to-line.
  * The editor view is owned by Compose via AndroidView; content changes are
  * forwarded to the VM through [onTextChange] (programmatic setText events
- * are filtered so loading a tab does not mark it dirty).
+ * are filtered so loading a tab does not mark it dirty), and View-level
+ * focus changes through [onFocusChanged] (drives the IME-aware layout in
+ * EditorScreen: keyboard + editor focus => hide the console panel).
  */
 object RustEditor {
 
@@ -96,6 +98,7 @@ fun CodeEditorPane(
     dark: Boolean,
     onTextChange: (String) -> Unit,
     jumpRequest: JumpRequest?,
+    onFocusChanged: (Boolean) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -144,6 +147,9 @@ fun CodeEditorPane(
 
     AndroidView(
         factory = { editor },
+        // focus listener re-attached on recomposition — captures the current
+        // callback without recreating the (expensive) editor View
+        update = { it.setOnFocusChangeListener { _, hasFocus -> onFocusChanged(hasFocus) } },
         modifier = modifier,
     )
 }

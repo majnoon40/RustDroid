@@ -3,6 +3,7 @@ package dev.rustdroid.ide.di
 import android.content.Context
 import dev.rustdroid.ide.projects.CratesIoClient
 import dev.rustdroid.ide.projects.ProjectRepository
+import dev.rustdroid.ide.projects.RsImport
 import dev.rustdroid.ide.runtime.CaBundle
 import dev.rustdroid.ide.runtime.CargoRunner
 import dev.rustdroid.ide.runtime.ProcEnv
@@ -52,4 +53,7 @@ class AppContainer(val context: Context) {
     }
 
     val cratesIoClient: CratesIoClient by lazy { CratesIoClient(http) }
+
+    /** ACTION_VIEW .rs import glue (ContentResolver lives here, repo stays pure JVM). */
+    val rsImport: RsImport by lazy { RsImport(context, projectRepository) }
 }

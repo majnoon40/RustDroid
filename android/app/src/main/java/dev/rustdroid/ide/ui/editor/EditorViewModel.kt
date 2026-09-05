@@ -43,6 +43,7 @@ private const val TLS_HINT =
 class EditorViewModel(
     val container: AppContainer,
     val projectName: String,
+    initialFile: String? = null,
 ) : ViewModel() {
 
     val projectDir: File = File(container.projectsRoot, projectName)
@@ -115,9 +116,11 @@ class EditorViewModel(
 
     init {
         refreshTree()
-        // open the entry file the way cargo new creates it
-        val entry = listOf("src/main.rs", "src/lib.rs", "Cargo.toml")
-            .firstOrNull { File(projectDir, it).isFile }
+        // deep-linked file ("open with" import) wins; otherwise open the
+        // entry file the way cargo new creates it
+        val entry = initialFile?.takeIf { File(projectDir, it).isFile }
+            ?: listOf("src/main.rs", "src/lib.rs", "Cargo.toml")
+                .firstOrNull { File(projectDir, it).isFile }
         entry?.let { openFile(it) }
     }
 
@@ -421,11 +424,11 @@ class EditorViewModel(
     }
 
     companion object {
-        fun factory(container: AppContainer, projectName: String) =
+        fun factory(container: AppContainer, projectName: String, initialFile: String? = null) =
             object : ViewModelProvider.Factory {
                 @Suppress("UNCHECKED_CAST")
                 override fun <T : ViewModel> create(modelClass: Class<T>): T =
-                    EditorViewModel(container, projectName) as T
+                    EditorViewModel(container, projectName, initialFile) as T
             }
     }
 }

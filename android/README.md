@@ -138,6 +138,37 @@ directories as needed. Path safety is `Fs.resolveChild` (no `..`, no
 absolute paths), existing files are never overwritten, and the created
 file opens in a tab immediately (covered by `FileCreateTest`).
 
+Opening .rs files from outside the app: `ACTION_VIEW` intent filters
+(`text/x-rust` MIME + `.*\.rs` pathPattern) make RustDroid appear in the
+file manager's "Open with" sheet. Imports land in a catch-all `imported`
+project (created without the toolchain — editing works before install;
+Run needs the toolchain). Names are sanitized to their basename, the
+charset is `[A-Za-z0-9._-]`, clashes get `-1`/`-2` suffixes, and
+`main.rs` imports replace the template stub (covered by `RsImportTest`).
+
+Screen real estate: the file tab strip is a custom 30dp row (M3 `Tab`
+enforces a 48dp minimum that ate a quarter of the screen on small
+devices); the active tab gets a 2dp primary-color underline, and the
+close button is a 22dp tap target inside the strip. With the keyboard open and the
+editor focused, the console/problems panel hides entirely (the IME
+already eats half the screen — a 220dp panel on top left a sliver of
+code); it returns when the keyboard closes. Typing in the console's
+stdin bar keeps the panel with the console shrunk to 88dp. Focus is
+tracked from the sora-editor View (`setOnFocusChangeListener` bridged
+through `AndroidView.update`), IME visibility via
+`WindowInsets.isImeVisible`; `imePadding()` sits on the outer column —
+with edge-to-edge, `adjustResize` in the manifest is neutralized
+(decorFitsSystemWindows=false), so IME insets must be applied manually.
+
+Settings "Re-verify health" returns to Home when the (minutes-long)
+verification passes — driven by `ToolchainManager.verifyPassTick`, a
+monotonic counter that survives StateFlow conflation. The naive "did I
+see Verifying?" watcher missed the case where the user backgrounds the
+app mid-verify: Compose recomposition pauses while stopped, every
+intermediate `Verifying` emission is conflated away, and on return the
+state jumps straight to `Ready` — so the transition was never observed.
+Failures stay on Settings (and re-route to the Gate).
+
 ## Known v1 limits
 
 - No PTY: stdin is a line-send field; programs needing raw tty interaction

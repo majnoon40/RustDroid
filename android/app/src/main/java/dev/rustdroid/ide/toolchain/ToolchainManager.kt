@@ -33,6 +33,18 @@ class ToolchainManager(
     private val _state = MutableStateFlow<ToolchainState>(initialState())
     val state: StateFlow<ToolchainState> = _state.asStateFlow()
 
+    /**
+     * Increments every time verification completes successfully (install
+     * or re-verify). Unlike [state]'s intermediate Verifying emissions, a
+     * counter survives StateFlow conflation: the re-verify smoke test takes
+     * minutes, users background the app mid-run, Compose pauses
+     * recomposition while stopped and every intermediate Verifying value is
+     * conflated away — so "did I see Verifying?" watchers miss the pass.
+     * UI code snapshots the tick at screen entry and reacts to any increase.
+     */
+    private val _verifyPassTick = MutableStateFlow(0L)
+    val verifyPassTick: StateFlow<Long> = _verifyPassTick.asStateFlow()
+
     private val mutex = Mutex()
     private val uiScope = kotlinx.coroutines.CoroutineScope(
         kotlinx.coroutines.SupervisorJob() + Dispatchers.Main
@@ -209,6 +221,7 @@ class ToolchainManager(
             )
             writeCargoDefaults()
             _state.value = ToolchainState.Ready(firstLine(rustc), firstLine(cargo))
+            _verifyPassTick.value += 1L
             log("verification PASSED — toolchain ready")
         } else {
             val first = failed.first()
