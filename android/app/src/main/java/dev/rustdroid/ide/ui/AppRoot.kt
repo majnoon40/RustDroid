@@ -6,7 +6,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
-import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -22,12 +21,18 @@ import dev.rustdroid.ide.ui.editor.EditorScreen
 import dev.rustdroid.ide.ui.gate.GateScreen
 import dev.rustdroid.ide.ui.home.HomeScreen
 import dev.rustdroid.ide.ui.settings.SettingsScreen
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 
 object Routes {
     const val GATE = "gate"
     const val HOME = "home"
+
+    /**
+     * The project argument is a REF, not just a name: internal projects are
+     * named (their dir under files/projects), external ones — folders opened
+     * in place anywhere on storage — travel as their absolute path
+     * (URL-encoded so it stays one path segment). Both resolve in
+     * ProjectRepository.resolve.
+     */
     const val EDITOR = "editor/{project}?file={file}"
     const val DEPS = "deps/{project}"
     const val SETTINGS = "settings"
@@ -56,7 +61,6 @@ fun AppRoot(
     )
     val state by vm.toolchainState.collectAsState()
     val nav = rememberNavController()
-    val context = LocalContext.current
 
     val startDest = if (state is ToolchainState.Ready) Routes.HOME else Routes.GATE
 
@@ -71,40 +75,6 @@ fun AppRoot(
                 nav.navigate(Routes.GATE) {
                     popUpTo(0) { inclusive = true }
                 }
-            }
-        }
-    }
-
-    // "Open with RustDroid" for .rs sources (ACTION_VIEW). The import is
-    // pure file work — no toolchain needed — so it also works before the
-    // toolchain is installed; the editor is reachable right away (Run
-    // needs an installed toolchain, editing does not). If the app cold-
-    // starts on the Gate, the import waits here until the toolchain is
-    // Ready, then lands the user on their file.
-    LaunchedEffect(pendingOpenRs.value, state) {
-        val uri = pendingOpenRs.value ?: return@LaunchedEffect
-        if (state is ToolchainState.Ready) {
-            val target = withContext(Dispatchers.IO) {
-                runCatching { container.rsImport.import(uri) }
-            }
-            onPendingRsConsumed()
-            target.onSuccess {
-                if (nav.currentDestination?.route?.startsWith("editor/") != true) {
-                    nav.navigate(Routes.editor(it.projectName, it.relativePath)) {
-                        launchSingleTop = true
-                    }
-                } else {
-                    // already in an editor: swap to the imported project
-                    nav.navigate(Routes.editor(it.projectName, it.relativePath)) {
-                        popUpTo(Routes.HOME)
-                        launchSingleTop = true
-                    }
-                }
-            }
-            target.onFailure {
-                android.widget.Toast.makeText(
-                    context, "could not open file: ${it.message}", android.widget.Toast.LENGTH_LONG
-                ).show()
             }
         }
     }
@@ -126,9 +96,11 @@ fun AppRoot(
             )
         }
         composable(Routes.HOME) {
-            HomeScreen(container, onOpenProject = { name ->
-                nav.navigate(Routes.editor(name))
-            }, onOpenSettings = { nav.navigate(Routes.SETTINGS) })
+            HomeScreen(
+                container,
+                onOpenProject = { ref -> nav.navigate(Routes.editor(ref)) },
+                onOpenSettings = { nav.navigate(Routes.SETTINGS) },
+            )
         }
         composable(
             Routes.EDITOR,
@@ -160,20 +132,43 @@ fun AppRoot(
             // Failed state re-routes to the Gate via the effect above.
             //
             // This watches the verifyPassTick COUNTER, not the intermediate
-            // Verifying states: the re-verify smoke test takes minutes,
-            // users background the app mid-run, and StateFlow conflates all
+            // Verifying states: the re-verify smoke test takes minutes, users
+            // background the app mid-run, and StateFlow conflates all
             // intermediate Verifying emissions away while Compose
             // recomposition is paused — the old "did I see Verifying?"
             // watcher missed exactly that case. A monotonic tick survives
-            // conflation: snapshot at entry, react to any increase.
+            // conflation: snapshot at entry, react to any increase. The run
+            // itself lives in the foreground service (ToolchainInstallService
+            // ACTION_REVERIFY), so the process — and this tick — survive the
+            // backgrounding that used to kill the re-verify in the first
+            // place.
             val passTickEntry = remember { container.toolchainManager.verifyPassTick.value }
             val passTick by container.toolchainManager.verifyPassTick.collectAsState()
             LaunchedEffect(passTick) {
-                if (passTick > passTickEntry) {
+                if (passTick > passTickEntry && nav.currentDestination?.route == Routes.SETTINGS) {
                     nav.popBackStack()
                 }
             }
             SettingsScreen(container)
         }
+    }
+
+    // "Open with RustDroid" for .rs sources (ACTION_VIEW): ask where the
+    // file should go (new project the user names, or an existing project)
+    // instead of dumping it into a fixed scratch project. Pure file work —
+    // no toolchain needed — so it also works before install; Run needs one,
+    // editing does not.
+    pendingOpenRs.value?.let { uri ->
+        OpenRsDialog(
+            container = container,
+            uri = uri,
+            onOpened = { ref, rel ->
+                onPendingRsConsumed()
+                nav.navigate(Routes.editor(ref, rel)) {
+                    launchSingleTop = true
+                }
+            },
+            onDismiss = { onPendingRsConsumed() },
+        )
     }
 }

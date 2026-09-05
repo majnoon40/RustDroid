@@ -91,7 +91,7 @@ fun DepsScreen(
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
-                title = { Text("Dependencies — $projectName") },
+                title = { Text("Dependencies — ${projectName.substringAfterLast('/')}") },
                 actions = {
                     if (fetching) {
                         CircularProgressIndicator(

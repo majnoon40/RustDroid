@@ -83,6 +83,14 @@ data class ProjectSummary(
     val dir: java.io.File,
     val lastModifiedMs: Long,
     val dependencyCount: Int,
+    /**
+     * True when this project is a folder opened in place anywhere on
+     * storage (Download, …) rather than one created under the app's
+     * projects dir: it is navigated by absolute path, "remove" forgets it
+     * without deleting anything, and its Cargo.toml may be absent
+     * (plain-folder editing).
+     */
+    val external: Boolean = false,
 )
 
 /** A node in the editor file tree. */

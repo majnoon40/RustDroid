@@ -1,5 +1,7 @@
 package dev.rustdroid.ide.ui.home
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -27,6 +29,7 @@ import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -41,13 +44,16 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.rustdroid.ide.di.AppContainer
 import dev.rustdroid.ide.model.ProjectSummary
+import dev.rustdroid.ide.projects.RsImport
 import dev.rustdroid.ide.ui.components.ConfirmDialog
 import dev.rustdroid.ide.ui.components.EmptyState
 import dev.rustdroid.ide.ui.components.RdIcons
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -68,14 +74,52 @@ fun HomeScreen(
     var showNewDialog by remember { mutableStateOf(false) }
     var deleteTarget by remember { mutableStateOf<ProjectSummary?>(null) }
     var renameTarget by remember { mutableStateOf<ProjectSummary?>(null) }
+    var folderCandidate by remember { mutableStateOf<File?>(null) }
+    var adopting by remember { mutableStateOf(false) }
 
     androidx.compose.runtime.LaunchedEffect(Unit) { vm.refresh() }
+
+    // ---- open folder in place ----
+    // Permission first (legacy storage model at targetSdk 28 — see
+    // build.gradle.kts), then the system folder picker; the picked tree
+    // is translated to a real path and validated by the VM.
+    val folderPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            vm.linkFolder(
+                uri,
+                onReady = { folderCandidate = it },
+                onError = { vm.reportError(it) },
+            )
+        }
+    }
+    val storagePermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            folderPicker.launch(null)
+        } else {
+            vm.reportError(
+                "storage access is required to edit a folder in place — grant it and try again",
+            )
+        }
+    }
+    val openFolderPicker = {
+        when (val perm = vm.storagePermissionToRequest()) {
+            null -> folderPicker.launch(null)
+            else -> storagePermission.launch(perm)
+        }
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("RustDroid") },
                 actions = {
+                    IconButton(onClick = openFolderPicker) {
+                        Icon(RdIcons.FolderOpen, contentDescription = "Open folder as project")
+                    }
                     IconButton(onClick = onOpenSettings) {
                         Icon(Icons.Filled.Settings, contentDescription = "Settings")
                     }
@@ -94,11 +138,22 @@ fun HomeScreen(
     ) { padding ->
         if (projects.isEmpty()) {
             Box(Modifier.fillMaxSize().padding(padding)) {
-                EmptyState(
-                    icon = RdIcons.Folder,
-                    title = "No cargo projects yet",
-                    subtitle = "Create one with cargo new — it compiles and runs right on this device.",
-                )
+                Column(
+                    Modifier.align(Alignment.Center).padding(horizontal = 24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    EmptyState(
+                        icon = RdIcons.Folder,
+                        title = "No cargo projects yet",
+                        subtitle = "Create one with cargo new — it compiles and runs right on this device.",
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedButton(onClick = openFolderPicker) {
+                        Icon(RdIcons.FolderOpen, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Open a folder as a project")
+                    }
+                }
             }
         } else {
             LazyColumn(
@@ -109,9 +164,11 @@ fun HomeScreen(
                 items(projects, key = { it.dir.absolutePath }) { project ->
                     ProjectCard(
                         project = project,
-                        onClick = { onOpenProject(project.name) },
+                        onClick = {
+                            onOpenProject(container.projectRepository.refOf(project.dir))
+                        },
                         onDelete = { deleteTarget = project },
-                        onRename = { renameTarget = project },
+                        onRename = { if (!project.external) renameTarget = project },
                     )
                 }
             }
@@ -132,13 +189,26 @@ fun HomeScreen(
     }
 
     deleteTarget?.let { target ->
-        ConfirmDialog(
-            title = "Delete '${target.name}'?",
-            text = "The whole project directory is removed, including target/ build outputs.",
-            confirmLabel = "Delete",
-            onConfirm = { vm.delete(target); deleteTarget = null },
-            onDismiss = { deleteTarget = null },
-        )
+        if (target.external) {
+            // external folders belong to the user — removing the entry must
+            // never delete the underlying files
+            ConfirmDialog(
+                title = "Remove '${target.name}' from RustDroid?",
+                text = "The folder stays where it is, with every file untouched — " +
+                    "only the RustDroid project entry is removed.",
+                confirmLabel = "Remove",
+                onConfirm = { vm.removeExternal(target); deleteTarget = null },
+                onDismiss = { deleteTarget = null },
+            )
+        } else {
+            ConfirmDialog(
+                title = "Delete '${target.name}'?",
+                text = "The whole project directory is removed, including target/ build outputs.",
+                confirmLabel = "Delete",
+                onConfirm = { vm.delete(target); deleteTarget = null },
+                onDismiss = { deleteTarget = null },
+            )
+        }
     }
 
     renameTarget?.let { target ->
@@ -149,6 +219,22 @@ fun HomeScreen(
                 renameTarget = null
             },
             onDismiss = { renameTarget = null },
+        )
+    }
+
+    folderCandidate?.let { dir ->
+        AdoptFolderDialog(
+            dir = dir,
+            busy = adopting,
+            onAdopt = { withCargo, packageName ->
+                adopting = true
+                vm.adoptFolder(dir, withCargo, packageName) { ref, err ->
+                    adopting = false
+                    folderCandidate = null
+                    if (ref != null) onOpenProject(ref) else vm.reportError(err ?: "failed")
+                }
+            },
+            onDismiss = { if (!adopting) folderCandidate = null },
         )
     }
 
@@ -175,23 +261,143 @@ private fun ProjectCard(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column(Modifier.weight(1f)) {
-                Text(project.name, style = MaterialTheme.typography.titleMedium)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (project.external) {
+                        Icon(
+                            RdIcons.FolderOpen,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.height(16.dp).width(16.dp),
+                        )
+                        Spacer(Modifier.width(6.dp))
+                    }
+                    Text(
+                        project.name,
+                        style = MaterialTheme.typography.titleMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
                 val fmt = remember { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()) }
                 Text(
                     "modified ${fmt.format(Date(project.lastModifiedMs))}" +
-                        if (project.dependencyCount >= 0) " · ${project.dependencyCount} deps" else " · Cargo.toml unreadable",
+                        when {
+                            project.dependencyCount >= 0 -> " · ${project.dependencyCount} deps"
+                            project.external -> " · no Cargo.toml (editing only)"
+                            else -> " · Cargo.toml unreadable"
+                        },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                if (project.external) {
+                    // opened in place: show where it lives on storage
+                    Text(
+                        project.dir.parent ?: project.dir.path,
+                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
-            IconButton(onClick = onRename) {
-                Icon(Icons.Filled.Edit, contentDescription = "Rename", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (!project.external) {
+                IconButton(onClick = onRename) {
+                    Icon(Icons.Filled.Edit, contentDescription = "Rename", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
             IconButton(onClick = onDelete) {
-                Icon(Icons.Filled.Delete, contentDescription = "Delete", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                Icon(
+                    Icons.Filled.Delete,
+                    contentDescription = if (project.external) "Remove from RustDroid" else "Delete",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }
+}
+
+/**
+ * Landing dialog for a folder picked to be opened IN PLACE: the folder is
+ * never copied or moved — RustDroid edits it where it lives. Folders
+ * without a manifest can be turned into a cargo project right there
+ * (Cargo.toml + src/main.rs written into the folder, only when missing),
+ * or opened for plain editing.
+ */
+@Composable
+private fun AdoptFolderDialog(
+    dir: File,
+    busy: Boolean,
+    onAdopt: (withCargo: Boolean, packageName: String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val hasManifest = File(dir, "Cargo.toml").isFile
+    var name by remember(dir) {
+        mutableStateOf(RsImport.suggestProjectName(dir.name + ".rs"))
+    }
+    val nameOk = name.matches(Regex("[a-zA-Z][a-zA-Z0-9_-]*"))
+
+    AlertDialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        title = { Text("Open '${dir.name}' in place?") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "The folder stays where it is and every edit saves straight into it — " +
+                        "nothing is copied or moved.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Text(
+                    dir.path,
+                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (!hasManifest) {
+                    OutlinedTextField(
+                        value = name,
+                        onValueChange = { name = it },
+                        singleLine = true,
+                        enabled = !busy,
+                        label = { Text("Cargo package name") },
+                        isError = name.isNotEmpty() && !nameOk,
+                        supportingText = {
+                            if (name.isNotEmpty() && !nameOk) {
+                                Text("letters, digits, - and _; must start with a letter")
+                            }
+                        },
+                    )
+                }
+                if (busy) {
+                    Text("opening…", style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        },
+        confirmButton = {
+            if (hasManifest) {
+                TextButton(
+                    onClick = { onAdopt(false, name) },
+                    enabled = !busy,
+                ) { Text("Open") }
+            } else {
+                TextButton(
+                    onClick = { onAdopt(true, name) },
+                    enabled = !busy && nameOk,
+                ) { Text("Add Cargo.toml") }
+            }
+        },
+        dismissButton = {
+            if (!hasManifest) {
+                // plain-folder mode: edit files, no cargo scaffold
+                TextButton(
+                    onClick = { onAdopt(false, name) },
+                    enabled = !busy,
+                ) { Text("Just edit files") }
+            } else {
+                TextButton(onClick = { if (!busy) onDismiss() }, enabled = !busy) { Text("Cancel") }
+            }
+        },
+    )
 }
 
 @Composable

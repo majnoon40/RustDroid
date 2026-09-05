@@ -18,6 +18,7 @@ class FileCreateTest {
     // createFile never touches the runner/env/cargo; dummies are fine.
     private fun repo(): ProjectRepository = ProjectRepository(
         projectsRoot = tmp.root,
+        externalRegistry = File(tmp.root, "external-projects.txt"),
         runner = CargoRunner(),
         envProvider = { emptyMap() },
         cargoPath = { "/unused/cargo" },

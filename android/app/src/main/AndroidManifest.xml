@@ -7,6 +7,12 @@
     <!-- Declared for API 34+ devices; enforcement is off at targetSdk 28 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Folders opened in place (Download, anywhere on shared storage).
+         targetSdk 28 keeps the legacy storage model, so this one runtime
+         grant is what lets the File API (and cargo, which needs real POSIX
+         paths) read+write those folders. Requested only when the user
+         actually opens a folder as a project. -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
 
     <application
         android:name=".RustDroidApp"

@@ -46,7 +46,13 @@ class EditorViewModel(
     initialFile: String? = null,
 ) : ViewModel() {
 
-    val projectDir: File = File(container.projectsRoot, projectName)
+    /**
+     * [projectName] is a project REF: a bare name (internal project under
+     * files/projects) or an absolute path (folder opened in place — see
+     * ProjectRepository.resolve). Either way the editor edits the folder
+     * where it lives; external folders are never copied.
+     */
+    val projectDir: File = container.projectRepository.resolve(projectName)
 
     private val repo = container.projectRepository
     private val runner = container.cargoRunner

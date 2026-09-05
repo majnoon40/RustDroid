@@ -123,9 +123,11 @@ fun EditorScreen(
     var showNewFile by remember { mutableStateOf(false) }
 
     // Re-entering this screen (e.g. back from the Deps screen) re-runs this
-    // effect: pull fresh bytes for any tab that has no unsaved edits, so a
-    // Cargo.toml updated by the Deps screen is never shown stale here.
-    LaunchedEffect(Unit) { vm.reloadUnchangedTabs() }
+    // effect: pull fresh bytes for any tab that has no unsaved edits AND
+    // re-list the file tree, so files changed on disk elsewhere (another
+    // app, or — for folders opened in place — the user on a PC) are
+    // reflected here instead of shown stale (or clobbered on save).
+    LaunchedEffect(Unit) { vm.reloadUnchangedTabs(); vm.refreshTree() }
 
     // Deep-linked file ("open with" import): the VM init already opened it
     // for fresh instances; this covers re-entering an existing VM for the
@@ -171,16 +173,21 @@ fun EditorScreen(
         // The editor is a sora-editor Android View (AndroidView interop): it
         // scrolls and long-press-selects inside the View system and never
         // consumes pointer events in Compose's gesture pipeline. With drawer
-        // gestures enabled, M3's anchoredDraggable watches the same pointer
-        // stream over the content area and (a) steals a long-press once the
-        // finger drifts past touch slop — cancelling the editor mid-hold, so
-        // text selection never fires, and (b) reads scroll/fling motion as a
-        // horizontal drag, popping the drawer open while scrolling long
-        // files. Compose-native scrollables (the console LazyColumn) consume
-        // their deltas first, so only interop children are exposed. The file
-        // tree opens via the toolbar folder button instead; the scrim tap
-        // still closes it.
-        gesturesEnabled = false,
+        // gestures enabled while CLOSED, M3's anchoredDraggable watches the
+        // same pointer stream over the content area and (a) steals a
+        // long-press once the finger drifts past touch slop — cancelling the
+        // editor mid-hold, so text selection never fires, and (b) reads
+        // scroll/fling motion as a horizontal drag, popping the drawer open
+        // while scrolling long files. Compose-native scrollables (the
+        // console LazyColumn) consume their deltas first, so only interop
+        // children are exposed.
+        //
+        // Gestures are enabled only while the drawer is OPEN: the sheet then
+        // covers the editor, nothing interop sits under the gesture area,
+        // and a right-to-left swipe (off the sheet or the scrim) closes it.
+        // Opening stays a deliberate act — the toolbar folder button — so
+        // scrolling code can never accidentally summon the drawer.
+        gesturesEnabled = drawerState.targetValue == androidx.compose.material3.DrawerValue.Open,
         drawerContent = {
             ModalDrawerSheet {
                 Column(Modifier.fillMaxHeight()) {
@@ -225,11 +232,17 @@ fun EditorScreen(
             topBar = {
                 TopAppBar(
                     navigationIcon = {
-                        IconButton(onClick = { drawerScope.launch { drawerState.open() } }) {
+                        IconButton(onClick = {
+                            // fresh tree every open: the folder may have
+                            // changed on disk since (opened-in-place projects
+                            // are shared with the rest of the system)
+                            vm.refreshTree()
+                            drawerScope.launch { drawerState.open() }
+                        }) {
                             Icon(RdIcons.Folder, contentDescription = "Files")
                         }
                     },
-                    title = { Text(projectName) },
+                    title = { Text(projectName.substringAfterLast('/')) },
                     actions = {
                         TextButton(onClick = { onOpenDeps(projectName) }) { Text("Deps") }
                         if (running) {

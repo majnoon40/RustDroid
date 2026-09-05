@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import dev.rustdroid.ide.di.AppContainer
 import dev.rustdroid.ide.model.ToolchainState
+import dev.rustdroid.ide.toolchain.ToolchainInstallService
 import dev.rustdroid.ide.util.Fs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -57,11 +58,36 @@ class SettingsViewModel(val container: AppContainer) : ViewModel() {
         }
     }
 
+    /**
+     * Re-verify runs in the toolchain FOREGROUND SERVICE, not in this
+     * viewModelScope: the smoke test takes minutes and users background the
+     * app mid-run — a plain coroutine dies with the process, the tick never
+     * increments, and the return-to-app pop never fires (the bug that kept
+     * coming back). The service keeps the process alive until the run
+     * completes; this VM merely tracks progress via the state flow.
+     */
     fun reverify() {
-        viewModelScope.launch {
-            _busy.value = true
-            manager.reverify()
+        if (_busy.value) return
+        _busy.value = true
+        val started = runCatching {
+            ToolchainInstallService.startReverify(container.context)
+        }.isSuccess
+        if (!started) {
             _busy.value = false
+            _message.value = "could not start re-verification"
+            return
+        }
+        viewModelScope.launch {
+            // busy while the service runs the verify; the pre-run Ready
+            // state passes through untouched
+            var seenVerifying = false
+            manager.state.collect { st ->
+                if (st is ToolchainState.Verifying) seenVerifying = true
+                if (seenVerifying && st !is ToolchainState.Verifying) _busy.value = false
+                // reverify with nothing installed short-circuits to
+                // NotInstalled without ever entering Verifying
+                if (st is ToolchainState.NotInstalled) _busy.value = false
+            }
         }
     }
 

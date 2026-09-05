@@ -26,7 +26,11 @@ class DepsViewModel(
     private val repo = container.projectRepository
     private val crates = container.cratesIoClient
 
-    val projectDir: File = File(container.projectsRoot, projectName)
+    /**
+     * [projectName] is a project REF (name for internal projects, absolute
+     * path for folders opened in place) — same resolution as the editor.
+     */
+    val projectDir: File = repo.resolve(projectName)
     private val manifest: File get() = File(projectDir, "Cargo.toml")
 
     private val _deps = MutableStateFlow<List<CargoToml.Dependency>>(emptyList())

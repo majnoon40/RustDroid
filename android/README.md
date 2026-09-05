@@ -120,17 +120,22 @@ filtered so tab loads don't mark files dirty; diagnostics tap-through jumps
 via `setSelection(line, col, makeVisible)`.
 
 The file drawer is a Material3 `ModalNavigationDrawer` with
-`gesturesEnabled = false` — deliberate, not an oversight. The editor is an
-Android View behind `AndroidView` interop, so it scrolls and long-press
-selects inside the View system and never consumes pointer events in
-Compose's gesture pipeline. With drawer gestures on, M3's
-`anchoredDraggable` watches the same pointer stream over the content area
-and (a) steals a long-press once the finger drifts past touch slop —
-cancelling the editor mid-hold, so text selection never fires — and (b)
-reads scroll/fling motion as a horizontal drag, popping the drawer open
-while scrolling long files. Compose-native scrollables consume their
-deltas first, so only interop children are exposed. The drawer opens via
-the toolbar folder button; the scrim tap still closes it.
+`gesturesEnabled = drawerState.targetValue == Open` — gestures on only
+while the drawer is open. The editor is an Android View behind
+`AndroidView` interop, so it scrolls and long-press selects inside the
+View system and never consumes pointer events in Compose's gesture
+pipeline. With gestures on while CLOSED, M3's `anchoredDraggable`
+watches the same pointer stream over the content area and (a) steals a
+long-press once the finger drifts past touch slop — cancelling the
+editor mid-hold, so text selection never fires — and (b) reads
+scroll/fling motion as a horizontal drag, popping the drawer open while
+scrolling long files (Compose-native scrollables consume their deltas
+first, so only interop children are exposed). While OPEN the sheet covers
+the editor — nothing interop sits under the gesture area — so a
+right-to-left swipe (off the sheet or the scrim) closes the drawer, and
+opening stays a deliberate act via the toolbar folder button so
+code-scrolling can never summon it. The tree refreshes on every drawer
+open and on editor re-entry, so externally-changed folders stay current.
 
 New files: the drawer header has a `+` button that creates an empty file
 at a project-relative path (`src/foo.rs`, `notes.md`), making parent
@@ -140,11 +145,37 @@ file opens in a tab immediately (covered by `FileCreateTest`).
 
 Opening .rs files from outside the app: `ACTION_VIEW` intent filters
 (`text/x-rust` MIME + `.*\.rs` pathPattern) make RustDroid appear in the
-file manager's "Open with" sheet. Imports land in a catch-all `imported`
-project (created without the toolchain — editing works before install;
-Run needs the toolchain). Names are sanitized to their basename, the
-charset is `[A-Za-z0-9._-]`, clashes get `-1`/`-2` suffixes, and
-`main.rs` imports replace the template stub (covered by `RsImportTest`).
+file manager's "Open with" sheet. A dialog then asks where the file goes:
+**create a new project** (user-named, scaffolded from a template WITHOUT
+the toolchain so editing works before install; Run needs the toolchain)
+or **add it to an existing project** (internal or opened-in-place). The
+name field defaults to `RsImport.suggestProjectName` (basename minus
+`.rs`, whitespace folded to `-`, cargo charset, letter forced up front:
+`2048.rs` → `rs2048`). Placed names are sanitized to their basename, the
+charset is `[A-Za-z0-9._-]`, clashes get `-1`/`-2` suffixes, and `main.rs`
+imports replace the template stub (covered by `RsImportTest`).
+
+**Folders as projects (open in place, never a copy):** the Home toolbar's
+folder-open button (also on the empty state) picks any folder on shared
+storage — Download, anywhere — via `ACTION_OPEN_DOCUMENT_TREE`. The tree
+URI is translated to the real path (`FolderLink` →
+`ProjectRepository.documentIdToPath`: `primary:Download/x` →
+`/storage/emulated/0/Download/x`, removable volumes too; cloud/USB picks
+are rejected with a clear message) and checked readable+writable.
+Folders without a `Cargo.toml` can be turned into a cargo project right
+there (`ensureCargoProject` writes `Cargo.toml` + `src/main.rs` only when
+missing — existing files are never overwritten) or opened for plain
+editing. The folder is remembered in `files/external-projects.txt` (one
+canonical path per line, pure JVM + `ExternalProjectsTest`), stays where
+the user put it, and every edit — new files, saves, `cargo` `target/`
+output — lands straight in it. "Remove" on an external card forgets it
+WITHOUT deleting anything (`ProjectRepository.delete` refuses registered
+external folders as a safety net). External projects navigate by
+absolute path (`Routes.editor` takes a ref: bare name or `/path`, both
+resolve in `ProjectRepository.resolve`); editing-before-install works for
+them too. Storage access rides the legacy model kept by targetSdk 28:
+one `WRITE_EXTERNAL_STORAGE` runtime grant, requested only when the user
+actually opens a folder.
 
 Screen real estate: the file tab strip is a custom 30dp row (M3 `Tab`
 enforces a 48dp minimum that ate a quarter of the screen on small
@@ -167,7 +198,15 @@ see Verifying?" watcher missed the case where the user backgrounds the
 app mid-verify: Compose recomposition pauses while stopped, every
 intermediate `Verifying` emission is conflated away, and on return the
 state jumps straight to `Ready` — so the transition was never observed.
-Failures stay on Settings (and re-route to the Gate).
+Even the tick counter alone wasn't enough: the run used to live in
+SettingsViewModel's `viewModelScope`, and a backgrounded process holding
+no foreground service simply gets killed — the verify coroutine died
+with it and the tick never incremented. The re-verify now runs inside
+`ToolchainInstallService` (`ACTION_REVERIFY`), the same foreground
+service installs use: the process (and the tick) survive backgrounding
+until the run completes, and the notification mirrors progress. Failures
+stay on Settings (and re-route to the Gate); the Settings-route pop is
+guarded on the current destination.
 
 ## Known v1 limits
 
@@ -184,7 +223,11 @@ Failures stay on Settings (and re-route to the Gate).
 
 ## F-Droid notes
 
-Buildable from source, no proprietary SDKs, single INTERNET permission,
-all dependencies Apache-2.0/LGPL-2.1/Public-Domain from Maven Central /
-Google Maven. sora-editor is LGPL-2.1 (dynamic linking via Maven AAR is
-fine for F-Droid; the license is shown in Settings → About).
+Buildable from source, no proprietary SDKs. Permissions are the minimum
+an on-device IDE needs: INTERNET (toolchain download + crates.io),
+foreground-service + POST_NOTIFICATIONS (install/re-verify survive
+backgrounding), WRITE_EXTERNAL_STORAGE (folders opened in place — one
+legacy-model runtime grant, targetSdk 28). All dependencies are
+Apache-2.0/LGPL-2.1/Public-Domain from Maven Central / Google Maven.
+sora-editor is LGPL-2.1 (dynamic linking via Maven AAR is fine for
+F-Droid; the license is shown in Settings → About).

@@ -29,6 +29,35 @@ object RdIcons {
         }
     }
 
+    /** Material "folder_open" — open folder flap (for open-folder-as-project). */
+    val FolderOpen: ImageVector by lazy {
+        materialIcon(name = "RdFolderOpen") {
+            materialPath {
+                // exact Material folder_open path data (Apache-2.0)
+                moveTo(20.0f, 6.0f)
+                horizontalLineToRelative(-8.0f)
+                lineToRelative(-2.0f, -2.0f)
+                horizontalLineTo(4.0f)
+                curveTo(2.9f, 4.0f, 2.01f, 4.9f, 2.01f, 6.0f)
+                lineTo(2.0f, 18.0f)
+                curveTo(2.0f, 19.1f, 2.9f, 20.0f, 4.0f, 20.0f)
+                horizontalLineToRelative(16.0f)
+                curveTo(21.1f, 20.0f, 22.0f, 19.1f, 22.0f, 18.0f)
+                verticalLineTo(8.0f)
+                curveTo(22.0f, 6.9f, 21.1f, 6.0f, 20.0f, 6.0f)
+                close()
+                moveTo(20.0f, 18.0f)
+                lineTo(4.0f, 18.0f)
+                lineTo(4.0f, 8.0f)
+                horizontalLineToRelative(5.17f)
+                lineToRelative(2.0f, 2.0f)
+                horizontalLineTo(20.0f)
+                verticalLineToRelative(8.0f)
+                close()
+            }
+        }
+    }
+
     val Stop: ImageVector by lazy {
         materialIcon(name = "RdStop") {
             materialPath {
