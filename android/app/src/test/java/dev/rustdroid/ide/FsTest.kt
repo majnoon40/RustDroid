@@ -25,6 +25,56 @@ class FsTest {
     }
 
     @Test
+    fun `atomic write creates a missing file and needs no delete window`() {
+        val f = File(tmp.root, "fresh.txt")
+        Fs.writeAtomic(f, "first")
+        assertEquals("first", f.readText())
+        // double-write: the replace path (REPLACE_EXISTING) never leaves a
+        // moment where the file is absent, and never leaves the tmp behind
+        Fs.writeAtomic(f, "second")
+        assertEquals("second", f.readText())
+        assertFalse(File(tmp.root, "fresh.txt.rdtmp").exists())
+    }
+
+    @Test
+    fun `atomic write replaces read-only targets where the fs allows`() {
+        val f = File(tmp.root, "locked.txt")
+        f.writeText("old")
+        Fs.writeAtomic(f, "new")
+        assertEquals("new", f.readText())
+        assertFalse(File(tmp.root, "locked.txt.rdtmp").exists())
+    }
+
+    @Test
+    fun `requireInside accepts real children and rejects escapes`() {
+        val root = tmp.newFolder("root")
+        Fs.requireInside(root, File(root, "bin/rustc")) // not yet existing: ok
+        Fs.requireInside(root, File(File(root, "a"), "b"))
+        try {
+            Fs.requireInside(root, File(tmp.root, "elsewhere"))
+            throw AssertionError("expected IOException")
+        } catch (e: IOException) {
+            assertTrue(e.message!!.contains("escapes"))
+        }
+    }
+
+    @Test
+    fun `requireInside catches writes routed through a symlink escape`() {
+        val root = tmp.newFolder("symlink-root")
+        val outside = tmp.newFolder("outside")
+        val link = File(root, "jailbreak")
+        java.nio.file.Files.createSymbolicLink(link.toPath(), outside.toPath())
+        // resolveChild passes (name is lexical), requireInside must not
+        val dest = Fs.resolveChild(root, "jailbreak/payload.rs")
+        try {
+            Fs.requireInside(root, dest)
+            throw AssertionError("expected IOException")
+        } catch (e: IOException) {
+            // the guard that stops symlink-based archive escapes
+        }
+    }
+
+    @Test
     fun `resolveChild rejects traversal`() {
         val root = tmp.newFolder()
         try {

@@ -113,9 +113,12 @@ object ProcEnv {
         assetProvider: (() -> ByteArray?)? = null,
         caBundle: File? = CaBundle.ensure(filesDir, prefix, assetProvider = assetProvider),
         insecureTlsOk: Boolean = false,
-        /** Non-null adds CARGO_TARGET_DIR — the noexec-storage workaround
-         *  for external projects (see [redirectedTargetDir]). */
         cargoTargetDir: File? = null,
+        /** Opt-in libcurl verbose tracing (CARGO_HTTP_DEBUG) for TLS hunts.
+         *  Off by default: the error-77 root cause is fixed (openssl no-stdio
+         *  patch), and verbose mode floods both cargo's stderr and the
+         *  console. Pass true only while actively debugging TLS setup. */
+        httpDebug: Boolean = false,
     ): Map<String, String> {
         ensureDirs(filesDir)
         return buildMap {
@@ -146,12 +149,13 @@ object ProcEnv {
             }
             // deliberately NO SSL_CERT_DIR here — see the doc comment above
 
-            // Diagnostic build: cargo forwards this to libcurl's
-            // CURLOPT_VERBOSE, so TLS setup failures print their exact
-            // cause (and successes print "certificate verify locations
-            // .. ok") into the console. Remove once the error-77 hunt
-            // is over.
-            put("CARGO_HTTP_DEBUG", "true")
+            // Opt-in libcurl verbose tracing (CURLOPT_VERBOSE) for TLS
+            // hunts — see the httpDebug parameter. The error-77 hunt is
+            // over (openssl no-stdio was the root cause); default off so
+            // cargo output stays readable and the console stays cheap.
+            if (httpDebug) {
+                put("CARGO_HTTP_DEBUG", "true")
+            }
 
             if (insecureTlsOk ||
                 File(homeDir(filesDir), INSECURE_TLS_MARKER_HOME).isFile

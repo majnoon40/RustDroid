@@ -8,12 +8,29 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Ring buffer of console output + live line feed. VMs expose this to the UI;
  * the console panel renders the buffer tail and appends on flow emissions.
+ *
+ * Performance contract: append() is O(1) (ArrayDeque, no per-line list
+ * copy). The [lines] StateFlow is republished at most once per
+ * [publishIntervalMs] — a verbose cargo build emits hundreds of lines per
+ * second, and publishing a 2000-element snapshot per line (the old
+ * `subList + copy` design) was the top source of build-time jank. Bursts
+ * land in the deque immediately and become visible on the next publish
+ * window; [flush] forces them out (call it when a run ends, and every
+ * [system] message publishes at once — user-facing status lines must never
+ * wait behind a rate limit).
  */
-class ConsoleBuffer(private val capacity: Int = 2000) {
+class ConsoleBuffer(
+    private val capacity: Int = 2000,
+    private val publishIntervalMs: Long = 100,
+) {
+
+    private val lock = Any()
+    private val deque = ArrayDeque<ConsoleLine>()
 
     private val _lines = MutableStateFlow<List<ConsoleLine>>(emptyList())
     val lines: StateFlow<List<ConsoleLine>> = _lines.asStateFlow()
@@ -21,26 +38,60 @@ class ConsoleBuffer(private val capacity: Int = 2000) {
     private val _newLines = MutableSharedFlow<ConsoleLine>(extraBufferCapacity = 256)
     val newLines: SharedFlow<ConsoleLine> = _newLines.asSharedFlow()
 
-    @Volatile var droppedOverflow: Int = 0
-        private set
+    private val dropped = AtomicInteger()
+    val droppedOverflow: Int get() = dropped.get()
+
+    /** True when the deque holds changes not yet in [lines]. */
+    private var dirty = false
+    private var lastPublishMs = 0L
 
     fun append(line: ConsoleLine) {
         _newLines.tryEmit(line)
-        val cur = _lines.value
-        val next = if (cur.size >= capacity) {
-            droppedOverflow++
-            cur.subList(cur.size - capacity + 1, cur.size) + line
-        } else {
-            cur + line
+        synchronized(lock) {
+            if (deque.size >= capacity) {
+                deque.removeFirst()
+                dropped.incrementAndGet()
+            }
+            deque.addLast(line)
+            dirty = true
         }
-        _lines.value = next
+        maybePublish()
     }
 
-    fun system(text: String) = append(ConsoleLine(Stream.SYSTEM, text))
+    /** Status/system lines are rare and important — always visible at once. */
+    fun system(text: String) {
+        append(ConsoleLine(Stream.SYSTEM, text))
+        flush()
+    }
+
+    /** Publishes pending lines if the rate-limit window has elapsed. */
+    private fun maybePublish() {
+        val now = System.currentTimeMillis()
+        if (now - lastPublishMs < publishIntervalMs) return
+        publish()
+    }
+
+    /** Publishes the current deque snapshot regardless of the rate limit. */
+    fun flush() {
+        publish()
+    }
+
+    private fun publish() {
+        synchronized(lock) {
+            if (!dirty) return
+            _lines.value = deque.toList()
+            dirty = false
+            lastPublishMs = System.currentTimeMillis()
+        }
+    }
 
     fun clear() {
-        droppedOverflow = 0
-        _lines.value = emptyList()
+        synchronized(lock) {
+            deque.clear()
+            dirty = true
+        }
+        dropped.set(0)
+        publish()
     }
 }
 

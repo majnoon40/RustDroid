@@ -46,8 +46,8 @@ class ToolchainManager(
     val verifyPassTick: StateFlow<Long> = _verifyPassTick.asStateFlow()
 
     private val mutex = Mutex()
-    private val uiScope = kotlinx.coroutines.CoroutineScope(
-        kotlinx.coroutines.SupervisorJob() + Dispatchers.Main
+    private val defaultScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + Dispatchers.Default
     )
 
     private val downloader = ArtifactDownloader(http)
@@ -62,7 +62,7 @@ class ToolchainManager(
         // so backfill config.toml CA trust + warm the bundle once at startup.
         // Idempotent and IO-dispatched; skips entirely when not installed.
         if (_state.value is ToolchainState.Ready) {
-            uiScope.launch { writeCargoDefaults() }
+            defaultScope.launch { writeCargoDefaults() }
         }
     }
 
@@ -100,6 +100,10 @@ class ToolchainManager(
     /** Install path A: download the pinned bundle from the GitHub release. */
     suspend fun installFromNetwork() =
         installWith { zip ->
+            // preflight BEFORE any network I/O: the download plus the
+            // extracted prefix must fit (one check — install bytes covers
+            // the zip + extraction with headroom)
+            requireFreeSpace(ToolchainDistro.EXPECTED_INSTALLED_BYTES, "toolchain install")
             _state.value = ToolchainState.Downloading(0, ToolchainDistro.expectedSizeBytes)
             withContext(Dispatchers.IO) {
                 downloader.downloadBlocking(
@@ -129,12 +133,17 @@ class ToolchainManager(
                     tmp.outputStream().use { output ->
                         val buf = ByteArray(64 * 1024)
                         var copied = 0L
+                        var lastReport = 0L
                         while (true) {
                             val n = input.read(buf)
                             if (n < 0) break
                             output.write(buf, 0, n)
                             copied += n
-                            if (copied % (4 * 1024 * 1024) == 0L) {
+                            // threshold, NOT modulo: SAF streams return short
+                            // counts, after which a modulo never fires again
+                            // and progress looks hung for the rest of the copy
+                            if (copied - lastReport >= 4L * 1024 * 1024) {
+                                lastReport = copied
                                 _state.value = ToolchainState.Downloading(copied, null)
                             }
                         }
@@ -149,24 +158,43 @@ class ToolchainManager(
 
     private suspend fun installWith(fetch: suspend (File) -> File) = mutex.withLock {
         try {
-            if (paths.isInstalled()) {
-                uninstallLocked()
-            }
             paths.ensureDirs()
             ProcEnv.ensureDirs(context.filesDir)
 
+            // 1) Fetch the whole bundle to the cache FIRST. The old flow
+            //    uninstalled the working prefix BEFORE the download, so any
+            //    fetch failure — no network, retries exhausted, storage
+            //    full mid-download, cancel — left the user with NO
+            //    toolchain, having started from a fully working one. Now
+            //    the prefix is only touched after the new bundle is
+            //    completely on disk.
             val zip = fetch(paths.bundleZip)
 
-            // Extract
+            // 2) Free-space preflight for extraction (re-checked here: the
+            //    download just consumed space; usableSpace reflects that).
+            requireFreeSpace(ToolchainDistro.EXPECTED_INSTALLED_BYTES, "toolchain extraction")
+
+            // 3) Extract into a STAGING dir and swap into place — a failed
+            //    or interrupted extraction must never leave a half-written
+            //    prefix either. The swap restores the old install if the
+            //    final move fails.
             _state.value = ToolchainState.Extracting(0, null)
+            val staging = File(context.filesDir, "usr.new")
             withContext(Dispatchers.IO) {
-                val info = extractor.install(zip) { done, total ->
-                    _state.value = ToolchainState.Extracting(done, total)
+                Fs.deleteRecursively(staging)
+                try {
+                    val info = extractor.install(zip, staging) { done, total ->
+                        _state.value = ToolchainState.Extracting(done, total)
+                    }
+                    ToolchainSwap.swap(paths.prefix, staging, File(context.filesDir, "usr.old"))
+                    log("toolchain ${info.rustVersion} installed (kit files: ${info.kitEntryCount})")
+                } finally {
+                    // staging is gone (swapped) or failed — never keep it
+                    Fs.deleteRecursively(staging)
                 }
-                log("toolchain ${info.rustVersion} installed (kit files: ${info.kitEntryCount})")
             }
 
-            // Verify — the smoke test is the gate
+            // 4) Verify — the smoke test is the gate
             runVerifyLocked()
 
             // Clean the 100+ MB zip: prefix is self-contained now
@@ -183,8 +211,16 @@ class ToolchainManager(
         }
     }
 
-    private fun ToolchainToolchainProgress(done: Int, total: Int?): ToolchainState =
-        ToolchainState.Extracting(done, total)
+    /** Refuses to start a multi-hundred-MB operation that cannot fit. */
+    private fun requireFreeSpace(requiredBytes: Long, what: String) {
+        val usable = context.filesDir.usableSpace
+        if (usable < requiredBytes) {
+            throw java.io.IOException(
+                "not enough free space for the $what: " +
+                    "need ~${Fs.humanBytes(requiredBytes)}, only ${Fs.humanBytes(usable)} available",
+            )
+        }
+    }
 
     /** Re-run the full health check (Settings button, or after import). */
     suspend fun reverify() = mutex.withLock {
@@ -233,8 +269,14 @@ class ToolchainManager(
         }
     }
 
-    fun uninstall() {
-        kotlinx.coroutines.runBlocking { mutex.withLock { uninstallLocked() } }
+    /**
+     * Removes the toolchain. Suspends and dispatches to IO: the delete of
+     * a ~500 MB prefix takes seconds, and the old runBlocking wrapper
+     * called from a click handler could ANR while waiting on the mutex
+     * behind a running install/verify.
+     */
+    suspend fun uninstall() = withContext(Dispatchers.IO) {
+        mutex.withLock { uninstallLocked() }
     }
 
     private fun uninstallLocked() {
@@ -326,7 +368,7 @@ class ToolchainManager(
 
     /** Convenience: [uri] content import via SAF (fire-and-forget from UI). */
     fun launchImport(uri: Uri) {
-        uiScope.launch { installFromUri(uri) }
+        defaultScope.launch { installFromUri(uri) }
     }
 
     suspend fun installFromUri(uri: Uri): Boolean {

@@ -14,9 +14,12 @@ cd android
 adb install app/build/outputs/apk/debug/app-debug.apk
 ```
 
-No local SDK? The **Android app** GitHub Actions workflow builds the debug
-APK on every push touching `android/` (and on manual dispatch): grab
-`rustdroid-debug-apk` from the run's artifacts page.
+No local SDK? The **Android app** GitHub Actions workflow builds both the
+debug AND release APKs on every push touching `android/` (and on manual
+dispatch): grab `rustdroid-debug-apk` / `rustdroid-release-apk` from the
+run's artifacts page. Release builds run lint-vital; the one Play-policy
+check that trips (`ExpiredTargetSdkVersion`) is disabled with a comment —
+targetSdk 28 is the whole point (see below).
 
 First launch downloads the toolchain bundle (~117 MB) from the project's
 GitHub release and verifies it (12 checks, incl. compiling and running a test
@@ -117,6 +120,42 @@ each check live; any failure blocks entry with an actionable message.
 bundle. Bump together with the release tag when a new toolchain ships.
 `publish-release.yml` (repo root `.github/`) builds the bundle from a
 completed CI run and records checksums in the release.
+
+### Install pipeline: failures never cost the working install
+
+The install order is fetch-first: the bundle (download or SAF import) is
+spooled COMPLETELY to cache before the prefix is touched, extraction runs
+into a staging dir (`files/usr.new`), and only a fully extracted tree is
+swapped in (`ToolchainSwap`: prefix → `usr.old` → staging → prefix →
+delete `usr.old`, restoring the old install if the final move fails). The
+old flow uninstalled before downloading, so a dead network mid-download
+left the user with no toolchain at all; a failed extraction now costs
+nothing but the cache zip. Free-space preflights (`EXPECTED_INSTALLED_
+BYTES`) run before the download and again before extraction, so a full
+disk produces a clear "not enough free space" failure instead of a
+mid-extraction ENOSPC stranding a partial prefix. Import progress uses a
+threshold (not modulo) after the first short SAF read — modulo never
+fires again and progress looks hung.
+
+Download resume is validated: the first response's ETag + total size are
+kept in a `<file>.part.meta` sidecar and resumes send `If-Range`. A
+changed asset answers 200 (or a 206 whose total no longer matches) — both
+cases discard the stale partial and restart cleanly in the same attempt,
+instead of appending new bytes onto the old prefix and failing the
+checksum four times. The resume re-hash reports progress so the
+multi-second pause reads as work, not a hang.
+
+Extraction is two-pass for link entries: hardlinks and symlinks are
+collected during the streaming pass and resolved after every regular
+file exists — tar makes no ordering guarantee, and resolving early
+silently produced missing files. Unresolvable targets now fail the
+install loud. Symlink targets are proven to stay inside the prefix, and
+every write is canonical-containment-checked (`Fs.requireInside`) — a
+symlink in an imported (not checksum-pinned) zip can no longer route
+writes out of the prefix. `Fs.writeAtomic` uses NIO
+`ATOMIC_MOVE|REPLACE_EXISTING` (a single `rename(2)`): the old
+delete-then-rename had a crash window that could lose the previous
+content of a user source file.
 
 ## Editor
 
@@ -229,6 +268,28 @@ through `AndroidView.update`), IME visibility via
 with edge-to-edge, `adjustResize` in the manifest is neutralized
 (decorFitsSystemWindows=false), so IME insets must be applied manually.
 
+Console performance: `ConsoleBuffer` is an `ArrayDeque` with O(1)
+appends; the `lines` StateFlow snapshot is republished at most every
+100 ms (bursts land in the deque instantly, `flush()` forces them out —
+called on run end and by every system/status line, which also bypass
+the rate limit so warnings are never delayed). The old design copied
+the whole 2000-line list per appended line — with cargo's line rates
+that was the top source of build-time jank. Stopping a build now kills
+the whole process tree: cargo's pid is extracted from the `Process`
+object, `/proc` is walked for descendants (`ProcTree`, pure JVM,
+synthetic-/proc tested), and each gets SIGKILL via
+`android.os.Process.sendSignal` — `Process.destroy()` alone left rustc
+and ld.lld running as orphans, burning CPU and battery until they
+finished on their own. The base OkHttp client now carries an
+API-sized 60 s `callTimeout` (bulk transfers opt out explicitly, as
+`ArtifactDownloader` does with 0); the old shared 5-minute budget was
+a trap for any future large-body caller. The insecure-TLS escape
+hatch, when active, prints a warning line into the console at the
+start of every affected run — a silent certificate-verification
+bypass is never OK. `CARGO_HTTP_DEBUG` (libcurl verbose tracing) is
+opt-in via `ProcEnv.env(httpDebug = …)` and off by default — the
+error-77 hunt is over (root cause: openssl `no-stdio`).
+
 Settings "Re-verify health" returns to Home when the (minutes-long)
 verification passes — driven by `ToolchainManager.verifyPassTick`, a
 monotonic counter that survives StateFlow conflation. The naive "did I
@@ -258,6 +319,14 @@ guarded on the current destination.
 - cargo builds run in-process (user-watched); backgrounding mid-build can
   be killed by the OS — incremental cache softens restarts.
 - One build per project at a time (by design; `cargo` locks target/ anyway).
+- Build cancellation kills the process tree by walking /proc and
+  SIGKILLing descendants (best effort — a pid-extraction failure degrades
+  to signalling only the direct child, and orphaned grandchildren that
+  spawn between the scan and the signal can slip through).
+- No instrumented test tier yet: nothing in CI runs on a device/emulator,
+  so the exec-from-app-data premise is validated only manually. The
+  real-bundle extraction test skips loudly (console prints a warning)
+  when `rd.bundle` is unset — green must not masquerade as covered.
 
 ## F-Droid notes
 

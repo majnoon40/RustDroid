@@ -20,8 +20,17 @@ import java.util.concurrent.TimeUnit
  * line events, supports stdin send and cooperative cancellation
  * (destroy -> grace -> destroyForcibly). Cleanup runs before rethrowing
  * cancellation, so state stays consistent under structured concurrency.
+ *
+ * Cancellation kills the WHOLE process tree, not just the direct child:
+ * [signal] (injected; Android wires it to android.os.Process.sendSignal)
+ * SIGKILLs every descendant found via [ProcTree] — Java's ProcessBuilder
+ * creates no process group, so process.destroy() alone leaves cargo's
+ * rustc/ld.lld children running as orphans, burning CPU and battery.
  */
-class CargoRunner {
+class CargoRunner(
+    /** Raw-pid signal sender. Default: no-op (pure JVM tests). */
+    private val signal: (pid: Long, sig: Int) -> Unit = { _, _ -> },
+) {
 
     /**
      * Runs [command] in [cwd] with [env]; calls [onLine] per output line.
@@ -95,13 +104,38 @@ class CargoRunner {
     }
 
     private fun kill(process: Process) {
-        process.destroy()
+        val pid = pidOf(process)
+        if (pid != null) {
+            // parent first: it cannot spawn replacements once dead, then
+            // sweep the orphaned descendants (rustc, ld.lld, build scripts)
+            process.destroy()
+            ProcTree.descendantPids(File("/proc"), pid).forEach { signal(it, 9) }
+        } else {
+            process.destroy()
+        }
         try {
             if (process.isAlive) process.waitFor(2, TimeUnit.SECONDS)
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
         }
         if (process.isAlive) process.destroyForcibly()
+    }
+
+    /**
+     * Best-effort pid of a [Process]: public `pid()` method (Java 9+ /
+     * newer Android) first, then the private `pid` field (Android's
+     * ProcessManager$ProcessImpl). Null when both fail.
+     */
+    private fun pidOf(process: Process): Long? {
+        runCatching {
+            val v = process.javaClass.getMethod("pid").invoke(process) as? Number
+            if (v != null) return v.toLong()
+        }
+        return runCatching {
+            val f = process.javaClass.getDeclaredField("pid")
+            f.isAccessible = true
+            (f.get(process) as? Number)?.toLong()
+        }.getOrNull()
     }
 
     /** Runs a short probe (e.g. `rustc --version`) and returns its stdout. */

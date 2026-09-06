@@ -82,16 +82,33 @@ class ProjectRepository(
         )
     }
 
+    /**
+     * Bounded "last modified" for the Home sort key. Skips target/ (tens of
+     * thousands of build artifacts that never indicate user edits — a built
+     * project turned the Home listing from instant into seconds), .git/ and
+     * hidden dirs; caps depth; and tracks visited canonical paths so a
+     * symlink loop inside a project cannot recurse forever.
+     */
     private fun latestMtime(root: File): Long {
-        var latest = root.lastModified()
-        root.listFiles()?.forEach { child ->
-            if (child.isDirectory) {
-                latest = maxOf(latest, latestMtime(child))
-            } else {
-                latest = maxOf(latest, child.lastModified())
+        val visited = HashSet<String>()
+        fun walk(dir: File, depth: Int): Long {
+            val canonical = dir.canonicalPath
+            if (!visited.add(canonical)) return dir.lastModified()
+            var latest = dir.lastModified()
+            if (depth >= 8) return latest
+            val children = dir.listFiles() ?: return latest
+            for (child in children) {
+                if (child.isDirectory) {
+                    val n = child.name
+                    if (n == "target" || n == ".git" || n.startsWith(".")) continue
+                    latest = maxOf(latest, walk(child, depth + 1))
+                } else {
+                    latest = maxOf(latest, child.lastModified())
+                }
             }
+            return latest
         }
-        return latest
+        return walk(root, 0)
     }
 
     // ---- external folders (open in place, never copy) ----

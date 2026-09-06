@@ -164,4 +164,19 @@ class ProcEnvTest {
         val redirected = ProcEnv.env(prefix, files, caBundle = null, cargoTargetDir = redirect)
         assertEquals(redirect!!.absolutePath, redirected["CARGO_TARGET_DIR"])
     }
+
+    @Test
+    fun `cargo http debug is opt-in and off by default`() {
+        val prefix = tmp.newFolder("usr-httpdebug")
+        val files = tmp.newFolder("files-httpdebug")
+
+        // default: absent — the error-77 hunt is over, verbose libcurl
+        // tracing must not flood shipping builds
+        val plain = ProcEnv.env(prefix, files, caBundle = null)
+        assertNull(plain["CARGO_HTTP_DEBUG"])
+
+        // explicit opt-in (TLS debugging sessions)
+        val debug = ProcEnv.env(prefix, files, caBundle = null, httpDebug = true)
+        assertEquals("true", debug["CARGO_HTTP_DEBUG"])
+    }
 }

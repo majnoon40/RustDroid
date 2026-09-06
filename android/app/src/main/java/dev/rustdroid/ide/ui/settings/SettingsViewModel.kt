@@ -94,7 +94,10 @@ class SettingsViewModel(val container: AppContainer) : ViewModel() {
     fun uninstall() {
         viewModelScope.launch {
             _busy.value = true
-            withContext(Dispatchers.IO) { manager.uninstall() }
+            // manager.uninstall() is suspend + IO-dispatched itself; the
+            // mutex it takes may be held by an install/re-verify for
+            // minutes, so this must never block the main thread
+            manager.uninstall()
             _busy.value = false
         }
     }

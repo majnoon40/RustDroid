@@ -391,6 +391,15 @@ class EditorViewModel(
                 // escape-hatch marker check happen off the main thread and
                 // reflect the state at the moment of invocation
                 val runEnv = withContext(Dispatchers.IO) { buildEnv() }
+                // the insecure-TLS escape hatch is a global, persistent
+                // footgun — never let it run silently
+                if (runEnv["CARGO_HTTP_DANGER_ACCEPT_INVALID_CERTS"] == "true") {
+                    console.system(
+                        "warning: TLS certificate verification is DISABLED " +
+                            "(insecure-tls marker present) — cargo will accept " +
+                            "invalid certificates; delete the marker to re-enable",
+                    )
+                }
                 // external folder: build output runs from app storage
                 // because shared storage is noexec — say so once per run,
                 // right where "Permission denied (os error 13)" used to be
@@ -413,6 +422,9 @@ class EditorViewModel(
                     },
                 )
                 _lastResult.value = result
+                // publish any lines still sitting in the rate-limited batch
+                // BEFORE scanning them for TLS failure signatures
+                console.flush()
                 // libcurl 77/60 = TLS trust store could not be loaded — bare
                 // curl codes confuse users; surface an actionable hint.
                 if (!result.cancelled && result.exitCode != 0 &&
@@ -432,6 +444,8 @@ class EditorViewModel(
                 console.system("(terminated)")
             } finally {
                 _running.value = false
+                // rate-limited batches are published here at the latest
+                console.flush()
             }
         }
     }

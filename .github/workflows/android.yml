@@ -59,9 +59,22 @@ jobs:
       - name: Assemble debug APK
         run: ./gradlew :app:assembleDebug --console=plain
 
+      # Release config is validated too: with minify disabled the proguard
+      # files are inert, but signing/manifest/packaging differences between
+      # build types have broken release-only builds before.
+      - name: Assemble release APK
+        run: ./gradlew :app:assembleRelease --console=plain
+
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
           name: rustdroid-debug-apk
           path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdroid-release-apk
+          path: android/app/build/outputs/apk/release/*.apk
           if-no-files-found: error

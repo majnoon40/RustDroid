@@ -2,22 +2,59 @@ package dev.rustdroid.ide.util
 
 import java.io.File
 import java.io.IOException
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 
 /** Filesystem helpers shared across layers. Pure JVM — unit-testable. */
 object Fs {
 
-    /** Atomic-ish write: write to sibling temp file, then rename over target. */
+    /**
+     * Atomic-ish write: write to sibling temp file, then atomically rename
+     * over the target.
+     *
+     * The rename uses NIO `ATOMIC_MOVE | REPLACE_EXISTING`, which on POSIX
+     * (Android included, same filesystem) is a single `rename(2)` — the
+     * replace has no window in which the target is missing, so a crash
+     * mid-write can never lose the previous content (user source files!).
+     * The historical delete-then-rename had exactly that window. If the
+     * filesystem refuses atomic moves, fall back to a plain move, then to
+     * the legacy two-step as a last resort.
+     */
     @Throws(IOException::class)
     fun writeAtomic(file: File, content: String) {
         val tmp = File(file.parentFile, file.name + ".rdtmp")
-        tmp.writeText(content)
-        if (file.exists() && !file.delete()) {
-            tmp.delete()
-            throw IOException("cannot replace ${file.path}")
-        }
-        if (!tmp.renameTo(file)) {
-            tmp.delete()
-            throw IOException("rename failed for ${file.path}")
+        try {
+            tmp.writeText(content)
+            try {
+                Files.move(
+                    tmp.toPath(), file.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE,
+                )
+                return
+            } catch (_: AtomicMoveNotSupportedException) {
+                // same-FS plain move still replaces without a missing window
+                // on POSIX; try it before the legacy path
+            }
+            try {
+                Files.move(
+                    tmp.toPath(), file.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
+                return
+            } catch (_: IOException) {
+                // fall through to legacy two-step
+            }
+            if (file.exists() && !file.delete()) {
+                throw IOException("cannot replace ${file.path}")
+            }
+            if (!tmp.renameTo(file)) {
+                throw IOException("rename failed for ${file.path}")
+            }
+        } finally {
+            // any path that did not consume the tmp file cleans it up
+            if (tmp.exists()) tmp.delete()
         }
     }
 
@@ -41,7 +78,15 @@ object Fs {
         return total
     }
 
-    /** chmod-style: apply execute bit set when [mode] owner-exec bit is set. */
+    /**
+     * chmod-style: apply execute bit set when [mode] owner-exec bit is set.
+     *
+     * Deliberate simplification: owner/group/other are not distinguished
+     * (every bit is applied to "all users"), so a tar mode of 0640 lands as
+     * effectively 0644. Harmless inside the app's single-UID sandbox — the
+     * exec and read bits are what the toolchain actually needs. Do not use
+     * where group/other fidelity matters.
+     */
     fun applyPosixMode(file: File, mode: Int) {
         val exec = (mode and 0b001_000_000) != 0
         file.setReadable(mode and 0b100_000_000 != 0, false)
@@ -62,7 +107,12 @@ object Fs {
         return "%.2f GB".format(mb / 1024.0)
     }
 
-    /** Safe entry-name resolution: rejects absolute paths and '..' traversal. */
+    /** Safe entry-name resolution: rejects absolute paths and '..' traversal.
+     *
+     * LEXICAL check only — a symlink created inside the root can still route
+     * a write outside it (see ArtifactExtractor's canonical containment
+     * guard for the toolchain-import trust boundary; user projects are the
+     * user's own trust domain). */
     @Throws(IOException::class)
     fun resolveChild(root: File, name: String): File {
         if (name.isEmpty() || name.startsWith("/") || name.startsWith("\\")) {
@@ -73,5 +123,20 @@ object Fs {
         var f = root
         for (p in parts) f = File(f, p)
         return f
+    }
+
+    /**
+     * Canonical containment: [dest] (which may not exist yet) must resolve
+     * inside [root] after following any symlinks in its EXISTING ancestors.
+     * The guard that actually stops symlink-based escape during archive
+     * extraction — [resolveChild] alone cannot see symlinks.
+     */
+    @Throws(IOException::class)
+    fun requireInside(root: File, dest: File) {
+        val rootPath = root.canonicalFile.toPath()
+        val destPath = dest.canonicalFile.toPath()
+        if (destPath != rootPath && !destPath.startsWith(rootPath)) {
+            throw IOException("path escapes ${root.path}: ${dest.path}")
+        }
     }
 }

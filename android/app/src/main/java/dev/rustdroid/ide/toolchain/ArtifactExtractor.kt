@@ -12,9 +12,11 @@ import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import java.nio.file.Files
+import java.nio.file.Paths
 
 /**
- * Installs the app bundle zip into $PREFIX. The validated Phase-1 recipe:
+ * Installs the app bundle zip into a prefix directory. The validated
+ * Phase-1 recipe:
  *
  *   tarballs (rustc/cargo/rust-std) -> strip <tarball>/<component>/ dirs
  *                                       into the prefix (modes preserved)
@@ -22,8 +24,23 @@ import java.nio.file.Files
  *   rustdroid-link contents          -> $PREFIX/lib/rustdroid-link/
  *   rustdroid-link/bin/{cc,clang,gcc}-> $PREFIX/bin/ (chmod 755)
  *
- * Single streaming pass (zip -> tar.xz -> files), zip-slip guarded,
- * fails loud on layout drift. Pure JVM — unit-tested.
+ * The destination is parameterized ([destRoot], default [ToolchainPaths.prefix])
+ * so ToolchainManager can extract into a staging dir and swap it in — a
+ * failed extraction must never leave a half-replaced prefix.
+ *
+ * Security envelope (the bundle zip is a trust boundary — it can arrive
+ * via "Import zip" instead of the checksum-pinned download):
+ *  - every entry path goes through [Fs.resolveChild] (zip-slip: no `..`,
+ *    no absolute) AND [Fs.requireInside] (canonical containment — catches
+ *    writes routed through an in-archive symlink out of the root);
+ *  - tar symlink targets are validated to stay inside the prefix BEFORE
+ *    the link is created — no absolute or `..` escapes;
+ *  - hardlink/symlink entries are resolved in a SECOND pass after all
+ *    regular files exist, and an unresolvable target is a hard failure —
+ *    never a silently missing file, never an empty-file placeholder.
+ *
+ * Single streaming pass over the archive data (links deferred), fails loud
+ * on layout drift. Pure JVM — unit-tested.
  */
 class ArtifactExtractor(
     private val paths: ToolchainPaths,
@@ -35,9 +52,21 @@ class ArtifactExtractor(
         val kitEntryCount: Int,
     )
 
+    /** A link entry deferred to the post-pass: (dest, linkName, mode, hard?). */
+    private data class PendingLink(
+        val dest: File,
+        val linkName: String,
+        val mode: Int,
+        val isHard: Boolean,
+    )
+
     /** Progress callback: (filesWritten, estimatedTotal or null). */
-    fun install(zip: File, onProgress: (Int, Int?) -> Unit = { _, _ -> }): BundleManifestData {
-        val prefix = paths.prefix
+    fun install(
+        zip: File,
+        destRoot: File = paths.prefix,
+        onProgress: (Int, Int?) -> Unit = { _, _ -> },
+    ): BundleManifestData {
+        val prefix = destRoot
         prefix.mkdirs()
 
         var manifest: dev.rustdroid.ide.model.BundleManifest? = null
@@ -76,6 +105,7 @@ class ArtifactExtractor(
                         val rel = name.removePrefix("rustdroid-link/").trimEnd('/')
                         if (rel.isNotEmpty()) {
                             val dest = Fs.resolveChild(kitDest, rel)
+                            Fs.requireInside(prefix, dest)
                             if (entry.isDirectory) {
                                 dest.mkdirs()
                             } else {
@@ -139,6 +169,12 @@ class ArtifactExtractor(
      * `<topdir>/<component>/rest...`. We strip the two leading segments
      * (install.sh & friends at depth 1 are dropped automatically) and
      * preserve tar mode bits.
+     *
+     * Link entries (hard + symbolic) are DEFERRED to a second pass over
+     * [links]: tar makes no ordering guarantee that a hardlink's target
+     * has already been extracted, and resolving early silently produced
+     * empty/missing files in the past. Deferred resolution is exact and
+     * hard-fails on unresolvable targets.
      */
     private fun extractTarball(input: InputStream, prefix: File, label: String) {
         val tar = TarArchiveInputStream(
@@ -146,6 +182,7 @@ class ArtifactExtractor(
         )
         var top: String? = null
         var entries = 0
+        val links = ArrayList<PendingLink>()
         while (true) {
             val e: TarArchiveEntry = tar.nextTarEntry ?: break
             val name = e.name.trimEnd('/')
@@ -161,27 +198,94 @@ class ArtifactExtractor(
             val rel = segments.drop(2).joinToString("/")
             val dest = Fs.resolveChild(prefix, rel)
             if (e.isDirectory) {
+                Fs.requireInside(prefix, dest)
                 dest.mkdirs()
             } else if (e.isLink) {
                 dest.parentFile?.mkdirs()
-                val target = Fs.resolveChild(prefix, e.linkName.trimStart('/'))
-                if (target.isFile) target.copyTo(dest, overwrite = true)
-                Fs.applyPosixMode(dest, e.mode)
+                links += PendingLink(dest, e.linkName, e.mode, isHard = true)
             } else if (e.isSymbolicLink) {
                 dest.parentFile?.mkdirs()
-                val ok = runCatching {
-                    Files.deleteIfExists(dest.toPath())
-                    Files.createSymbolicLink(dest.toPath(), java.nio.file.Paths.get(e.linkName))
-                }
-                if (ok.isFailure) dest.writeText("")
+                links += PendingLink(dest, e.linkName, e.mode, isHard = false)
             } else {
+                Fs.requireInside(prefix, dest)
                 dest.parentFile?.mkdirs()
                 tar.copyToFile(dest)
                 Fs.applyPosixMode(dest, e.mode)
             }
             entries++
         }
+        for (link in links) {
+            resolveLink(prefix, link, label)
+        }
         if (entries == 0) throw IOException("$label: no payload entries found")
+    }
+
+    /**
+     * Resolves one deferred link entry. Hardlinks copy the target's bytes
+     * (the app sandbox has no cross-file hardlink requirement and copies
+     * sidestep ordering entirely); symlinks are created after their target
+     * is proven to stay inside the prefix.
+     */
+    private fun resolveLink(prefix: File, link: PendingLink, label: String) {
+        if (link.isHard) {
+            val target = hardlinkTarget(prefix, link.linkName)
+                ?: throw IOException(
+                    "$label: hardlink '${link.dest.relativeTo(prefix).path}' -> " +
+                        "'${link.linkName}': target not extracted — corrupt archive",
+                )
+            if (!target.isFile) {
+                throw IOException(
+                    "$label: hardlink target '${link.linkName}' is not a regular file",
+                )
+            }
+            target.copyTo(link.dest, overwrite = true)
+            Fs.applyPosixMode(link.dest, link.mode)
+            return
+        }
+        // symbolic link: the target must resolve inside the prefix. Every
+        // other symlink in the tree passes the same check, so chains of
+        // in-prefix links cannot combine into an escape.
+        val targetPath = if (link.linkName.startsWith("/")) {
+            Paths.get(link.linkName).normalize()
+        } else {
+            link.dest.parentFile.toPath().resolve(link.linkName).normalize()
+        }
+        val prefixPath = prefix.canonicalFile.toPath()
+        if (!targetPath.startsWith(prefixPath)) {
+            throw IOException(
+                "$label: symlink '${link.dest.relativeTo(prefix).path}' -> " +
+                    "'${link.linkName}' escapes the install prefix — corrupt archive",
+            )
+        }
+        try {
+            Files.deleteIfExists(link.dest.toPath())
+            Files.createSymbolicLink(link.dest.toPath(), Paths.get(link.linkName))
+        } catch (e: java.io.IOException) {
+            // NEVER fall back to an empty file: a broken symlink fails loud
+            // at install time instead of as a baffling link error later.
+            throw IOException(
+                "$label: cannot create symlink '${link.dest.relativeTo(prefix).path}': ${e.message}",
+                e,
+            )
+        }
+    }
+
+    /**
+     * A tar hardlink's linkName is the TARGET ENTRY's full archive path
+     * (`<top>/<component>/rest`); some writers emit the already-stripped
+     * form instead. Try both interpretations, plus the leading-slash
+     * variant; null when none names an existing file.
+     */
+    private fun hardlinkTarget(prefix: File, linkName: String): File? {
+        val trimmed = linkName.trimStart('/')
+        if (trimmed.isEmpty()) return null
+        val candidates = ArrayList<File>(2)
+        val segments = trimmed.split('/')
+        if (segments.size > 2) {
+            candidates += Fs.resolveChild(prefix, segments.drop(2).joinToString("/"))
+        }
+        candidates += Fs.resolveChild(prefix, trimmed)
+        return candidates.firstOrNull { it.isFile }
     }
 
     /** Copies the CURRENT zip entry's data to [dest]. */

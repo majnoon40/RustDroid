@@ -13,8 +13,12 @@ import java.io.File
 /**
  * OPTIONAL integration test against the real published bundle.
  * Activated only when system property `rd.bundle` points to a downloaded
- * rustdroid-app-bundle-aarch64.zip (dev machines; CI skips silently).
- * Guards against layout drift between the publish workflow and the app.
+ * rustdroid-app-bundle-aarch64.zip (dev machines). Guards against layout
+ * drift between the publish workflow and the app.
+ *
+ * The skip is deliberately LOUD: CI runs without `rd.bundle`, and a silent
+ * assumeTrue here made "green" look like "covered" while the real-bundle
+ * path (the one that failed on-device before) went untested.
  */
 class RealBundleExtractionTest {
 
@@ -26,6 +30,14 @@ class RealBundleExtractionTest {
 
     @Test
     fun `real bundle extracts into the validated prefix layout`() {
+        if (bundle == null || !bundle!!.isFile) {
+            // visible in `./gradlew test` output and CI logs — do not let a
+            // green build masquerade as real-bundle coverage
+            println(
+                "SKIP (loud): RealBundleExtractionTest — rd.bundle not set. " +
+                    "The real-bundle extraction path is NOT covered by this run."
+            )
+        }
         assumeTrue("rd.bundle not set — skipping", bundle != null && bundle!!.isFile)
         val zip = bundle!!
 

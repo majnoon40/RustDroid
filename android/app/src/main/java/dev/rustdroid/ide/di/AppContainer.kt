@@ -22,13 +22,23 @@ class AppContainer(val context: Context) {
 
     val http: OkHttpClient by lazy {
         OkHttpClient.Builder()
-            .callTimeout(5, TimeUnit.MINUTES) // big downloads
+            // API-sized budget only (crates.io search): a whole-call
+            // timeout on a client used for bulk transfers silently kills
+            // big bodies at exactly 5:00 — bulk consumers (ArtifactDownloader)
+            // must opt OUT explicitly with callTimeout(0).
+            .callTimeout(60, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .connectTimeout(30, TimeUnit.SECONDS)
             .build()
     }
 
-    val cargoRunner: CargoRunner by lazy { CargoRunner() }
+    /** Android signal sender: lets build cancellation SIGKILL cargo's
+     *  whole process tree (rustc, ld.lld, build scripts) — see ProcTree. */
+    val cargoRunner: CargoRunner by lazy {
+        CargoRunner(signal = { pid, sig ->
+            android.os.Process.sendSignal(pid.toInt(), sig)
+        })
+    }
 
     val toolchainPaths: ToolchainPaths by lazy { ToolchainPaths(context.filesDir) }
 

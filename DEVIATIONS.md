@@ -407,3 +407,53 @@ Still pending on-device validation: rustc/cargo actually executing on
 Android, `LD_LIBRARY_PATH` resolution of `libc++_shared.so`,
 `RUSTDROID_PREFIX` env var read by the patched openssl-probe, and cargo's
 `home::cargo_home()` under `/data/data/dev.rustdroid.ide/files/usr`.
+
+## 6. App reliability hardening (external code review, 2026-09-06)
+
+An evidence-based review of the Android app (~18 findings) landed in v0.1.3.
+All P0/P1/P2 items fixed and unit-tested (128 JVM tests, 0 failures):
+
+- **P0 install ordering**: `installWith` uninstalled the prefix BEFORE the
+  download — any fetch failure destroyed a working toolchain. Now: fetch to
+  cache first → free-space preflight → extract into `files/usr.new` staging →
+  `ToolchainSwap` (prefix→usr.old→staging→prefix, restore-on-failure). A
+  failed download or extraction now costs nothing but the cache zip.
+- **P0 writeAtomic**: delete-then-rename had a crash window losing user
+  source files. Now NIO `ATOMIC_MOVE|REPLACE_EXISTING` (single `rename(2)`),
+  with graceful fallbacks.
+- **P1 resume validation**: downloads persist ETag+size in a `.part.meta`
+  sidecar; resumes send `If-Range`. Changed assets (200 answer or drifted
+  Content-Range total) restart cleanly in the same attempt instead of
+  failing checksums for 4 rounds. Resume re-hash reports progress.
+- **P1 extraction links**: hard/symlinks resolved in a second pass after all
+  files exist (tar ordering is not guaranteed); unresolvable targets fail
+  loud; symlink escapes rejected (`Fs.requireInside` canonical containment
+  on every write — closes the imported-zip symlink-escape vector); no more
+  empty-file placeholders for failed symlinks.
+- **P1 ANR**: `ToolchainManager.uninstall()` was `runBlocking` on the mutex
+  from a click handler → suspend + Dispatchers.IO.
+- **P1 console flood**: `CARGO_HTTP_DEBUG` (libcurl verbose) was
+  unconditional in shipping builds → opt-in parameter, default off.
+- **P2 console jank**: ConsoleBuffer copied the full 2000-line list per
+  appended line → ArrayDeque + 100 ms rate-limited StateFlow publication +
+  `flush()`; overflow counter now atomic.
+- **P2 orphaned builds**: cancelling killed only cargo (no process groups in
+  Java) → `/proc` walk (`ProcTree`, pure JVM) SIGKILLs all descendants via
+  `android.os.Process.sendSignal`.
+- **P2 Home listing**: `latestMtime` walked the whole project tree including
+  `target/` (tens of thousands of files) and could loop forever on symlink
+  cycles → skips target/.git/hidden, depth cap, canonical visited-set.
+- **P2 misc**: import progress modulo→threshold (progress no longer freezes
+  after a short SAF read); free-space preflights before download+extraction;
+  dead `ToolchainToolchainProgress` removed; Main-dispatched scope → Default;
+  base OkHttp callTimeout 5 min→60 s (bulk callers opt out explicitly).
+- **P3**: insecure-TLS marker now prints a console warning every affected
+  run; CI builds assembleRelease too (caught a real lint-vital blocker:
+  Play-policy `ExpiredTargetSdkVersion` — disabled with justification);
+  real-bundle test skip is loud; `applyPosixMode` and `resolveChild` doc
+  their deliberate simplifications.
+
+Not addressed (documented as Known v1 limits): instrumented test tier
+(device/emulator) — the exec-from-app-data premise still rests on manual
+validation; hardlink-restore edge in ToolchainSwap is covered for the
+missing-staging case only.

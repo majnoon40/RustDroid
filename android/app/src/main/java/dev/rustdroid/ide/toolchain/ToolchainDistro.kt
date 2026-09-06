@@ -27,6 +27,16 @@ object ToolchainDistro {
 
     val expectedSizeBytes: Long = 116_974_122L // exact; display only
 
+    /**
+     * Free-space preflight: the extracted prefix (rustc + rust-std + cargo
+     * + link kit) plus the zip still on disk during install, with headroom.
+     * Estimate, not a hard number — the error message says "~", and a
+     * false refusal is impossible in practice (the real expansion is well
+     * under this; low-storage devices get a clear failure instead of a
+     * mid-extraction ENOSPC that used to strand a partial prefix).
+     */
+    const val EXPECTED_INSTALLED_BYTES: Long = 1_500_000_000L
+
     /** Zip entry names expected inside the bundle (layout contract). */
     val expectedEntries = listOf(
         "rustc-1.85.0-aarch64-linux-android.tar.xz",

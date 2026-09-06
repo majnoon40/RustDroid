@@ -17,8 +17,8 @@ android {
         // F-Droid distribution only — not Play-eligible at this target.
         minSdk = 24
         targetSdk = 28
-        versionCode = 3
-        versionName = "0.1.2"
+        versionCode = 4
+        versionName = "0.1.3"
     }
 
     buildTypes {
@@ -28,9 +28,6 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-        }
-        debug {
-            applicationIdSuffix = ""
         }
     }
 
@@ -60,6 +57,15 @@ android {
         unitTests.all { test ->
             test.systemProperty("rd.bundle", System.getProperty("rd.bundle") ?: "")
         }
+    }
+
+    lint {
+        // targetSdk 28 is deliberate and load-bearing (exec from app data —
+        // see the defaultConfig comment and README "Why targetSdk 28").
+        // ExpiredTargetSdkVersion is a Google Play *policy* check; this app
+        // is F-Droid-only by design, so the policy does not apply. Killing
+        // this check un-blocks assembleRelease, which lint-vital gates.
+        disable += "ExpiredTargetSdkVersion"
     }
 }
 
