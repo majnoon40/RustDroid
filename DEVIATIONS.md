@@ -558,3 +558,77 @@ NotInstalled state can flip to Ready within milliseconds of launch);
 UI-layer `catch (Exception)` blocks (Home/Deps/Editor VMs) intentionally
 keep callback semantics — they hold no subprocesses and die with their
 viewModelScope.
+
+## 8. Fourth-pass targeted fixes (follow-up audit, 2026-09-08)
+
+Five targeted correctness fixes over v0.1.4 — no broad rewrite; every
+already-fixed area re-verified intact (190 JVM tests, 0 failures).
+
+- **P0 crash-safe install-pending marker**: v0.1.4 could clear
+  `install-pending.txt` even when the rollback or the startup recovery
+  itself FAILED — a failed restore then looked like a clean state and no
+  later startup could retry it. The invariant is now enforced in ONE
+  place: `ToolchainTransaction.rollbackFailedInstall` (install-time
+  rollback; returns the failure so the caller attaches it to the original
+  exception via `addSuppressed` — both stay visible) and
+  `ToolchainTransaction.runRecovery` (startup execution of the pure
+  decision table; returns whether a known safe final state was reached).
+  The marker is cleared ONLY after: verified READY, a completed rollback,
+  a completed recovery, a fresh-install failure with nothing to restore,
+  or an explicit uninstall. A failed rollback/recovery leaves the marker
+  on disk BY DESIGN — it is the retry record; the next startup reads it
+  and re-attempts the restore. Regression tests assert the MARKER's
+  existence/non-existence directly (not just exceptions): rollback
+  succeeds → marker gone; rollback fails → marker remains; recovery
+  fails → marker remains; a later startup retries and then clears it.
+- **P0 unknown root identity never authorizes late descendant
+  rediscovery**: `ProcTree.terminateTree`'s late re-discovery condition
+  was effectively `rootId == null || stillMatches(...)` — when the root's
+  identity could never be established (its `/proc/<pid>/stat` was already
+  unreadable), a reused root PID with fresh children would be walked and
+  those innocent processes SIGKILLed. The condition is now the
+  conservative `rootId != null && stillMatches(...)`: known + matching →
+  allowed; known + reused → stop; unknown → no late traversal at all.
+  Everything else (identity snapshots, per-signal revalidation, root
+  exclusion, bounded sweeps, /proc-degradation) is unchanged. The
+  regression test plants a reused root PID with children after the
+  original identity became unavailable and asserts ZERO signals.
+- **P1 repeated-restart downloader test made real**: the old test
+  exercised exactly one restart (416 → 200 → checksum mismatch). Worse,
+  the production restart ceiling was unreachable dead code: every restart
+  discards the partial and a fresh request could never trigger another
+  restart, so a corrupt-body server escaped the ceiling by burning OUTER
+  retries (4 full downloads + 11 s backoff). A checksum mismatch is now
+  a bounded clean restart INSIDE the attempt (the partial is still
+  discarded — corrupt data is never resumed), and exhausting
+  `MAX_RESTARTS_PER_ATTEMPT` throws `RestartBudgetExceededException`,
+  which `downloadBlocking` treats as TERMINAL (re-attempting would
+  re-download the identical corrupt body). The rewritten test drives
+  restart → restart → restart → refused at the exact configured limit
+  (4 exchanges, all fresh full-body requests), asserts the bounded
+  failure message with the checksum cause preserved, and a second test
+  drives `downloadBlocking` itself through an interceptor-scripted
+  client (no sockets) proving the outer loop never re-runs the exhausted
+  experiment. All prior downloader tests (416 recovery, corrupted
+  prefix, asset drift, truncated body, failed discard, successful
+  resume, zero-byte download) are preserved and green.
+- **P1 probe drains stderr concurrently**: `CargoRunner.probe` read only
+  stdout; a child writing more stderr than the ~64 KB pipe buffer blocks
+  in write() forever, the waitFor times out and a healthy toolchain
+  probes as dead. Both pipes are now consumed concurrently (stdout
+  collected, stderr drained/discarded), both pumps are joined with a
+  bound, and the finally-block still closes all three streams. The
+  regression test runs a real `/bin/sh` child that writes ~1.2 MB of
+  stderr before its single stdout line — it FAILS against the old code
+  (probe returns "") and passes with the drain (host-JVM subprocess
+  tests are reliable here: unit tests run on the developer/CI machine,
+  not the Android runtime; hosts without POSIX sh skip via assumeTrue).
+- **P3 duplicate service notification**: `ToolchainInstallService` called
+  `startInForeground(reverify)` BEFORE the active-job check, so a
+  duplicate re-verify start during an install relabeled the notification
+  to "Re-verifying…" mid-install. The check now precedes any
+  foreground/notification change; the duplicate still answers Android's
+  `startForegroundService` contract (every such start must be followed
+  by `startForeground`, else "did not then call Service.startForeground"
+  — the crash the naive fix would trade in) by re-asserting the CURRENT
+  operation's state. Job cancellation/cleanup behavior unchanged.

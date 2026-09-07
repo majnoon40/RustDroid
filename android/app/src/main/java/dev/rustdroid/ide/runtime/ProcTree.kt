@@ -154,9 +154,13 @@ object ProcTree {
      *     captured identity — freezing them so nothing new spawns and
      *     nothing escapes between discovery and the kill;
      *  4. terminate the root ([destroyRoot]);
-     *  5. re-discover descendants while the root PID still belongs to the
-     *     ORIGINAL process (zombie window) — catches children spawned
-     *     between snapshot and freeze; every discovery is revalidated
+     *  5. re-discover descendants ONLY while the root PID is still
+     *     provably the ORIGINAL process — identity known AND still
+     *     matching (the zombie window) — catching children spawned
+     *     between snapshot and freeze; an UNKNOWN root identity (the
+     *     /proc entry was already gone before we looked) authorizes NO
+     *     late traversal at all, because that PID may have been reused
+     *     by an unrelated process; every discovery is revalidated
      *     immediately before its signal;
      *  6. bounded final sweep: SIGKILL every captured process that STILL
      *     matches its identity, until none remain or the pass budget is
@@ -195,11 +199,15 @@ object ProcTree {
             waited += 50L
         }
 
-        // 5) re-discover late spawns, but only while the root PID is still
-        // occupied by the ORIGINAL process — a reaped-and-reused root PID
-        // belongs to someone else's tree now, and walking it would target
-        // innocent processes.
-        if (rootId == null || stillMatches(procRoot, rootId)) {
+        // 5) re-discover late spawns, but ONLY while the root PID is
+        // still occupied by the ORIGINAL process — a reaped-and-reused
+        // root PID belongs to someone else's tree now, and walking it
+        // would target innocent processes. When the root's identity was
+        // NEVER captured (rootId == null: /proc entry already gone),
+        // the PID is UNTRUSTED for late rediscovery: an unknown
+        // identity cannot prove the tree still belongs to us, and a
+        // destructive traversal must not proceed on "cannot disprove".
+        if (rootId != null && stillMatches(procRoot, rootId)) {
             for (id in descendants(procRoot, rootPid)) {
                 if (seen.add(id.pid)) captured.add(id)
             }

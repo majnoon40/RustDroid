@@ -294,6 +294,38 @@ class ProcTreeTest {
     }
 
     @Test
+    fun `unknown root identity never authorizes late descendant rediscovery`() {
+        // The original root is ALREADY GONE before terminateTree even
+        // started: /proc/100 exists as an entry, but its stat file is
+        // unreadable, so the root's identity can NEVER be established.
+        // Later the pid exists again, now with fresh children (a reused
+        // pid owned by an unrelated process). A destructive late
+        // traversal from that pid would signal innocent processes — an
+        // UNKNOWN identity must not be treated as permission.
+        val dir = File(tmp.root, "100").apply { mkdirs() }
+        File(dir, "status").writeText("Name:\ta\nPPid:\t1\n")
+        // deliberately NO stat file: identity() -> null
+        val rec = Recorder()
+        rec.onRootDestroyed = {
+            // the pid is reused by a new occupant that spawns children
+            File(dir, "stat").writeText(statLine(100L, "reused", "R", 1L, 424242L))
+            proc(Triple(150L, 100L, 1500L), Triple(151L, 100L, 1510L))
+        }
+        ProcTree.terminateTree(
+            tmp.root, 100L, rec.signal, rec.destroyRoot, { rec.rootAlive },
+            sweepDelayMs = 0,
+        )
+        assertTrue(rec.rootDestroyed)
+        // the initial snapshot found no children; the late rediscovery
+        // must be REFUSED (root identity unknown), so nothing is ever
+        // captured and no signal of any kind is sent to 150/151
+        assertTrue(
+            "no destructive rediscovery/signaling from an untrusted root pid, got ${rec.sent}",
+            rec.sent.isEmpty(),
+        )
+    }
+
+    @Test
     fun `late descendant spawned before root death is caught by re-discovery`() {
         proc(Triple(100L, 1L, 10L), Triple(200L, 100L, 20L))
         val rec = Recorder()

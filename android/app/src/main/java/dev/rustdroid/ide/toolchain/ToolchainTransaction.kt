@@ -2,6 +2,7 @@ package dev.rustdroid.ide.toolchain
 
 import dev.rustdroid.ide.util.Fs
 import java.io.File
+import java.io.IOException
 
 /**
  * EXTERNAL install-transaction marker — the durable record that an
@@ -29,6 +30,17 @@ import java.io.File
  * The marker is written atomically (temp file + rename, fsync'd), so a
  * crash mid-write leaves either the old or the new marker — never a
  * torn one. Pure JVM — unit-tested in isolation.
+ *
+ * CRASH-SAFE MARKER INVARIANT (enforced by [rollbackFailedInstall] and
+ * [runRecovery], the ONLY paths allowed to clear the marker on a
+ * non-READY outcome): `install-pending.txt` may only be deleted after
+ * the transaction has reached a KNOWN SAFE FINAL STATE. A rollback or
+ * recovery that fails (e.g. a transient filesystem error) must leave
+ * the marker in place — otherwise the next startup sees no pending
+ * transaction, assumes everything is fine, and an unresolved half-
+ * installed state is silently promoted to "clean". The marker is the
+ * ONLY durable record that recovery work is still owed; deleting it
+ * deletes the app's ability to retry.
  */
 internal object ToolchainTransaction {
 
@@ -91,6 +103,123 @@ internal object ToolchainTransaction {
         asideExists -> Action.RESTORE_ASIDE
         // no aside, no usable prefix: nothing to keep — clean up
         else -> Action.DISCARD
+    }
+
+    /**
+     * Rollback for a FAILED verification/install with the crash-safe
+     * marker invariant: the pending marker is cleared ONLY when the
+     * previous known-good install was actually restored — or when there
+     * was never anything to restore (fresh install: an unverified prefix
+     * with no rollback source is a final, unrecoverable-but-known state
+     * that startup recovery would DISCARD anyway).
+     *
+     * Returns the rollback failure (if any) so the caller can attach it
+     * to the ORIGINAL install/verification exception — both must stay
+     * visible. When a failure is returned the marker is DELIBERATELY
+     * kept on disk: startup recovery must be able to retry the restore
+     * on the next launch. Never convert an unresolved state into a
+     * clean one by clearing the marker here.
+     */
+    fun rollbackFailedInstall(
+        marker: File,
+        prefix: File,
+        aside: File,
+        log: (String) -> Unit = {},
+    ): IOException? {
+        if (!aside.exists()) {
+            // nothing retained to restore — a terminal (failed) state;
+            // clearing the marker matches what startup recovery's
+            // DISCARD action would conclude
+            clearOrWarn(marker, log)
+            return null
+        }
+        return try {
+            ToolchainSwap.rollback(prefix, aside)
+            log("previous toolchain restored from ${aside.path}")
+            clearOrWarn(marker, log)
+            null
+        } catch (rb: IOException) {
+            // DO NOT clear install-pending.txt: the restore did NOT
+            // complete, so the transaction is unresolved — the marker
+            // stays so the next startup retries recovery
+            log("FAILED to restore the previous toolchain: ${rb.message}")
+            log("keeping ${marker.name} — startup recovery will retry")
+            rb
+        }
+    }
+
+    /**
+     * Executes startup recovery for an interrupted install, returning
+     * true ONLY when the transaction reached a known safe final state
+     * (in which case the pending marker is also cleared). False means
+     * recovery could not complete — the marker REMAINS on disk and the
+     * next startup must retry. Pure JVM (all real filesystem work),
+     * unit-testable without Android.
+     */
+    fun runRecovery(
+        marker: File,
+        prefix: File,
+        staging: File,
+        aside: File,
+        readyMarker: File,
+        isInstalled: () -> Boolean,
+        log: (String) -> Unit = {},
+    ): Boolean {
+        val pending = read(marker) ?: return true // nothing owed
+        val action = recoveryAction(
+            pending = pending,
+            prefixInstalled = isInstalled(),
+            readyMarkerPresent = readyMarker.isFile,
+            asideExists = aside.exists(),
+        )
+        return when (action) {
+            Action.NONE -> true
+            Action.KEEP_VERIFIED -> {
+                // crashed after verification passed but before
+                // commit/clear: finish the job. A failed aside delete is
+                // disk-garbage, not an unsafe state (the next swap
+                // pre-cleans it) — the verified install IS the safe
+                // final state, so the marker is cleared either way.
+                if (!ToolchainSwap.commit(aside)) {
+                    log("recovery: could not delete the old toolchain at ${aside.path} (retried next install)")
+                }
+                log("recovered interrupted install (stage=${pending.stage}): verified toolchain kept")
+                clearOrWarn(marker, log)
+                true
+            }
+            Action.RESTORE_ASIDE -> {
+                try {
+                    ToolchainSwap.rollback(prefix, aside)
+                    Fs.deleteRecursively(staging)
+                    log("recovered interrupted install (stage=${pending.stage}): previous toolchain restored")
+                    clearOrWarn(marker, log)
+                    true
+                } catch (rb: IOException) {
+                    // recovery INCOMPLETE: the marker is the durable
+                    // record that this work is still owed — keep it so
+                    // the NEXT startup retries the restore
+                    log("recovery FAILED to restore the previous toolchain: ${rb.message}")
+                    log("keeping ${marker.name} — the next startup will retry recovery")
+                    false
+                }
+            }
+            Action.DISCARD -> {
+                // nothing usable anywhere: staging garbage is best-effort
+                // cleanup (the next install pre-cleans it) — with no
+                // aside there is nothing to restore, so this IS a final
+                // (NotInstalled) state
+                Fs.deleteRecursively(staging)
+                log("recovered interrupted install (stage=${pending.stage}): nothing usable — cleaned up")
+                clearOrWarn(marker, log)
+                true
+            }
+        }
+    }
+
+    private fun clearOrWarn(marker: File, log: (String) -> Unit) {
+        if (!clear(marker)) {
+            log("WARN: could not clear ${marker.path} — startup recovery will re-run")
+        }
     }
 
     private fun write(marker: File, dist: String, stage: String) {

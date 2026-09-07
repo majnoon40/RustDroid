@@ -41,6 +41,9 @@ class ToolchainInstallService : Service() {
     /** The ONE operation job this service instance is running. */
     private var activeJob: kotlinx.coroutines.Job? = null
 
+    /** Kind of the RUNNING job — a duplicate start re-asserts THIS state. */
+    private var activeIsReverify = false
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -57,7 +60,6 @@ class ToolchainInstallService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val manager = (application as dev.rustdroid.ide.RustDroidApp).container.toolchainManager
         val reverify = intent?.action == ACTION_REVERIFY
-        startInForeground(reverify)
 
         // ONE active operation per service instance. A start arriving
         // while a job is running is a duplicate, and the RUNNING job wins:
@@ -69,9 +71,22 @@ class ToolchainInstallService : Service() {
         //    heavier intent but the manager mutex would just serialize it
         //    behind the re-verify for minutes — also ignored; the Settings
         //    screen offers re-verify explicitly afterwards.
-        // Ignored starts never reach the job's terminal block, so they can
-        // never stopSelf() out from under the running operation.
+        // The check happens BEFORE any foreground/notification change, so
+        // a duplicate (e.g. a re-verify start during an install) can no
+        // longer relabel the running operation's notification to
+        // "Re-verifying…" while an install is still in flight. The
+        // duplicate still answers Android's startForegroundService
+        // contract (every such start must be followed by startForeground
+        // within its window, even when the service is already
+        // foregrounded — skipping it risks
+        // "Context.startForegroundService() did not then call
+        // Service.startForeground()") by re-asserting the CURRENT
+        // operation's state, which is also exactly what the notification
+        // should keep showing. Ignored starts never reach the job's
+        // terminal block, so they can never stopSelf() out from under
+        // the running operation.
         if (activeJob?.isActive == true) {
+            startInForeground(activeIsReverify)
             android.util.Log.i(
                 TAG,
                 "ignoring duplicate ${if (reverify) "re-verify" else "install"} start — " +
@@ -79,6 +94,9 @@ class ToolchainInstallService : Service() {
             )
             return START_NOT_STICKY
         }
+
+        startInForeground(reverify)
+        activeIsReverify = reverify
 
         activeJob = scope.launch {
             try {

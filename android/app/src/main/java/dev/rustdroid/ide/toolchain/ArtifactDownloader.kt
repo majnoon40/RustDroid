@@ -30,15 +30,24 @@ import java.util.concurrent.TimeUnit
  *    the same attempt, instead of appending new bytes onto a stale prefix
  *    and failing the checksum (the old failure loop).
  *  - a checksum mismatch deletes the .part file (and its sidecar) —
- *    corrupt data must never be resumed.
+ *    corrupt data must never be resumed — and retries the transfer
+ *    from zero as a clean restart INSIDE the attempt (no network retry
+ *    budget consumed, no backoff): one flaky-proxy corruption heals
+ *    immediately instead of after a backoff cycle
  *  - RESTART discipline: a restart-from-zero (416, If-Range mismatch,
- *    size drift, unreadable resume prefix) stays INSIDE the attempt —
- *    it consumes no network retry budget — but is itself bounded by
- *    [MAX_RESTARTS_PER_ATTEMPT] so a pathological server cannot loop
- *    the download forever. A discard that fails to actually delete the
- *    .part/.meta files is a LOCAL filesystem failure: it throws instead
- *    of retrying, because retrying against an undeletable partial is
- *    an infinite loop by another name.
+ *    size drift, unreadable resume prefix, corrupt body) stays INSIDE
+ *    the attempt — it consumes no network retry budget — but is itself
+ *    bounded by [MAX_RESTARTS_PER_ATTEMPT] so a pathological server
+ *    (one that keeps forcing discards: alternating 200/206 with
+ *    unusable bodies, 416 on every resume) cannot loop the download
+ *    forever. Exhausting the restart budget throws
+ *    [RestartBudgetExceededException], which [downloadBlocking]
+ *    treats as TERMINAL: re-attempting would just re-download the same
+ *    unusable body four more times with backoff — hundreds of wasted
+ *    megabytes for zero information. A discard that fails to actually
+ *    delete the .part/.meta files is a LOCAL filesystem failure: it
+ *    throws instead of retrying, because retrying against an
+ *    undeletable partial is an infinite loop by another name.
  */
 class ArtifactDownloader(baseClient: OkHttpClient) {
 
@@ -136,6 +145,12 @@ class ArtifactDownloader(baseClient: OkHttpClient) {
             try {
                 attemptOnce(url, tmp, dest, expectedSha256, onProgress)
                 return
+            } catch (e: RestartBudgetExceededException) {
+                // TERMINAL: the in-attempt restart budget was exhausted —
+                // every restart re-downloaded from zero and the server
+                // kept serving unusable data. Retrying can only repeat
+                // the identical experiment; fail loud instead.
+                throw e
             } catch (e: IOException) {
                 lastError = e
                 if (attempt < MAX_ATTEMPTS) {
@@ -166,11 +181,13 @@ class ArtifactDownloader(baseClient: OkHttpClient) {
      * The download loop for one attempt, parameterized over the HTTP
      * exchange so tests can script response sequences without sockets.
      *
-     * A clean restart loops here at most [MAX_RESTARTS_PER_ATTEMPT] times
-     * (partial discarded -> next iteration has haveBytes == 0 and requests
-     * the full body). Unbounded would let a pathological server
-     * (alternating 200/206 with a half-written partial) loop the download
-     * forever.
+     * A clean restart loops here at most [MAX_RESTARTS_PER_ATTEMPT]
+     * times (partial discarded -> next iteration has haveBytes == 0 and
+     * requests the full body). Unbounded would let a pathological
+     * server (alternating 200/206 with a half-written partial) loop the
+     * download forever. Exceeding the budget throws
+     * [RestartBudgetExceededException] — a bounded, loud, TERMINAL
+     * failure that the outer retry loop will not re-attempt.
      */
     internal fun attemptLoop(
         url: String,
@@ -203,11 +220,12 @@ class ArtifactDownloader(baseClient: OkHttpClient) {
             val outcome = response.use { resp ->
                 handleResponse(resp, tmp, dest, expectedSha256, onProgress, resumeFrom, meta)
             }
-            if (outcome == Outcome.RESTART) {
+            if (outcome is Outcome.RESTART) {
                 if (++restarts > MAX_RESTARTS_PER_ATTEMPT) {
-                    throw IOException(
-                        "download restarted from zero $restarts times — " +
-                            "the server keeps rejecting resume attempts; giving up"
+                    throw RestartBudgetExceededException(
+                        "download restarted from zero $restarts times " +
+                            "(limit: $MAX_RESTARTS_PER_ATTEMPT) — the server keeps " +
+                            "serving unusable data (last cause: ${outcome.reason}); giving up"
                     )
                 }
                 continue
@@ -216,7 +234,14 @@ class ArtifactDownloader(baseClient: OkHttpClient) {
         }
     }
 
-    private enum class Outcome { DONE, RESTART }
+    private sealed class Outcome {
+        object DONE : Outcome()
+
+        /** Clean restart from zero inside this attempt; [reason] feeds
+         *  the budget-exceeded failure so the final error explains the
+         *  loop's cause (e.g. the checksum mismatch details). */
+        class RESTART(val reason: String) : Outcome()
+    }
 
     private fun handleResponse(
         resp: okhttp3.Response,
@@ -235,7 +260,7 @@ class ArtifactDownloader(baseClient: OkHttpClient) {
             // iteration requests the full body.
             resp.code == 416 && resumeFrom > 0 -> {
                 discardPartOrThrow(tmp)
-                return Outcome.RESTART
+                return Outcome.RESTART("416 range not satisfiable with $resumeFrom bytes on disk")
             }
             !resp.isSuccessful -> throw IOException("HTTP ${resp.code} fetching bundle")
         }
@@ -251,7 +276,7 @@ class ArtifactDownloader(baseClient: OkHttpClient) {
                 // the stale prefix and take the full body — same attempt,
                 // no retry budget burned
                 discardPartOrThrow(tmp)
-                return Outcome.RESTART
+                return Outcome.RESTART("server rejected the resume (code ${resp.code}) — asset changed or ranges unsupported")
             }
             // fresh start: record ETag + total for future resumes
             val total0 = body.contentLength().takeIf { it > 0 }
@@ -286,7 +311,7 @@ class ArtifactDownloader(baseClient: OkHttpClient) {
                 // inconsistency, not a network error — fix it inside this
                 // attempt instead of burning a network retry
                 discardPartOrThrow(tmp)
-                return Outcome.RESTART
+                return Outcome.RESTART("resume prefix drifted: expected $resumeFrom bytes, found $written")
             }
         }
 
@@ -314,9 +339,12 @@ class ArtifactDownloader(baseClient: OkHttpClient) {
         val sha = digest.digest().joinToString("") { "%02x".format(it) }
         if (expectedSha256 != null && expectedSha256.length == 64 && sha != expectedSha256) {
             discardPartOrThrow(tmp) // corrupt data must never be resumed
-            throw IOException(
-                "checksum mismatch: got $sha, expected $expectedSha256 — " +
-                    "the download was corrupted or the release changed"
+            // corrupt transfer: a CLEAN restart inside this attempt (no
+            // retry budget, no backoff) — a one-off corruption heals on
+            // the immediate re-download; a persistently corrupt server
+            // is bounded by MAX_RESTARTS_PER_ATTEMPT and then fails loud
+            return Outcome.RESTART(
+                "checksum mismatch: got $sha, expected $expectedSha256"
             )
         }
         // POSIX rename(2) replaces an existing target, so try the direct
@@ -333,9 +361,22 @@ class ArtifactDownloader(baseClient: OkHttpClient) {
         return Outcome.DONE
     }
 
-    private companion object {
-        const val MAX_ATTEMPTS = 4
+    /**
+     * The in-attempt clean-restart budget was exhausted: every restart
+     * re-downloaded the whole body from zero and the server kept
+     * serving data that could not be used. Subclassing IOException so
+     * existing callers still catch it as a download failure, while
+     * [downloadBlocking] can single it out as TERMINAL (no outer retry
+     * — re-running the identical experiment would only waste the
+     * transfer again).
+     */
+    internal class RestartBudgetExceededException(message: String) : IOException(message)
+
+    internal companion object {
+        /** Clean restarts allowed per attempt; internal so the
+         *  bounded-restart regression test can assert the exact limit. */
         const val MAX_RESTARTS_PER_ATTEMPT = 3
-        val BACKOFF_MS = longArrayOf(1_000L, 3_000L, 7_000L)
+        private const val MAX_ATTEMPTS = 4
+        private val BACKOFF_MS = longArrayOf(1_000L, 3_000L, 7_000L)
     }
 }

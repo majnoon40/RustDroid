@@ -300,38 +300,98 @@ class ArtifactDownloaderTest {
     }
 
     @Test
-    fun `repeated restarts are bounded - a rejecting server fails loud`() {
-        // Pathological server: every Range request answers 416, every full
-        // request answers with a 200 whose body can never match (content
-        // half) — each write leaves a partial that forces another restart.
-        val full = "0123456789abcdef".toByteArray()
+    fun `repeated restarts are bounded - a corrupt-every-time server fails loud at the exact ceiling`() {
+        // Pathological server: every fresh full-body 200 fails the
+        // checksum, and each mismatch discards the partial and loops as
+        // a CLEAN restart INSIDE the attempt:
+        //   restart -> restart -> restart -> restart (refused)
+        // until the exact configured restart ceiling is reached. The
+        // downloader must terminate with the budget-exceeded failure
+        // (never an infinite loop) — and the restart cycles must not
+        // leak out as network retries.
+        val body = "0123456789abcdef".toByteArray()
         val part = File(tmp.root, "loop.zip.part")
-        part.writeBytes(full) // full-size partial keeps forcing 416-restarts
-        downloader.writeMeta(part, "\"flip\"", 16L)
+        val dest = File(tmp.root, "loop.zip")
+        val expected = sha256("definitely-not-the-body".toByteArray())
         val ex = Exchange(
-            List(20) { idx ->
+            List(20) {
                 { range: String?, _: String? ->
-                    if (range != null) httpResponse(416)
-                    else httpResponse(200, full, mapOf("ETag" to "\"flip\""))
+                    // every restart must re-request from zero — a resume
+                    // attempt would mean the corrupt partial survived
+                    assertNull("restarts must re-request from zero", range)
+                    httpResponse(200, body, mapOf("ETag" to "\"corrupt\""))
                 }
             }
         )
 
-        val dest = File(tmp.root, "loop.zip")
         try {
-            // wrong checksum -> every completion fails; the loop must
-            // terminate through the bounded restart budget, not hang
-            downloader.attemptLoop("http://localhost/l", part, dest, sha256("mismatch".toByteArray()), progress(), ex.next)
-            throw AssertionError("expected IOException from bounded restarts")
+            downloader.attemptLoop("http://localhost/l", part, dest, expected, progress(), ex.next)
+            throw AssertionError("expected the restart ceiling to fail the download")
         } catch (e: IOException) {
+            // bounded AND loud, with the underlying cause preserved
             val msg = e.message ?: ""
-            assertTrue(
-                "unexpected failure: $msg",
-                msg.contains("restarted from zero") || msg.contains("checksum mismatch"),
-            )
+            assertTrue("unexpected failure: $msg", msg.contains("restarted from zero"))
+            assertTrue("cause must be preserved: $msg", msg.contains("checksum mismatch"))
         }
-        // bounded: far fewer requests than the script offers
-        assertTrue("expected bounded requests, got ${ex.count}", ex.count in 2..8)
+        // EXACT bound: the initial download + MAX_RESTARTS_PER_ATTEMPT
+        // clean restarts; the (limit+1)-th restart is refused
+        assertEquals(
+            "restart cycles must be exactly bounded by the configured limit",
+            ArtifactDownloader.MAX_RESTARTS_PER_ATTEMPT + 1,
+            ex.count,
+        )
+        // nothing finalized, no corrupt partial left behind
+        assertFalse(dest.exists())
+        assertFalse(part.exists())
+        assertFalse(downloader.metaFile(part).exists())
+    }
+
+    @Test
+    fun `restart budget exhaustion is terminal - no outer network retry re-runs it`() {
+        // The same pathological server, driven through the REAL
+        // downloadBlocking (outer attempts + backoff) via an
+        // interceptor-scripted client — application interceptors answer
+        // before any connection is attempted, so no sockets are opened.
+        // A budget-exhausted failure must NOT be re-attempted: the
+        // outer loop re-running the same experiment would just re-fetch
+        // the same corrupt body (4 attempts x 4 downloads = 16 requests
+        // and ~11 s of backoff); the terminal failure caps it at the
+        // in-attempt cycles alone.
+        val body = "0123456789abcdef".toByteArray()
+        var served = 0
+        val scripted = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                served += 1
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("fixture")
+                    .body(body.toResponseBody(null))
+                    .header("ETag", "\"corrupt\"")
+                    .build()
+            }
+            .build()
+        val blocking = ArtifactDownloader(scripted)
+        val dest = File(tmp.root, "terminal.zip")
+
+        try {
+            blocking.downloadBlocking(
+                "http://localhost/t", dest,
+                sha256("definitely-not-the-body".toByteArray()),
+                progress(),
+            )
+            throw AssertionError("expected IOException")
+        } catch (e: IOException) {
+            assertTrue("unexpected failure: ${e.message}", e.message!!.contains("restarted from zero"))
+        }
+        // TERMINAL: the first attempt's in-attempt cycles are ALL the
+        // requests ever made — the outer retry loop never re-ran it
+        assertEquals(
+            ArtifactDownloader.MAX_RESTARTS_PER_ATTEMPT + 1,
+            served,
+        )
+        assertFalse(dest.exists())
     }
 
     @Test

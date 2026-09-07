@@ -131,13 +131,19 @@ durable transaction: an external `files/install-pending.txt` marker
 `ToolchainSwap` moves prefix → `usr.old` (the old install is RETAINED),
 staging → prefix. Verification is the gate: on success the ready marker
 is written (atomic + fsync) and `commit` deletes `usr.old`; on failure
-`rollback` restores the previous known-good install. A crash at ANY
-boundary is reconciled at next startup by `recoverInterruptedInstall`
+`rollback` restores the previous known-good install. The marker is
+crash-safe in the strict sense: it is deleted ONLY after the transaction
+reached a known safe final state — if a rollback or startup recovery
+itself fails (e.g. a transient filesystem error), the marker stays on
+disk and the NEXT startup retries the recovery instead of silently
+treating a half-installed state as clean. A crash at ANY boundary is
+reconciled at next startup by `recoverInterruptedInstall`
 (keep-verified / restore-old / discard — the decision table is pure and
-unit-tested). The old flow uninstalled before downloading, so a dead
-network mid-download left the user with no toolchain at all; now a failed
-download costs the cache zip, a failed extraction costs nothing, and a
-failed verification costs one retry tap. Free-space preflights
+unit-tested, including the failed-recovery-keeps-the-marker cases). The
+old flow uninstalled before downloading, so a dead network mid-download
+left the user with no toolchain at all; now a failed download costs the
+cache zip, a failed extraction costs nothing, and a failed verification
+costs one retry tap. Free-space preflights
 (`EXPECTED_INSTALLED_BYTES`) run before the download and again before
 extraction, so a full disk produces a clear "not enough free space"
 failure instead of a mid-extraction ENOSPC stranding a partial prefix.
@@ -149,12 +155,15 @@ kept in a `<file>.part.meta` sidecar and resumes send `If-Range`. A
 changed asset answers 200 (or a 206 whose total no longer matches) — both
 cases discard the stale partial and restart cleanly in the same attempt,
 instead of appending new bytes onto the old prefix and failing the
-checksum four times. Restart-from-zero (including HTTP 416 and unreadable
-resume prefixes) never consumes the network retry budget, but is itself
-bounded — a pathological server cannot loop the download forever — and a
-partial that cannot actually be deleted fails loud as a local filesystem
-error instead of looping. The resume re-hash reports progress so the
-multi-second pause reads as work, not a hang.
+checksum four times. Restart-from-zero (including HTTP 416, unreadable
+resume prefixes, and corrupt bodies — a checksum mismatch discards the
+partial and re-downloads it cleanly) never consumes the network retry
+budget, but is itself bounded — a pathological server cannot loop the
+download forever, and exhausting the restart budget is a terminal
+failure (the outer retry loop does not re-run the identical experiment)
+— and a partial that cannot actually be deleted fails loud as a local
+filesystem error instead of looping. The resume re-hash reports progress
+so the multi-second pause reads as work, not a hang.
 
 Extraction is two-pass for link entries: hardlinks and symlinks are
 collected during the streaming pass and resolved after every regular

@@ -151,10 +151,16 @@ open class CargoRunner(
 
     /**
      * Runs a short probe (e.g. `rustc --version`) and returns its stdout.
-     * Streams and the process are always cleaned up (try/finally), the
-     * reader runs on a child coroutine joined before returning, and a
-     * timeout terminates the subprocess so stderr can never wedge the
-     * probe forever.
+     * Streams and the process are always cleaned up (try/finally), and
+     * BOTH pipes are consumed concurrently: stdout is collected, stderr
+     * is drained. An undrained stderr pipe (64 KB kernel buffer) fills
+     * when a chatty child writes diagnostics faster than stdout is
+     * produced, and the child then blocks in write() forever — the
+     * waitFor times out and a perfectly healthy toolchain looks dead.
+     * Draining is enough: the probe contract is stdout-only. Both pumps
+     * run on child coroutines joined (bounded) before returning, and a
+     * timeout terminates the subprocess so nothing can wedge the probe
+     * forever.
      */
     open suspend fun probe(
         command: List<String>,
@@ -162,23 +168,33 @@ open class CargoRunner(
         timeoutSec: Long = 15,
     ): String = withContext(Dispatchers.IO) {
         var process: Process? = null
-        var reader: BufferedReader? = null
+        var outReader: BufferedReader? = null
+        var errReader: BufferedReader? = null
         try {
             process = ProcessBuilder(command).apply {
                 environment().clear()
                 environment().putAll(env)
             }.start()
             val out = StringBuilder()
-            reader = BufferedReader(InputStreamReader(process.inputStream, Charsets.UTF_8))
-            val job = launch {
-                try {
-                    while (true) {
-                        val line = reader.readLine() ?: break
-                        if (out.isNotEmpty()) out.append('\n')
-                        out.append(line)
-                    }
-                } catch (_: IOException) {}
-            }
+            outReader = BufferedReader(InputStreamReader(process.inputStream, Charsets.UTF_8))
+            errReader = BufferedReader(InputStreamReader(process.errorStream, Charsets.UTF_8))
+            val pumps = listOf(
+                launch {
+                    try {
+                        while (true) {
+                            val line = outReader.readLine() ?: break
+                            if (out.isNotEmpty()) out.append('\n')
+                            out.append(line)
+                        }
+                    } catch (_: IOException) {}
+                },
+                launch {
+                    // drain stderr concurrently — content discarded
+                    try {
+                        while (errReader.readLine() != null) { /* drain */ }
+                    } catch (_: IOException) {}
+                },
+            )
             val finished = try {
                 process.waitFor(timeoutSec, TimeUnit.SECONDS)
             } catch (_: InterruptedException) {
@@ -186,15 +202,20 @@ open class CargoRunner(
             }
             if (!finished) {
                 process.destroyForcibly()
-                job.cancel()
+                pumps.forEach { it.cancel() }
                 return@withContext ""
             }
-            job.join()
+            // bounded join: a stray grandchild inheriting the pipe could
+            // otherwise hold readLine() open past the child's exit
+            pumps.forEach {
+                runCatching { kotlinx.coroutines.withTimeoutOrNull(2000) { it.join() } }
+            }
             out.toString().trim()
         } catch (e: IOException) {
             ""
         } finally {
-            runCatching { reader?.close() }
+            runCatching { outReader?.close() }
+            runCatching { errReader?.close() }
             process?.let { p ->
                 runCatching { p.inputStream.close() }
                 runCatching { p.errorStream.close() }

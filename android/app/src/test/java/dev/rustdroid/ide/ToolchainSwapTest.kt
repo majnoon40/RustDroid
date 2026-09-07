@@ -253,4 +253,212 @@ class ToolchainSwapTest {
             ToolchainTransaction.recoveryAction(pending, prefixInstalled = true, readyMarkerPresent = false, asideExists = false),
         )
     }
+
+    // ------------------------------------------------------------------
+    // Crash-safe pending-marker invariant: install-pending.txt may only
+    // be deleted after the transaction reached a known safe final state.
+    // These tests assert the MARKER's existence, not just thrown
+    // exceptions.
+    // ------------------------------------------------------------------
+
+    /** A fake prefix layout good enough for paths.isInstalled()-style checks. */
+    private fun fakeInstall(root: File, rustc: String): File {
+        val prefix = File(root, "usr").apply { mkdirs() }
+        File(prefix, "bin").mkdirs()
+        File(prefix, "bin/rustc").writeText(rustc)
+        File(prefix, "bin/cargo").writeText(rustc)
+        File(prefix, "lib").mkdirs()
+        File(prefix, "lib/libc++_shared.so").writeText(rustc)
+        File(prefix, "lib/rustdroid-link").mkdirs()
+        return prefix
+    }
+
+    private fun isInstalledLike(prefix: File): Boolean =
+        File(prefix, "bin/rustc").isFile && File(prefix, "bin/cargo").isFile &&
+            File(prefix, "lib/rustdroid-link").isDirectory &&
+            File(prefix, "lib/libc++_shared.so").isFile
+
+    @Test
+    fun `install rollback succeeds - pending marker is removed`() {
+        val prefix = fakeInstall(tmp.root, "broken-new")
+        val aside = File(tmp.root, "usr.old").apply { mkdirs() }
+        File(aside, "bin").mkdirs()
+        File(aside, "bin/rustc").writeText("good-old")
+        val marker = ToolchainTransaction.markerFile(tmp.root)
+        ToolchainTransaction.begin(marker, "dist")
+
+        val failure = ToolchainTransaction.rollbackFailedInstall(marker, prefix, aside)
+
+        assertNull("rollback must succeed", failure)
+        // THE invariant: the marker is gone because the restore COMPLETED
+        assertFalse("marker must be removed after a successful rollback", marker.exists())
+        // and the known-good install is actually back in place
+        assertEquals("good-old", File(prefix, "bin/rustc").readText())
+        assertFalse(aside.exists())
+    }
+
+    @Test
+    fun `install rollback fails - pending marker REMAINS for startup recovery`() {
+        // the unverified prefix cannot be removed (read-only parent blocks
+        // the delete) -> ToolchainSwap.rollback throws -> the marker must
+        // survive so the next startup can retry the restore
+        val parent = tmp.newFolder("rollback-kept")
+        val prefix = fakeInstall(parent, "broken-new")
+        val aside = File(parent, "usr.old").apply { mkdirs() }
+        File(aside, "bin").mkdirs()
+        File(aside, "bin/rustc").writeText("good-old")
+        val marker = ToolchainTransaction.markerFile(parent)
+        ToolchainTransaction.begin(marker, "dist")
+        ToolchainTransaction.advance(marker, "verify")
+        parent.setWritable(false)
+        try {
+            val failure = ToolchainTransaction.rollbackFailedInstall(marker, prefix, aside)
+            // the rollback failure is RETURNED so the caller can attach it
+            // to the original install/verification exception (both stay
+            // visible); it must NOT have been swallowed
+            assertNotNull("rollback must fail", failure)
+            assertTrue(
+                "unexpected failure: ${failure!!.message}",
+                failure.message!!.contains("cannot remove the unverified install"),
+            )
+        } finally {
+            parent.setWritable(true)
+        }
+        // THE invariant: an incomplete rollback NEVER clears the marker
+        assertTrue(
+            "install-pending.txt must remain when the rollback failed",
+            marker.exists(),
+        )
+        // and the pending record is still complete enough to act on
+        val still = ToolchainTransaction.read(marker)
+        assertNotNull(still)
+        assertEquals("verify", still!!.stage)
+        // the known-good install is still retained for the retry
+        assertTrue(File(aside, "bin/rustc").isFile)
+    }
+
+    @Test
+    fun `startup recovery fails - pending marker REMAINS`() {
+        // crash state: prefix = new-unverified, aside = old known-good ->
+        // RESTORE_ASIDE; the restore itself fails (blocked prefix delete)
+        val parent = tmp.newFolder("recovery-fail")
+        val prefix = fakeInstall(parent, "broken-new")
+        val staging = File(parent, "usr.new")
+        val aside = File(parent, "usr.old").apply { mkdirs() }
+        File(aside, "bin").mkdirs()
+        File(aside, "bin/rustc").writeText("good-old")
+        val marker = ToolchainTransaction.markerFile(parent)
+        ToolchainTransaction.begin(marker, "dist")
+        parent.setWritable(false)
+        try {
+            val safe = ToolchainTransaction.runRecovery(
+                marker, prefix, staging, aside,
+                readyMarker = File(prefix, ".rustdroid-verified"),
+                isInstalled = { isInstalledLike(prefix) },
+            )
+            assertFalse("recovery must report incomplete", safe)
+        } finally {
+            parent.setWritable(true)
+        }
+        // THE invariant: recovery did NOT reach a safe final state, so
+        // the marker survives — never silently promote an unresolved
+        // install to a clean state
+        assertTrue(
+            "install-pending.txt must remain when recovery failed",
+            marker.exists(),
+        )
+        assertTrue(File(aside, "bin/rustc").isFile) // retry material intact
+    }
+
+    @Test
+    fun `a later startup retries recovery because the marker still exists`() {
+        // first startup: recovery fails (transient filesystem problem)
+        // second startup: the retained marker drives the retry, which
+        // now succeeds and clears the marker
+        val parent = tmp.newFolder("recovery-retry")
+        val prefix = fakeInstall(parent, "broken-new")
+        val staging = File(parent, "usr.new")
+        val aside = File(parent, "usr.old").apply { mkdirs() }
+        File(aside, "bin").mkdirs()
+        File(aside, "bin/rustc").writeText("good-old")
+        val marker = ToolchainTransaction.markerFile(parent)
+        ToolchainTransaction.begin(marker, "dist")
+
+        // ---- startup 1: the restore fails ----
+        parent.setWritable(false)
+        try {
+            assertFalse(
+                ToolchainTransaction.runRecovery(
+                    marker, prefix, staging, aside,
+                    readyMarker = File(prefix, ".rustdroid-verified"),
+                    isInstalled = { isInstalledLike(prefix) },
+                )
+            )
+        } finally {
+            parent.setWritable(true)
+        }
+        assertTrue(marker.exists()) // the retry record survived
+
+        // ---- startup 2: the marker still exists, so recovery runs again ----
+        // (runRecovery only does anything BECAUSE the marker is present —
+        // a cleared marker would have meant "nothing owed")
+        assertNotNull(ToolchainTransaction.read(marker))
+        val safe = ToolchainTransaction.runRecovery(
+            marker, prefix, staging, aside,
+            readyMarker = File(prefix, ".rustdroid-verified"),
+            isInstalled = { isInstalledLike(prefix) },
+        )
+
+        assertTrue("second recovery must complete", safe)
+        // restored, and the marker cleared exactly because it completed
+        assertEquals("good-old", File(prefix, "bin/rustc").readText())
+        assertFalse(aside.exists())
+        assertFalse("marker must be removed once recovery completes", marker.exists())
+    }
+
+    @Test
+    fun `fresh install with nothing to restore still clears the marker`() {
+        // verification failed on a FIRST install (no previous toolchain,
+        // no aside): a failed-but-terminal state — the marker is cleared
+        // because there is nothing recovery could retry
+        val prefix = fakeInstall(tmp.root, "broken-new")
+        val marker = ToolchainTransaction.markerFile(tmp.root)
+        ToolchainTransaction.begin(marker, "dist")
+
+        val failure = ToolchainTransaction.rollbackFailedInstall(
+            marker, prefix, File(tmp.root, "usr.old"),
+        )
+
+        assertNull(failure)
+        assertFalse(marker.exists())
+        // the unverified prefix itself is left for the next install to
+        // replace (and initialState() reports NotInstalled: no ready
+        // marker inside it)
+        assertFalse(File(prefix, ".rustdroid-verified").exists())
+    }
+
+    @Test
+    fun `startup recovery of a verified install finishes the transaction`() {
+        // crash after VERIFY passed (ready marker written) but before
+        // READY: recovery keeps the verified prefix, drops the aside and
+        // clears the marker
+        val prefix = fakeInstall(tmp.root, "verified-new")
+        File(prefix, ".rustdroid-verified").writeText("verified=1\n")
+        val aside = File(tmp.root, "usr.old").apply { mkdirs() }
+        File(aside, "bin").mkdirs()
+        File(aside, "bin/rustc").writeText("old")
+        val marker = ToolchainTransaction.markerFile(tmp.root)
+        ToolchainTransaction.begin(marker, "dist")
+
+        val safe = ToolchainTransaction.runRecovery(
+            marker, prefix, File(tmp.root, "usr.new"), aside,
+            readyMarker = File(prefix, ".rustdroid-verified"),
+            isInstalled = { isInstalledLike(prefix) },
+        )
+
+        assertTrue(safe)
+        assertEquals("verified-new", File(prefix, "bin/rustc").readText())
+        assertFalse(aside.exists())
+        assertFalse(marker.exists())
+    }
 }

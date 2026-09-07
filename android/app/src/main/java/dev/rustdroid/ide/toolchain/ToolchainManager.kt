@@ -225,8 +225,9 @@ class ToolchainManager(
             runVerifyLocked()
 
             if (_state.value is ToolchainState.Ready) {
-                // READY — make it final: delete the retained old install,
-                // then clear the transaction marker
+                // READY — a KNOWN SAFE FINAL STATE (verification passed,
+                // the verified prefix is in place): delete the retained
+                // old install, then clear the transaction marker
                 withContext(Dispatchers.IO) {
                     if (!ToolchainSwap.commit(aside)) {
                         log("WARN: could not delete the old toolchain at ${aside.path} — retried on the next install")
@@ -237,21 +238,23 @@ class ToolchainManager(
                 }
             } else {
                 // verification FAILED: restore the previous known-good
-                // install from aside (when one exists)
+                // install from aside (when one exists). CRASH-SAFE MARKER
+                // INVARIANT: [ToolchainTransaction.rollbackFailedInstall]
+                // clears the pending marker ONLY when the restore
+                // actually completed — a failed rollback keeps it so
+                // startup recovery retries on the next launch.
                 withContext(Dispatchers.IO) {
-                    if (aside.exists()) {
-                        try {
-                            ToolchainSwap.rollback(paths.prefix, aside)
-                            log("verification failed — previous toolchain restored")
-                            // the restored install is the working one; its
-                            // own ready marker makes the state truthful
-                            _state.value = initialState()
-                        } catch (rb: java.io.IOException) {
-                            log("FAILED to restore the previous toolchain: ${rb.message}")
-                            // keep the Failed state — the prefix is unusable
-                        }
+                    val rollbackFailure = ToolchainTransaction.rollbackFailedInstall(
+                        marker, paths.prefix, aside,
+                    ) { line -> log("verification failed — $line") }
+                    if (rollbackFailure == null) {
+                        // restored (or nothing to restore): the previous
+                        // install's own ready marker makes the state
+                        // truthful
+                        _state.value = initialState()
                     }
-                    ToolchainTransaction.clear(marker)
+                    // rollbackFailure != null: keep the Failed state and
+                    // KEEP the marker — recovery is still owed
                 }
             }
 
@@ -271,16 +274,19 @@ class ToolchainManager(
             if (swapped) {
                 // the new prefix is in place but unverified: restore the
                 // previous known-good one. A rollback failure must not
-                // replace the original failure — attach it.
-                withContext(Dispatchers.IO) {
-                    try {
-                        ToolchainSwap.rollback(paths.prefix, paths.aside)
-                    } catch (rb: java.io.IOException) {
-                        e.addSuppressed(rb)
-                    }
-                    ToolchainTransaction.clear(paths.pendingInstall)
+                // replace the original failure — attach it (BOTH stay
+                // visible). The pending marker is cleared only when the
+                // restore completed; on rollback failure it REMAINS on
+                // disk so startup recovery can retry.
+                val rollbackFailure = withContext(Dispatchers.IO) {
+                    ToolchainTransaction.rollbackFailedInstall(
+                        paths.pendingInstall, paths.prefix, paths.aside,
+                    ) { line -> log(line) }
                 }
-                _state.value = initialState()
+                rollbackFailure?.let { e.addSuppressed(it) }
+                if (rollbackFailure == null) {
+                    _state.value = initialState()
+                }
             }
             val current = _state.value
             if (current is ToolchainState.Failed) {
@@ -367,46 +373,29 @@ class ToolchainManager(
 
     /**
      * Startup crash recovery for an interrupted install transaction.
-     * Decision table lives in [ToolchainTransaction.recoveryAction];
-     * this only executes it with checked file operations and logging.
-     * Guarded by the mutex so it cannot race a user-triggered install.
+     * Decision table + execution live in
+     * [ToolchainTransaction.runRecovery], which enforces the crash-safe
+     * marker invariant: the pending marker survives any recovery that
+     * did NOT complete, so a later startup retries it. Guarded by the
+     * mutex so it cannot race a user-triggered install.
      */
     private suspend fun recoverInterruptedInstall() = mutex.withLock {
         val marker = paths.pendingInstall
-        val pending = ToolchainTransaction.read(marker) ?: return
+        if (ToolchainTransaction.read(marker) == null) return
         withContext(Dispatchers.IO) {
-            val action = ToolchainTransaction.recoveryAction(
-                pending = pending,
-                prefixInstalled = paths.isInstalled(),
-                readyMarkerPresent = paths.readyMarker.isFile,
-                asideExists = paths.aside.exists(),
+            val reachedSafeState = ToolchainTransaction.runRecovery(
+                marker = marker,
+                prefix = paths.prefix,
+                staging = paths.staging,
+                aside = paths.aside,
+                readyMarker = paths.readyMarker,
+                isInstalled = { paths.isInstalled() },
+                log = { line -> log(line) },
             )
-            when (action) {
-                ToolchainTransaction.Action.NONE -> return@withContext
-                ToolchainTransaction.Action.KEEP_VERIFIED -> {
-                    // crashed after verification passed (ready marker
-                    // written) but before commit/clear: finish the job
-                    if (!ToolchainSwap.commit(paths.aside)) {
-                        log("recovery: could not delete the old toolchain at ${paths.aside.path} (retried next install)")
-                    }
-                    log("recovered interrupted install (stage=${pending.stage}): verified toolchain kept")
-                }
-                ToolchainTransaction.Action.RESTORE_ASIDE -> {
-                    try {
-                        ToolchainSwap.rollback(paths.prefix, paths.aside)
-                        Fs.deleteRecursively(paths.staging)
-                        log("recovered interrupted install (stage=${pending.stage}): previous toolchain restored")
-                    } catch (rb: java.io.IOException) {
-                        log("recovery FAILED to restore the previous toolchain: ${rb.message}")
-                    }
-                }
-                ToolchainTransaction.Action.DISCARD -> {
-                    Fs.deleteRecursively(paths.staging)
-                    log("recovered interrupted install (stage=${pending.stage}): nothing usable — cleaned up")
-                }
-            }
-            if (!ToolchainTransaction.clear(marker)) {
-                log("recovery: could not clear ${marker.path} — will retry at next startup")
+            if (!reachedSafeState) {
+                // the marker is still on disk BY DESIGN — this is the
+                // retry record, not a leftover
+                log("recovery incomplete — ${marker.name} retained for the next startup")
             }
             // disk truth becomes the state (Ready when a verified install
             // survived, NotInstalled otherwise)
