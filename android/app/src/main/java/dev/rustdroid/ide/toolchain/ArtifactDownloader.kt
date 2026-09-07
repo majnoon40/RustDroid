@@ -31,6 +31,14 @@ import java.util.concurrent.TimeUnit
  *    and failing the checksum (the old failure loop).
  *  - a checksum mismatch deletes the .part file (and its sidecar) —
  *    corrupt data must never be resumed.
+ *  - RESTART discipline: a restart-from-zero (416, If-Range mismatch,
+ *    size drift, unreadable resume prefix) stays INSIDE the attempt —
+ *    it consumes no network retry budget — but is itself bounded by
+ *    [MAX_RESTARTS_PER_ATTEMPT] so a pathological server cannot loop
+ *    the download forever. A discard that fails to actually delete the
+ *    .part/.meta files is a LOCAL filesystem failure: it throws instead
+ *    of retrying, because retrying against an undeletable partial is
+ *    an infinite loop by another name.
  */
 class ArtifactDownloader(baseClient: OkHttpClient) {
 
@@ -69,9 +77,25 @@ class ArtifactDownloader(baseClient: OkHttpClient) {
         runCatching { f.writeText("${etag ?: ""}\n${total ?: ""}\n") }
     }
 
-    internal fun discardPart(part: File) {
-        part.delete()
-        metaFile(part).delete()
+    internal fun discardPart(part: File): Boolean {
+        val partGone = !part.exists() || part.delete()
+        val metaGone = metaFile(part).let { !it.exists() || it.delete() }
+        return partGone && metaGone
+    }
+
+    /**
+     * Discards a partial file, throwing when the local filesystem cannot
+     * actually remove it — an undeletable .part means every future attempt
+     * restarts from the same corrupted prefix forever. Distinct from a
+     * NETWORK failure (retryable) and from a clean restart (free).
+     */
+    internal fun discardPartOrThrow(part: File) {
+        if (!discardPart(part)) {
+            throw IOException(
+                "cannot discard partial download at ${part.path} " +
+                    "(local filesystem error — remove it manually and retry)"
+            )
+        }
     }
 
     /**
@@ -134,12 +158,32 @@ class ArtifactDownloader(baseClient: OkHttpClient) {
         dest: File,
         expectedSha256: String?,
         onProgress: (Long, Long?) -> Unit,
+    ) = attemptLoop(url, tmp, dest, expectedSha256, onProgress) { builder ->
+        client.newCall(builder.build()).execute()
+    }
+
+    /**
+     * The download loop for one attempt, parameterized over the HTTP
+     * exchange so tests can script response sequences without sockets.
+     *
+     * A clean restart loops here at most [MAX_RESTARTS_PER_ATTEMPT] times
+     * (partial discarded -> next iteration has haveBytes == 0 and requests
+     * the full body). Unbounded would let a pathological server
+     * (alternating 200/206 with a half-written partial) loop the download
+     * forever.
+     */
+    internal fun attemptLoop(
+        url: String,
+        tmp: File,
+        dest: File,
+        expectedSha256: String?,
+        onProgress: (Long, Long?) -> Unit,
+        exchange: (Request.Builder) -> okhttp3.Response,
     ) {
-        // A clean restart loops here at most once (partial discarded ->
-        // next iteration has haveBytes == 0 and requests the full body).
+        var restarts = 0
         while (true) {
             val resumeFrom = if (tmp.isFile) tmp.length() else 0L
-            if (resumeFrom == 0L) discardPart(tmp)
+            if (resumeFrom == 0L) discardPartOrThrow(tmp)
             val meta = readMeta(tmp)
 
             val builder = Request.Builder()
@@ -152,14 +196,22 @@ class ArtifactDownloader(baseClient: OkHttpClient) {
             }
 
             val response = try {
-                client.newCall(builder.build()).execute()
+                exchange(builder)
             } catch (e: IOException) {
                 throw IOException("network error: ${e.message}")
             }
             val outcome = response.use { resp ->
                 handleResponse(resp, tmp, dest, expectedSha256, onProgress, resumeFrom, meta)
             }
-            if (outcome == Outcome.RESTART) continue
+            if (outcome == Outcome.RESTART) {
+                if (++restarts > MAX_RESTARTS_PER_ATTEMPT) {
+                    throw IOException(
+                        "download restarted from zero $restarts times — " +
+                            "the server keeps rejecting resume attempts; giving up"
+                    )
+                }
+                continue
+            }
             return
         }
     }
@@ -177,11 +229,13 @@ class ArtifactDownloader(baseClient: OkHttpClient) {
     ): Outcome {
         when {
             // Range not satisfiable — the .part file is already at full
-            // size from a run whose rename never happened; the retry loop
-            // starts the next attempt clean.
+            // size from a run whose rename never happened. Restart from
+            // zero INSIDE this attempt: a local bookkeeping fix must not
+            // burn a network retry (with backoff), and the next loop
+            // iteration requests the full body.
             resp.code == 416 && resumeFrom > 0 -> {
-                discardPart(tmp)
-                throw IOException("server rejected resume (HTTP 416) — restarting from zero")
+                discardPartOrThrow(tmp)
+                return Outcome.RESTART
             }
             !resp.isSuccessful -> throw IOException("HTTP ${resp.code} fetching bundle")
         }
@@ -196,7 +250,7 @@ class ArtifactDownloader(baseClient: OkHttpClient) {
                 // asset changed server-side (or no range support): discard
                 // the stale prefix and take the full body — same attempt,
                 // no retry budget burned
-                discardPart(tmp)
+                discardPartOrThrow(tmp)
                 return Outcome.RESTART
             }
             // fresh start: record ETag + total for future resumes
@@ -228,8 +282,11 @@ class ArtifactDownloader(baseClient: OkHttpClient) {
                 }
             }
             if (written != resumeFrom) {
-                discardPart(tmp)
-                throw IOException("resume prefix unreadable — restarting from zero")
+                // prefix drifted under us (truncated/replaced): a LOCAL
+                // inconsistency, not a network error — fix it inside this
+                // attempt instead of burning a network retry
+                discardPartOrThrow(tmp)
+                return Outcome.RESTART
             }
         }
 
@@ -256,16 +313,20 @@ class ArtifactDownloader(baseClient: OkHttpClient) {
         }
         val sha = digest.digest().joinToString("") { "%02x".format(it) }
         if (expectedSha256 != null && expectedSha256.length == 64 && sha != expectedSha256) {
-            discardPart(tmp) // corrupt data must never be resumed
+            discardPartOrThrow(tmp) // corrupt data must never be resumed
             throw IOException(
                 "checksum mismatch: got $sha, expected $expectedSha256 — " +
                     "the download was corrupted or the release changed"
             )
         }
-        if (dest.exists()) dest.delete()
+        // POSIX rename(2) replaces an existing target, so try the direct
+        // rename first; delete-then-rename is only the fallback (checked —
+        // an unchecked delete would silently leave a stale dest behind)
         if (!tmp.renameTo(dest)) {
-            discardPart(tmp)
-            throw IOException("cannot finalize download at ${dest.path}")
+            if ((dest.exists() && !dest.delete()) || !tmp.renameTo(dest)) {
+                discardPartOrThrow(tmp)
+                throw IOException("cannot finalize download at ${dest.path}")
+            }
         }
         metaFile(tmp).delete()
         onProgress(written, total)
@@ -274,6 +335,7 @@ class ArtifactDownloader(baseClient: OkHttpClient) {
 
     private companion object {
         const val MAX_ATTEMPTS = 4
+        const val MAX_RESTARTS_PER_ATTEMPT = 3
         val BACKOFF_MS = longArrayOf(1_000L, 3_000L, 7_000L)
     }
 }

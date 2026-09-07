@@ -124,15 +124,24 @@ do_prepare() {
     if [[ ! -d "$NDK_ROOT" ]] || needs_force "$1"; then
         log "downloading NDK $NDK_VERSION (~1.5GB)..."
         local ndk_zip="${RUSTDROID_STAGE_PREFIX}/${NDK_ZIP_NAME}"
+        # --fail: an HTTP error page never becomes the archive. The SHA1
+        # below then proves the bytes: it is the checksum Google OFFICIALLY
+        # publishes for NDK archives (the .sha1 sidecar on dl.google.com;
+        # no SHA-256 is published for them) and it is tied to the exact
+        # pinned $NDK_VERSION/$NDK_ZIP_NAME in env.sh.
         curl -L --fail -o "$ndk_zip" "$NDK_ZIP_URL" \
             || fail "NDK download failed from $NDK_ZIP_URL"
-        # SHA1 check (warn-only unless NDK_SHA1_REQUIRED=1).
+        # SHA1 check: REQUIRED by default (CI and release builds must never
+        # continue past a mismatch). Opting out is explicit and logged:
+        # NDK_SHA1_REQUIRED=0 is for a VERIFIED Google checksum rotation
+        # only — silent acceptance is how a corrupted or tampered archive
+        # becomes the toolchain's foundation.
         local actual_sha1; actual_sha1=$(sha1sum "$ndk_zip" | awk '{print $1}')
         if [[ "$actual_sha1" != "$NDK_SHA1_KNOWN" ]]; then
-            if [[ "${NDK_SHA1_REQUIRED:-0}" == "1" ]]; then
-                fail "NDK SHA1 mismatch: got $actual_sha1, expected $NDK_SHA1_KNOWN"
+            if [[ "${NDK_SHA1_REQUIRED:-1}" != "0" ]]; then
+                fail "NDK SHA1 mismatch: got $actual_sha1, expected $NDK_SHA1_KNOWN — refusing to continue (set NDK_SHA1_REQUIRED=0 only after verifying Google rotated the archive)"
             else
-                log "WARN: NDK SHA1 mismatch (got $actual_sha1, expected $NDK_SHA1_KNOWN) — Google may have rotated the checksum; continuing"
+                log "WARN: NDK SHA1 mismatch override (got $actual_sha1, expected $NDK_SHA1_KNOWN) — continuing at your own risk"
             fi
         fi
         log "extracting NDK..."

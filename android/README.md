@@ -121,28 +121,39 @@ bundle. Bump together with the release tag when a new toolchain ships.
 `publish-release.yml` (repo root `.github/`) builds the bundle from a
 completed CI run and records checksums in the release.
 
-### Install pipeline: failures never cost the working install
+### Install pipeline: a crash-safe transaction — failures never cost the working install
 
 The install order is fetch-first: the bundle (download or SAF import) is
 spooled COMPLETELY to cache before the prefix is touched, extraction runs
-into a staging dir (`files/usr.new`), and only a fully extracted tree is
-swapped in (`ToolchainSwap`: prefix → `usr.old` → staging → prefix →
-delete `usr.old`, restoring the old install if the final move fails). The
-old flow uninstalled before downloading, so a dead network mid-download
-left the user with no toolchain at all; a failed extraction now costs
-nothing but the cache zip. Free-space preflights (`EXPECTED_INSTALLED_
-BYTES`) run before the download and again before extraction, so a full
-disk produces a clear "not enough free space" failure instead of a
-mid-extraction ENOSPC stranding a partial prefix. Import progress uses a
-threshold (not modulo) after the first short SAF read — modulo never
-fires again and progress looks hung.
+into a staging dir (`files/usr.new`), and the swap-in is one step of a
+durable transaction: an external `files/install-pending.txt` marker
+(atomic + fsync) is written BEFORE any destructive step, then
+`ToolchainSwap` moves prefix → `usr.old` (the old install is RETAINED),
+staging → prefix. Verification is the gate: on success the ready marker
+is written (atomic + fsync) and `commit` deletes `usr.old`; on failure
+`rollback` restores the previous known-good install. A crash at ANY
+boundary is reconciled at next startup by `recoverInterruptedInstall`
+(keep-verified / restore-old / discard — the decision table is pure and
+unit-tested). The old flow uninstalled before downloading, so a dead
+network mid-download left the user with no toolchain at all; now a failed
+download costs the cache zip, a failed extraction costs nothing, and a
+failed verification costs one retry tap. Free-space preflights
+(`EXPECTED_INSTALLED_BYTES`) run before the download and again before
+extraction, so a full disk produces a clear "not enough free space"
+failure instead of a mid-extraction ENOSPC stranding a partial prefix.
+Import progress uses a threshold (not modulo) after the first short SAF
+read — modulo never fires again and progress looks hung.
 
 Download resume is validated: the first response's ETag + total size are
 kept in a `<file>.part.meta` sidecar and resumes send `If-Range`. A
 changed asset answers 200 (or a 206 whose total no longer matches) — both
 cases discard the stale partial and restart cleanly in the same attempt,
 instead of appending new bytes onto the old prefix and failing the
-checksum four times. The resume re-hash reports progress so the
+checksum four times. Restart-from-zero (including HTTP 416 and unreadable
+resume prefixes) never consumes the network retry budget, but is itself
+bounded — a pathological server cannot loop the download forever — and a
+partial that cannot actually be deleted fails loud as a local filesystem
+error instead of looping. The resume re-hash reports progress so the
 multi-second pause reads as work, not a hang.
 
 Extraction is two-pass for link entries: hardlinks and symlinks are
@@ -320,9 +331,19 @@ guarded on the current destination.
   be killed by the OS — incremental cache softens restarts.
 - One build per project at a time (by design; `cargo` locks target/ anyway).
 - Build cancellation kills the process tree by walking /proc and
-  SIGKILLing descendants (best effort — a pid-extraction failure degrades
-  to signalling only the direct child, and orphaned grandchildren that
-  spawn between the scan and the signal can slip through).
+  signalling descendants — but never on PID alone: every process is
+  captured as PID + `/proc/<pid>/stat` start time, revalidated before
+  EVERY signal, so a PID that exited and was reused between discovery
+  and the kill is never touched. Known descendants are SIGSTOP-frozen
+  before the parent dies (nothing new spawns, nothing escapes), the
+  tree is re-walked while the root PID still belongs to the original
+  process, and the final SIGKILL sweeps are bounded and
+  identity-checked. A pid-extraction failure or missing /proc degrades
+  to signalling only the direct child.
+- Cancellation is never misreported as failure: the install/verify path
+  rethrows `CancellationException` before any generic catch, so a
+  backgrounded service being torn down does not surface as
+  "installation failed".
 - No instrumented test tier yet: nothing in CI runs on a device/emulator,
   so the exec-from-app-data premise is validated only manually. The
   real-bundle extraction test skips loudly (console prints a warning)

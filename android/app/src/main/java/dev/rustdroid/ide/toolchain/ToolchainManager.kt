@@ -64,10 +64,23 @@ class ToolchainManager(
         if (_state.value is ToolchainState.Ready) {
             defaultScope.launch { writeCargoDefaults() }
         }
+        // Crash recovery: an install interrupted between SWAP and READY
+        // leaves a pending-transaction marker on disk. Reconcile it BEFORE
+        // any user-triggered action can race the repair.
+        defaultScope.launch { recoverInterruptedInstall() }
     }
 
-    /** Extra log lines surfaced by the UI (extraction/verify output tail). */
-    val logTail = ArrayDeque<String>()
+    /**
+     * Extra log lines surfaced by the UI (extraction/verify output tail).
+     * [logTail] stays private; readers get an immutable snapshot via
+     * [logTailSnapshot] — iterating a live ArrayDeque from the UI thread
+     * while an install thread mutates it is a ConcurrentModificationException
+     * waiting to happen.
+     */
+    private val logTail = ArrayDeque<String>()
+
+    /** Immutable copy of the log tail (newest last), safe from any thread. */
+    fun logTailSnapshot(): List<String> = synchronized(logTail) { logTail.toList() }
 
     private fun initialState(): ToolchainState {
         // Fast path: the ready marker is only written after a fully green
@@ -157,6 +170,7 @@ class ToolchainManager(
         }
 
     private suspend fun installWith(fetch: suspend (File) -> File) = mutex.withLock {
+        var swapped = false
         try {
             paths.ensureDirs()
             ProcEnv.ensureDirs(context.filesDir)
@@ -174,19 +188,30 @@ class ToolchainManager(
             //    download just consumed space; usableSpace reflects that).
             requireFreeSpace(ToolchainDistro.EXPECTED_INSTALLED_BYTES, "toolchain extraction")
 
-            // 3) Extract into a STAGING dir and swap into place — a failed
-            //    or interrupted extraction must never leave a half-written
-            //    prefix either. The swap restores the old install if the
-            //    final move fails.
+            // 3) Extract into a STAGING dir, then swap into place as ONE
+            //    step of a durable transaction:
+            //      PENDING marker (before any destructive step)
+            //      prefix -> aside (old install RETAINED for rollback)
+            //      staging -> prefix
+            //      VERIFY (the smoke test is the gate)
+            //      READY: commit deletes aside; marker cleared
+            //    A crash at any boundary is recovered at startup; a FAILED
+            //    verification restores the previous known-good install.
             _state.value = ToolchainState.Extracting(0, null)
-            val staging = File(context.filesDir, "usr.new")
+            val staging = paths.staging
+            val aside = paths.aside
+            val marker = paths.pendingInstall
             withContext(Dispatchers.IO) {
                 Fs.deleteRecursively(staging)
                 try {
                     val info = extractor.install(zip, staging) { done, total ->
                         _state.value = ToolchainState.Extracting(done, total)
                     }
-                    ToolchainSwap.swap(paths.prefix, staging, File(context.filesDir, "usr.old"))
+                    // PENDING — durably recorded BEFORE the destructive swap
+                    ToolchainTransaction.begin(marker, ToolchainDistro.RELEASE_TAG)
+                    ToolchainSwap.swap(paths.prefix, staging, aside)
+                    swapped = true
+                    ToolchainTransaction.advance(marker, "verify")
                     log("toolchain ${info.rustVersion} installed (kit files: ${info.kitEntryCount})")
                 } finally {
                     // staging is gone (swapped) or failed — never keep it
@@ -194,20 +219,88 @@ class ToolchainManager(
                 }
             }
 
-            // 4) Verify — the smoke test is the gate
+            // 4) Verify — the smoke test is the gate. runVerifyLocked()
+            //    writes the ready marker (atomically, fsync'd) only on a
+            //    fully green run.
             runVerifyLocked()
+
+            if (_state.value is ToolchainState.Ready) {
+                // READY — make it final: delete the retained old install,
+                // then clear the transaction marker
+                withContext(Dispatchers.IO) {
+                    if (!ToolchainSwap.commit(aside)) {
+                        log("WARN: could not delete the old toolchain at ${aside.path} — retried on the next install")
+                    }
+                    if (!ToolchainTransaction.clear(marker)) {
+                        log("WARN: could not clear ${marker.path} — startup recovery will re-run")
+                    }
+                }
+            } else {
+                // verification FAILED: restore the previous known-good
+                // install from aside (when one exists)
+                withContext(Dispatchers.IO) {
+                    if (aside.exists()) {
+                        try {
+                            ToolchainSwap.rollback(paths.prefix, aside)
+                            log("verification failed — previous toolchain restored")
+                            // the restored install is the working one; its
+                            // own ready marker makes the state truthful
+                            _state.value = initialState()
+                        } catch (rb: java.io.IOException) {
+                            log("FAILED to restore the previous toolchain: ${rb.message}")
+                            // keep the Failed state — the prefix is unusable
+                        }
+                    }
+                    ToolchainTransaction.clear(marker)
+                }
+            }
 
             // Clean the 100+ MB zip: prefix is self-contained now
             paths.bundleZip.delete()
-        } catch (e: Exception) {
-            val stage = when (val s = _state.value) {
-                is ToolchainState.Downloading -> "download"
-                is ToolchainState.Extracting -> "extraction"
-                is ToolchainState.Verifying -> "verification"
-                else -> "install"
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // A cancelled install is NOT a failure: coroutine cancellation
+            // must propagate (the service scope or VM scope is going away).
+            // If the swap already happened, the pending marker stays on
+            // disk and startup recovery restores the previous install.
+            when (val s = _state.value) {
+                is ToolchainState.Ready, is ToolchainState.Failed, is ToolchainState.NotInstalled -> {}
+                else -> _state.value = ToolchainState.NotInstalled // stale progress state
             }
-            log("FAILED at $stage: ${e.message}")
-            _state.value = ToolchainState.Failed(stage, e.message ?: e.javaClass.simpleName)
+            throw e
+        } catch (e: Exception) {
+            if (swapped) {
+                // the new prefix is in place but unverified: restore the
+                // previous known-good one. A rollback failure must not
+                // replace the original failure — attach it.
+                withContext(Dispatchers.IO) {
+                    try {
+                        ToolchainSwap.rollback(paths.prefix, paths.aside)
+                    } catch (rb: java.io.IOException) {
+                        e.addSuppressed(rb)
+                    }
+                    ToolchainTransaction.clear(paths.pendingInstall)
+                }
+                _state.value = initialState()
+            }
+            val current = _state.value
+            if (current is ToolchainState.Failed) {
+                // a more specific failure was already recorded (e.g. a
+                // verification check) — keep its stage, do NOT relabel it
+                // as a generic "install" failure
+                log("FAILED at ${current.stage}: ${current.message}")
+            } else {
+                val stage = when (val s = _state.value) {
+                    is ToolchainState.Downloading -> "download"
+                    is ToolchainState.Extracting -> "extraction"
+                    is ToolchainState.Verifying -> "verification"
+                    else -> "install"
+                }
+                log("FAILED at $stage: ${e.message}")
+                _state.value = ToolchainState.Failed(stage, e.message ?: e.javaClass.simpleName)
+                if (e.suppressed.isNotEmpty()) {
+                    e.suppressed.forEach { log("  (also: ${it.message})") }
+                }
+            }
         }
     }
 
@@ -248,12 +341,15 @@ class ToolchainManager(
             val env = ProcEnv.env(paths.prefix, context.filesDir)
             val rustc = runner.probe(listOf(paths.rustc.absolutePath, "--version"), env)
             val cargo = runner.probe(listOf(paths.cargo.absolutePath, "--version"), env)
-            paths.readyMarker.writeText(
+            // The ready marker is the durable READY record of the
+            // transaction — atomic + fsync'd, never a torn file
+            Fs.writeAtomic(
+                paths.readyMarker,
                 buildString {
                     appendLine("verified=${System.currentTimeMillis()}")
                     appendLine("rustc_version=${firstLine(rustc)}")
                     appendLine("cargo_version=${firstLine(cargo)}")
-                }
+                },
             )
             writeCargoDefaults()
             _state.value = ToolchainState.Ready(firstLine(rustc), firstLine(cargo))
@@ -266,6 +362,55 @@ class ToolchainManager(
                 "check '${first.title}' failed: ${first.detail ?: "unknown"}"
             )
             log("verification FAILED (${failed.size} checks)")
+        }
+    }
+
+    /**
+     * Startup crash recovery for an interrupted install transaction.
+     * Decision table lives in [ToolchainTransaction.recoveryAction];
+     * this only executes it with checked file operations and logging.
+     * Guarded by the mutex so it cannot race a user-triggered install.
+     */
+    private suspend fun recoverInterruptedInstall() = mutex.withLock {
+        val marker = paths.pendingInstall
+        val pending = ToolchainTransaction.read(marker) ?: return
+        withContext(Dispatchers.IO) {
+            val action = ToolchainTransaction.recoveryAction(
+                pending = pending,
+                prefixInstalled = paths.isInstalled(),
+                readyMarkerPresent = paths.readyMarker.isFile,
+                asideExists = paths.aside.exists(),
+            )
+            when (action) {
+                ToolchainTransaction.Action.NONE -> return@withContext
+                ToolchainTransaction.Action.KEEP_VERIFIED -> {
+                    // crashed after verification passed (ready marker
+                    // written) but before commit/clear: finish the job
+                    if (!ToolchainSwap.commit(paths.aside)) {
+                        log("recovery: could not delete the old toolchain at ${paths.aside.path} (retried next install)")
+                    }
+                    log("recovered interrupted install (stage=${pending.stage}): verified toolchain kept")
+                }
+                ToolchainTransaction.Action.RESTORE_ASIDE -> {
+                    try {
+                        ToolchainSwap.rollback(paths.prefix, paths.aside)
+                        Fs.deleteRecursively(paths.staging)
+                        log("recovered interrupted install (stage=${pending.stage}): previous toolchain restored")
+                    } catch (rb: java.io.IOException) {
+                        log("recovery FAILED to restore the previous toolchain: ${rb.message}")
+                    }
+                }
+                ToolchainTransaction.Action.DISCARD -> {
+                    Fs.deleteRecursively(paths.staging)
+                    log("recovered interrupted install (stage=${pending.stage}): nothing usable — cleaned up")
+                }
+            }
+            if (!ToolchainTransaction.clear(marker)) {
+                log("recovery: could not clear ${marker.path} — will retry at next startup")
+            }
+            // disk truth becomes the state (Ready when a verified install
+            // survived, NotInstalled otherwise)
+            _state.value = initialState()
         }
     }
 
@@ -283,6 +428,10 @@ class ToolchainManager(
         Fs.deleteRecursively(paths.prefix)
         paths.readyMarker.delete()
         paths.bundleZip.delete()
+        // transaction leftovers must not outlive an explicit uninstall
+        Fs.deleteRecursively(paths.aside)
+        Fs.deleteRecursively(paths.staging)
+        ToolchainTransaction.clear(paths.pendingInstall)
         _state.value = ToolchainState.NotInstalled
         log("toolchain removed")
     }
@@ -377,6 +526,9 @@ class ToolchainManager(
                 ?: throw java.io.IOException("cannot open $uri")
             stream.use { s -> installFromImport { s } }
             _state.value is ToolchainState.Ready
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // cancellation is not a failure result — propagate it
+            throw e
         } catch (e: Exception) {
             false
         }

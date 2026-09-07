@@ -457,3 +457,104 @@ Not addressed (documented as Known v1 limits): instrumented test tier
 (device/emulator) — the exec-from-app-data premise still rests on manual
 validation; hardlink-restore edge in ToolchainSwap is covered for the
 missing-staging case only.
+
+## 7. Crash/cancellation hardening (independent third-pass audit, 2026-09-07)
+
+A follow-up audit focused on process-tree termination, transactional
+installs, cancellation propagation, and CI determinism. Landed in v0.1.4
+(179 JVM tests, 0 failures):
+
+- **P0 PID-reuse-safe tree kill**: `ProcTree` now tracks every process as
+  `ProcessId(pid, /proc/<pid>/stat field-22 start time)`, not a bare PID.
+  `terminateTree` is the full sequence: capture root identity → snapshot
+  descendants (identity-bearing) → SIGSTOP each still-matching one →
+  terminate the root → re-discover late spawns only while the root PID
+  still belongs to the original process → bounded SIGKILL sweeps that
+  revalidate identity before EVERY signal. A reused PID is never signaled;
+  the root is never its own descendant; processes vanishing mid-walk drop
+  out; missing `/proc` degrades to destroying the direct child. The old
+  `descendantPids` remains as a read-only view.
+- **P1 download restart discipline**: `ArtifactDownloader` restarts
+  (HTTP 416, If-Range mismatch, drifted Content-Range total, unreadable
+  resume prefix) stay INSIDE the attempt — no network-retry budget burned —
+  and are themselves bounded (`MAX_RESTARTS_PER_ATTEMPT`). `discardPart`
+  reports success; an undeletable partial throws a local-failure
+  IOException instead of looping forever. `attemptLoop` is parameterized
+  over the HTTP exchange, so the whole discipline is tested against
+  scripted responses (no sockets).
+- **P1 install as a durable transaction**: `ToolchainTransaction` writes
+  an EXTERNAL marker (`files/install-pending.txt`, atomic+fsync) BEFORE
+  the destructive swap. `ToolchainSwap.swap` retains the old install in
+  `usr.old` until verification passes; `commit` deletes it at READY,
+  `rollback` restores it on verification failure — restoring the previous
+  known-good toolchain when one exists. Every rename/delete is checked;
+  a failed rollback is attached to the original exception via
+  `addSuppressed` (both failures stay visible). Startup recovery
+  (`recoverInterruptedInstall`, pure decision table
+  `recoveryAction` + checked execution) reconciles crash states at every
+  boundary: keep-verified / restore-aside / discard. The ready marker and
+  every atomic write are now fsync'd before rename (power-loss durable).
+  `installWith`'s stage relabeling no longer overwrites a specific
+  "verification" failure with a generic "install" one.
+- **P1 cancellation propagation**: `ToolchainManager.installWith` and
+  `installFromUri` rethrow `CancellationException` before their generic
+  catch (a cancelled install is not a "failure"); `ToolchainVerifier`'s
+  per-check wrapper does the same, so cancellation from the foreground
+  service scope unwinds through verifier → runner → subprocess teardown
+  instead of being recorded as a failed check.
+- **P1/P2 verifier async**: `verify()` is now `suspend`; the four nested
+  `runBlocking` bridges are gone (direct `runner.probe`/`runner.run`
+  calls); `CargoRunner` is `open` so tests can inject hanging runners and
+  prove cancellation propagation end-to-end.
+- **P2 log/console concurrency**: `ToolchainManager.logTail` is private;
+  readers get an immutable `logTailSnapshot()` (a live ArrayDeque iterated
+  from the UI thread was a CME waiting to happen). `ConsoleBuffer`
+  publishes trailing burst lines through a single-shot job owned by the
+  INJECTED scope (viewModelScope) — no leaked global scope, cancelled by
+  explicit flush; `lastPublishMs` access is fully synchronized.
+- **P2 CA bundle mirror**: probe-mirror validity is now digest-based
+  (same-size corruption no longer survives); the copy is atomic+fsync
+  via `Fs.writeAtomic` and re-verified afterwards (a copy that still does
+  not verify is deleted — a corrupt mirror is worse than none). The
+  system-store fallback keeps its PEM-in-hashed-CApath parse with the
+  layout documented; the APK asset stays the deterministic primary.
+- **P2 CI cache correctness**: the LLVM build-tree cache key now covers
+  every input that can affect the tree (bootstrap.toml.template, build.sh,
+  env.sh — which pins RUST_TAG/NDK, patches/**, shims/**); the broad
+  `llvm-` restore-key fallback is REMOVED (a prefix-match restore of an
+  incompatible tree is untrusted-by-default; ccache remains the
+  content-addressed rebuild insurance). ccache and the tree cache stay
+  logically separate with the safety argument documented inline.
+- **P2 verify.sh classification**: warnings are now classified. Hard
+  failures: unexpected absolute RUNPATH (linker-searched at runtime —
+  untrusted by default), unknown PT_INTERP, missing libm stub, missing
+  rust-lld, all smoke-compile failures. Documented warnings: no PT_INTERP
+  (shared objects — normal), symlinked rust-lld (repacking concern),
+  missing libdl stub (dlopen-only), rustc missing the prefix string
+  (env vars still route resolution). verify.sh also prints an explicit
+  RUNTIME STATUS footer: without `--device` it performed static + LINK
+  verification only — no Android execution — and release notes say so
+  (the app's install-time ToolchainVerifier smoke test is the on-device
+  runtime gate; CI does not run an emulator, by cost/reliability choice).
+- **P3 service dedupe**: `ToolchainInstallService` keeps ONE active
+  operation job; duplicate starts (same or different action) are ignored
+  with a log line and documented policy; only the active job's terminal
+  block calls `stopSelf()`, so a redundant start can never stop the
+  service out from under a running operation. START_NOT_STICKY unchanged.
+- **P3 NDK checksum**: the pinned-archive SHA1 (Google's official
+  checksum format for NDK zips) is REQUIRED by default; the workflow sets
+  `NDK_SHA1_REQUIRED=1` explicitly; opting out (`=0`) is explicit,
+  logged, and reserved for a verified Google rotation. Release builds
+  transitively cannot continue past a mismatch (they consume main.yml
+  artifacts, which fail the build).
+- **P3 probe/stream cleanup**: `CargoRunner.probe` closes reader and all
+  three process streams in `finally`; the reader coroutine is joined
+  before returning; the timeout path destroys the subprocess.
+
+Remaining known limits: no instrumented-test tier (the app's install-time
+smoke test remains the on-device runtime gate); `ToolchainVerifier`'s
+startup recovery runs best-effort in the background (a transient
+NotInstalled state can flip to Ready within milliseconds of launch);
+UI-layer `catch (Exception)` blocks (Home/Deps/Editor VMs) intentionally
+keep callback semantics — they hold no subprocesses and die with their
+viewModelScope.

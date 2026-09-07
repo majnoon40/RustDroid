@@ -166,4 +166,96 @@ class CaBundleTest {
         good.writeText("-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----\n")
         assertTrue(CaBundle.isUsable(good))
     }
+
+    // ------------------------------------------------------------------
+    // Probe-mirror integrity (digest, not length)
+    // ------------------------------------------------------------------
+
+    private fun builtWithAsset(prefixName: String): Pair<File, File> {
+        val files = tmp.newFolder("files-$prefixName")
+        val prefix = tmp.newFolder("prefix-$prefixName")
+        val asset =
+            "-----BEGIN CERTIFICATE-----\nMIRRORTTESTCERT1\n-----END CERTIFICATE-----\n" +
+                "-----BEGIN CERTIFICATE-----\nMIRRORTTESTCERT2\n-----END CERTIFICATE-----\n"
+        val bundle = CaBundle.ensure(
+            files, prefix,
+            sources = listOf(File(tmp.root, "nope-$prefixName")),
+            assetProvider = { asset.toByteArray() },
+        )
+        assertNotNull(bundle)
+        return files to prefix
+    }
+
+    @Test
+    fun `missing mirror is created and matches the canonical bundle`() {
+        val (files, prefix) = builtWithAsset("create")
+        val probe = CaBundle.probeFile(prefix)
+        val canonical = CaBundle.bundleFile(files)
+        assertTrue(probe.isFile)
+        assertTrue(CaBundle.mirrorMatches(probe, canonical))
+        assertEquals(canonical.readText(), probe.readText())
+    }
+
+    @Test
+    fun `truncated mirror is detected and repaired`() {
+        val (files, prefix) = builtWithAsset("trunc")
+        val probe = CaBundle.probeFile(prefix)
+        val canonical = CaBundle.bundleFile(files)
+        assertTrue(CaBundle.mirrorMatches(probe, canonical))
+        // truncate: same file, fewer bytes
+        probe.writeText(canonical.readText().substring(0, 40))
+        assertFalse(CaBundle.mirrorMatches(probe, canonical))
+        // the next ensure() self-heals the mirror
+        CaBundle.ensure(files, prefix, sources = emptyList())
+        assertTrue(CaBundle.mirrorMatches(probe, canonical))
+    }
+
+    @Test
+    fun `same-size corrupted mirror is detected and repaired`() {
+        val (files, prefix) = builtWithAsset("corrupt")
+        val probe = CaBundle.probeFile(prefix)
+        val canonical = CaBundle.bundleFile(files)
+        assertTrue(CaBundle.mirrorMatches(probe, canonical))
+        // same length, different bytes: the OLD length check called this valid
+        val text = canonical.readText()
+        probe.writeText(text.replace("MIRRORTTESTCERT1", "XXXXXXXXXXXXXXX1"))
+        assertEquals(canonical.length(), probe.length())
+        assertFalse(CaBundle.mirrorMatches(probe, canonical))
+        CaBundle.ensure(files, prefix, sources = emptyList())
+        assertTrue(CaBundle.mirrorMatches(probe, canonical))
+    }
+
+    @Test
+    fun `interrupted copy leaves no partial mirror`() {
+        val (files, prefix) = builtWithAsset("partial")
+        val probe = CaBundle.probeFile(prefix)
+        val canonical = CaBundle.bundleFile(files)
+        assertTrue(CaBundle.mirrorMatches(probe, canonical))
+        // a torn write: the mirror is truncated AND a partial temp file
+        // (from the interrupted attempt) sits next to the target
+        probe.writeText(canonical.readText().substring(0, 30))
+        val tmpFile = File(probe.parentFile, probe.name + ".rdtmp")
+        tmpFile.writeText("-----BEGIN CERTIF")
+        // the next ensure() rewrites atomically: the partial temp is
+        // replaced and renamed into a complete, verifying mirror
+        CaBundle.ensure(files, prefix, sources = emptyList())
+        assertTrue(CaBundle.mirrorMatches(probe, canonical))
+        assertTrue(CaBundle.isUsable(probe))
+        val litter = probe.parentFile?.listFiles()
+            ?.filter { it.name.endsWith(".rdtmp") } ?: emptyList()
+        assertTrue(litter.isEmpty())
+    }
+
+    @Test
+    fun `valid mirror is left untouched (no rewrite churn)`() {
+        val (files, prefix) = builtWithAsset("stable")
+        val probe = CaBundle.probeFile(prefix)
+        val canonical = CaBundle.bundleFile(files)
+        val before = probe.lastModified()
+        // the canonical's mtime is older than the probe's; a re-ensure must
+        // not rewrite a digest-matching mirror
+        Thread.sleep(50)
+        CaBundle.ensure(files, prefix, sources = emptyList())
+        assertEquals(before, probe.lastModified())
+    }
 }

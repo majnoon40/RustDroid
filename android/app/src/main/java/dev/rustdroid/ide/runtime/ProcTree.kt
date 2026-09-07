@@ -3,9 +3,9 @@ package dev.rustdroid.ide.runtime
 import java.io.File
 
 /**
- * Maps a process tree by scanning `<procRoot>/<pid>/status` for "PPid:"
-lines (Linux /proc layout — Android included). Pure file work, so the JVM
-tests build synthetic /proc trees.
+ * Maps and terminates process trees by scanning `<procRoot>/<pid>` (Linux
+ * /proc layout — Android included). Pure file work, so the JVM tests build
+ * synthetic /proc trees.
  *
  * Why this exists: `Process.destroy()` signals only the DIRECT child
  * (cargo). Java's ProcessBuilder does not create a process group, so
@@ -13,16 +13,38 @@ tests build synthetic /proc trees.
  * running as orphans — burning CPU and battery until they finished on
  * their own. [CargoRunner.kill] walks this tree and SIGKILLs every
  * descendant.
+ *
+ * PID REUSE: a PID is not an identity — Linux wraps around and reassigns
+ * them. A "snapshot descendants -> kill parent -> kill snapshot" sequence
+ * can signal a process that merely OCCUPIES a dead child's PID. Every
+ * process here is therefore tracked as [ProcessId]: PID + the process
+ * start time from `/proc/<pid>/stat` field 22 (kernel jiffies at process
+ * birth — unique for the lifetime of the machine). Destructive signals
+ * are only sent after re-reading the stat and confirming the current
+ * occupant still has the captured start time; a mismatch means the
+ * original process is gone and the PID was reused, so it is skipped.
  */
 object ProcTree {
 
+    const val SIGSTOP = 19
+    const val SIGKILL = 9
+
+    /** PID + start time (stat field 22) — identity of a concrete process. */
+    data class ProcessId(val pid: Long, val startTime: Long?)
+
     /**
-     * All descendant pids of [rootPid], breadth-first (children before
-     * grandchildren). Empty when [procRoot] is not a directory (non-Linux
-     * JVMs, or /proc hidden — the kill then degrades to the direct child).
+     * All descendants of [rootPid], breadth-first (children before
+     * grandchildren), each with its captured identity. Empty when
+     * [procRoot] is not a directory (non-Linux JVMs, or /proc hidden —
+     * the kill then degrades to the direct child). Entries whose identity
+     * could not be read (process vanished mid-walk) are skipped: they
+     * cannot be signaled safely. [rootPid] itself is never included,
+     * even if malformed /proc data claims a self-parenting loop.
      */
-    fun descendantPids(procRoot: File, rootPid: Long): List<Long> {
+    fun descendants(procRoot: File, rootPid: Long): List<ProcessId> {
         val dirs = procRoot.listFiles() ?: return emptyList()
+        // pid -> identity (null startTime = stat unreadable)
+        val identity = HashMap<Long, ProcessId>()
         val children = HashMap<Long, MutableList<Long>>()
         for (d in dirs) {
             val pid = d.name.toLongOrNull() ?: continue
@@ -30,20 +52,81 @@ object ProcTree {
             // ppid 0/1 = kernel or init: no real parent in our tree, and
             // never a descendant of a user process
             if (ppid <= 1) continue
+            // malformed self-parenting entry would loop the BFS forever
+            if (pid == ppid) continue
+            // identity MUST be readable to be safely signalable later;
+            // an unreadable stat means the process is gone (or /proc is
+            // hidden) — drop it instead of keeping an unvalidatable PID
+            val start = startTimeOf(File(d, "stat")) ?: continue
+            identity[pid] = ProcessId(pid, start)
             children.getOrPut(ppid) { mutableListOf() }.add(pid)
         }
-        val out = ArrayList<Long>()
+        // listFiles order is filesystem-dependent (readdir); sort so the
+        // breadth-first result is deterministic
+        children.values.forEach { it.sort() }
+        val out = ArrayList<ProcessId>()
         val queue = ArrayDeque<Long>()
         queue.add(rootPid)
+        val seen = HashSet<Long>()
+        seen.add(rootPid) // the root is never its own descendant
         while (queue.isNotEmpty()) {
             val cur = queue.removeFirst()
             val kids = children[cur] ?: continue
             for (k in kids) {
-                out.add(k)
+                if (!seen.add(k)) continue // cycles / duplicate edges
+                val id = identity[k] ?: continue // vanished mid-walk
+                out.add(id)
                 queue.add(k)
             }
         }
         return out
+    }
+
+    /**
+     * All descendant pids of [rootPid] (identity-free view for callers
+     * that only need the tree shape).
+     */
+    fun descendantPids(procRoot: File, rootPid: Long): List<Long> =
+        descendants(procRoot, rootPid).map { it.pid }
+
+    /**
+     * Identity of the process currently occupying [pid]: PID + start
+     * time. Null when `/proc/<pid>/stat` cannot be read — the process is
+     * gone (or /proc is not visible); either way there is nothing safe to
+     * signal.
+     */
+    fun identity(procRoot: File, pid: Long): ProcessId? {
+        val startTime = startTimeOf(File(procRoot, "$pid/stat")) ?: return null
+        return ProcessId(pid, startTime)
+    }
+
+    /**
+     * True when the process currently occupying [id.pid] is still the
+     * captured process: /proc entry exists AND the start time matches.
+     * A null [ProcessId.startTime] can never be revalidated, so it
+     * returns false (conservative — never signal an unvalidatable PID).
+     */
+    fun stillMatches(procRoot: File, id: ProcessId): Boolean {
+        val startTime = id.startTime ?: return false
+        return startTimeOf(File(procRoot, "${id.pid}/stat")) == startTime
+    }
+
+    /**
+     * `/proc/<pid>/stat` field 22 (starttime, kernel jiffies since boot):
+     * stable per-process identity for PID-reuse defense. The comm field
+     * (2) may contain spaces and ')' characters, so parsing starts after
+     * the LAST ')'. Null when the file is missing/unreadable/malformed.
+     */
+    private fun startTimeOf(stat: File): Long? {
+        if (!stat.isFile) return null
+        return runCatching {
+            val text = stat.readText()
+            val close = text.lastIndexOf(')')
+            if (close < 0) return@runCatching null
+            // tokens[0] is field 3 (state); field N -> tokens[N - 3]
+            val tokens = text.substring(close + 1).trim().split(' ')
+            tokens.getOrNull(STARTTIME_FIELD - 3)?.toLongOrNull()
+        }.getOrNull()
     }
 
     /** "PPid:\t<n>" from a /proc status file, or null. */
@@ -57,5 +140,77 @@ object ProcTree {
                     ?.toLongOrNull()
             }
         }.getOrNull()
+    }
+
+    private const val STARTTIME_FIELD = 22
+
+    /**
+     * Identity-preserving process-tree termination.
+     *
+     * Sequence:
+     *  1. capture the root's identity (for re-discovery guarding later);
+     *  2. snapshot descendants WITH identity;
+     *  3. SIGSTOP every captured descendant that still matches its
+     *     captured identity — freezing them so nothing new spawns and
+     *     nothing escapes between discovery and the kill;
+     *  4. terminate the root ([destroyRoot]);
+     *  5. re-discover descendants while the root PID still belongs to the
+     *     ORIGINAL process (zombie window) — catches children spawned
+     *     between snapshot and freeze; every discovery is revalidated
+     *     immediately before its signal;
+     *  6. bounded final sweep: SIGKILL every captured process that STILL
+     *     matches its identity, until none remain or the pass budget is
+     *     exhausted. A PID that no longer matches was reused — it is
+     *     never signaled.
+     *
+     * All /proc reads are best-effort: processes vanishing mid-traversal
+     * simply drop out of the sweep. No new dependencies.
+     */
+    fun terminateTree(
+        procRoot: File,
+        rootPid: Long,
+        signal: (pid: Long, sig: Int) -> Unit,
+        destroyRoot: () -> Unit,
+        isRootAlive: () -> Boolean,
+        rootGraceMs: Long = 2_000L,
+        maxSweeps: Int = 3,
+        sweepDelayMs: Long = 50L,
+        sleeper: (ms: Long) -> Unit = { Thread.sleep(it) },
+    ) {
+        val rootId = identity(procRoot, rootPid)
+        val captured = ArrayList<ProcessId>()
+        val seen = HashSet<Long>()
+
+        // 2-3) snapshot + freeze known descendants
+        for (id in descendants(procRoot, rootPid)) {
+            if (seen.add(id.pid)) captured.add(id)
+            if (stillMatches(procRoot, id)) signal(id.pid, SIGSTOP)
+        }
+
+        // 4) terminate the root — dead parents cannot spawn replacements
+        destroyRoot()
+        var waited = 0L
+        while (isRootAlive() && waited < rootGraceMs) {
+            sleeper(50L)
+            waited += 50L
+        }
+
+        // 5) re-discover late spawns, but only while the root PID is still
+        // occupied by the ORIGINAL process — a reaped-and-reused root PID
+        // belongs to someone else's tree now, and walking it would target
+        // innocent processes.
+        if (rootId == null || stillMatches(procRoot, rootId)) {
+            for (id in descendants(procRoot, rootPid)) {
+                if (seen.add(id.pid)) captured.add(id)
+            }
+        }
+
+        // 6) bounded final sweep — kill only identity-matching processes
+        for (sweep in 0 until maxSweeps) {
+            val remaining = captured.filter { stillMatches(procRoot, it) }
+            if (remaining.isEmpty()) return
+            for (id in remaining) signal(id.pid, SIGKILL)
+            if (sweep < maxSweeps - 1) sleeper(sweepDelayMs)
+        }
     }
 }

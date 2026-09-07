@@ -10,22 +10,34 @@ import java.nio.file.StandardCopyOption
 object Fs {
 
     /**
-     * Atomic-ish write: write to sibling temp file, then atomically rename
-     * over the target.
+     * Atomic-ish write: write to sibling temp file, fsync, then atomically
+     * rename over the target.
      *
      * The rename uses NIO `ATOMIC_MOVE | REPLACE_EXISTING`, which on POSIX
      * (Android included, same filesystem) is a single `rename(2)` — the
      * replace has no window in which the target is missing, so a crash
      * mid-write can never lose the previous content (user source files!).
-     * The historical delete-then-rename had exactly that window. If the
-     * filesystem refuses atomic moves, fall back to a plain move, then to
-     * the legacy two-step as a last resort.
+     * The historical delete-then-rename had exactly that window. The temp
+     * file is fsync'd BEFORE the rename so the renamed content is on stable
+     * storage even across power loss — without it the rename can land
+     * before the data blocks do. If the filesystem refuses atomic moves,
+     * fall back to a plain move, then to the legacy two-step as a last
+     * resort.
      */
     @Throws(IOException::class)
     fun writeAtomic(file: File, content: String) {
         val tmp = File(file.parentFile, file.name + ".rdtmp")
         try {
             tmp.writeText(content)
+            try {
+                java.nio.channels.FileChannel.open(
+                    tmp.toPath(), java.nio.file.StandardOpenOption.WRITE
+                ).use { it.force(true) }
+            } catch (_: IOException) {
+                // fsync unsupported on this filesystem: the rename still
+                // guarantees no torn state, just weaker power-loss
+                // durability — not worth failing the write over
+            }
             try {
                 Files.move(
                     tmp.toPath(), file.toPath(),

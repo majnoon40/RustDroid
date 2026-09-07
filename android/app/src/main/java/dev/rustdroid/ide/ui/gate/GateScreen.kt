@@ -350,7 +350,9 @@ private fun FailedCard(state: ToolchainState.Failed, onRetry: () -> Unit, onImpo
 
 @Composable
 private fun LogTail(manager: dev.rustdroid.ide.toolchain.ToolchainManager) {
-    val log = manager.logTail
+    // immutable snapshot — safe to read from the UI thread while install
+    // threads keep appending (a live ArrayDeque would CME under iteration)
+    val log = manager.logTailSnapshot()
     if (log.isEmpty()) return
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp)) {

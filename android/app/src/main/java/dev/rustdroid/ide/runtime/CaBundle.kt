@@ -1,5 +1,6 @@
 package dev.rustdroid.ide.runtime
 
+import dev.rustdroid.ide.util.Fs
 import java.io.File
 
 /**
@@ -47,7 +48,15 @@ object CaBundle {
     /** APK asset path holding the pinned Mozilla PEM bundle. */
     const val ASSET_PATH = "ssl/cacert.pem"
 
-    /** Android system CA stores, in preference order. */
+    /**
+     * Android system CA stores, in preference order. Both are OpenSSL
+     * hashed-CApath directories — one PEM certificate per
+     * `<8-hex-subject-hash>.N` file — for the classic built-in store and
+     * for the Android 14+ Conscrypt APEX store alike, so PEM-block
+     * scanning is the correct parse (verified against the documented
+     * layouts; the APEX directory is world-readable). Best-effort: these
+     * only fill in when the deterministic APK asset is unavailable.
+     */
     val SYSTEM_SOURCES: List<File> = listOf(
         File("/system/etc/security/cacerts"), // classic built-in store (hashed CApath)
         File("/apex/com.android.conscrypt/cacerts"), // Android 14+ Conscrypt APEX store
@@ -65,6 +74,33 @@ object CaBundle {
      * "cert.pem" (first entry of its candidate list).
      */
     fun probeFile(prefix: File): File = File(prefix, "etc/tls/cert.pem")
+
+    /**
+     * Mirror integrity: a same-LENGTH file proves nothing — a corrupted
+     * or bit-flipped mirror of identical size survived the old length
+     * check forever. The digest makes "mirror == canonical" a provable
+     * fact instead of a hopeful one.
+     */
+    internal fun mirrorMatches(mirror: File, canonical: File): Boolean {
+        if (!mirror.isFile || !canonical.isFile) return false
+        if (mirror.length() != canonical.length()) return false
+        return sha256(mirror) == sha256(canonical)
+    }
+
+    private fun sha256(file: File): String? = try {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buf = ByteArray(64 * 1024)
+            while (true) {
+                val n = input.read(buf)
+                if (n < 0) break
+                digest.update(buf, 0, n)
+            }
+        }
+        digest.digest().joinToString("") { "%02x".format(it) }
+    } catch (_: Exception) {
+        null
+    }
 
     /**
      * Reads [ASSET_PATH] from Android's asset manager. Kept as one tiny
@@ -172,17 +208,31 @@ object CaBundle {
      */
     private fun writeBundle(target: File, content: ByteArray): Boolean = runCatching {
         target.parentFile?.mkdirs()
-        dev.rustdroid.ide.util.Fs.writeAtomic(target, String(content, Charsets.UTF_8))
+        Fs.writeAtomic(target, String(content, Charsets.UTF_8))
         isUsable(target)
     }.getOrDefault(false)
 
-    /** Best-effort mirror into the prefix for the openssl-probe path. */
+    /**
+     * Mirrors the canonical bundle into the prefix for the openssl-probe
+     * path. Validity is digest-based (see [mirrorMatches]); copying is
+     * ATOMIC (temp file + fsync + rename via [Fs.writeAtomic]) so an
+     * interrupted copy can never leave a truncated mirror behind — a
+     * half-written probe file is exactly what the old non-atomic
+     * writeText could leave. A copy that still does not verify afterwards
+     * is removed: a corrupt mirror is worse than none (openssl-probe
+     * would trust it).
+     */
     private fun syncProbeCopy(prefix: File, target: File) {
         runCatching {
             val probe = probeFile(prefix)
-            if (probe.isFile && probe.length() == target.length()) return
+            if (mirrorMatches(probe, target)) return
             probe.parentFile?.mkdirs()
-            probe.writeText(target.readText())
+            Fs.writeAtomic(probe, target.readText())
+            if (!mirrorMatches(probe, target)) {
+                // atomic copy that STILL does not verify: give up on the
+                // mirror rather than leave a corrupt file in place
+                probe.delete()
+            }
         }
     }
 }

@@ -37,6 +37,15 @@ class ToolchainPaths(val filesDir: File) {
     /** Scratch space for the smoke test. */
     val scratch: File get() = File(filesDir, "home/scratch")
 
+    /** Staging dir for an in-flight extraction (swapped in by ToolchainSwap). */
+    val staging: File get() = File(filesDir, "usr.new")
+
+    /** Previous install retained here until verification passes (rollback). */
+    val aside: File get() = File(filesDir, "usr.old")
+
+    /** External install-transaction marker — see [ToolchainTransaction]. */
+    val pendingInstall: File get() = ToolchainTransaction.markerFile(filesDir)
+
     /** Marker: a fully verified install (survives app restarts). */
     val readyMarker: File get() = File(filesDir, "usr/.rustdroid-verified")
 

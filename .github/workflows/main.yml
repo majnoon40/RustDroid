@@ -41,18 +41,23 @@ jobs:
           echo "ANDROID_NDK_HOME=$PWD/android-ndk-r27c" >> "$GITHUB_ENV"
 
       # Caches both LLVM build trees (host x86_64 + target aarch64-android).
-      # Keyed on the two files that actually change LLVM's build inputs —
-      # bootstrap.toml.template (LLVM config: thin-lto, targets, etc.) and
-      # build.sh (in case shim/link flags feeding into the build change).
-      # Editing anything else (e.g. this workflow file, docs) won't bust
-      # the cache. If LLVM itself finished but a later step (rustc linking,
-      # dist packaging) fails, the next run restores LLVM instantly instead
-      # of rebuilding ~2,600 + ~2,600 compile units from scratch.
+      # The key covers EVERY input that can affect the generated build tree:
+      #   - bootstrap.toml.template: LLVM cmake config (thin-lto, targets...)
+      #   - build.sh:               flags/shim/link steps feeding the build
+      #   - env.sh:                 RUST_TAG + NDK version/API (paths baked
+      #                             into build.ninja) — also covers the Rust
+      #                             source identity (the pinned tag)
+      #   - patches/**:             vendored-source patches
+      #   - shims/**:               kit sources linked into the dist
+      # If LLVM itself finished but a later step (rustc linking, dist
+      # packaging) fails, the next run restores the SAME key instantly.
       #
-      # NOTE: a key change restores via the llvm- fallback key but cmake still
-      # regenerates build.ninja when the compile COMMANDS change (e.g. the
-      # first run that adds the ccache launcher) — that rebuild is exactly
-      # what the ccache layer below makes cheap.
+      # NO broad `llvm-` restore-key fallback: GitHub matches restore-keys
+      # by prefix and would happily restore an INCOMPATIBLE tree after any
+      # input change — a stale tree that ninja cannot always detect (mtimes
+      # are touched post-restore). A miss costs a rebuild, but ccache (the
+      # content-addressed layer below) makes that rebuild cheap; a wrong
+      # HIT would silently ship a toolchain built from mismatched inputs.
       - name: Restore LLVM build cache
         id: llvm-cache
         uses: actions/cache/restore@v4
@@ -60,14 +65,7 @@ jobs:
           path: |
             stage/rust-src/build/x86_64-unknown-linux-gnu/llvm
             stage/rust-src/build/aarch64-linux-android/llvm
-          key: llvm-${{ hashFiles('bootstrap.toml.template', 'build.sh') }}
-          # Fallback: build.sh-only changes bust the primary key but leave
-          # LLVM's actual build inputs (bootstrap.toml.template) untouched.
-          # Restore the newest llvm-* tree anyway so we don't pay a full
-          # LLVM rebuild for an unrelated build.sh edit; the Save step then
-          # refreshes the cache under the new exact key.
-          restore-keys: |
-            llvm-
+          key: llvm-v2-${{ hashFiles('bootstrap.toml.template', 'build.sh', 'env.sh', 'patches/**', 'shims/**') }}
 
       # ccache layer — rebuild insurance for the C/C++ parts (LLVM, lld,
       # compiler-rt). Bootstrap enables it via `[llvm] ccache` in
@@ -75,6 +73,9 @@ jobs:
       # build-tree cache above hits, ccache is not even consulted; when it
       # misses (key change, cmake command change, eviction), a warm ccache
       # turns the ~5,200-unit rebuild into mostly cache hits.
+      # Unlike the LLVM tree cache, ccache is CONTENT-ADDRESSED (hash of
+      # compiler + flags + preprocessed input), so a broad restore-key is
+      # safe here: stale entries can never produce a wrong build.
       # Key is unique per run (github.run_id) so every run saves a fresh
       # snapshot; the restore-key picks up the newest previous one.
       - name: Restore ccache
@@ -91,6 +92,11 @@ jobs:
           CCACHE_DIR=$PWD/stage/ccache ccache -s || true
 
       - name: Run toolchain build
+        env:
+          # The NDK SHA1 must be ENFORCED in CI: a release build must never
+          # continue past a corrupted/tampered 1.5 GB archive. build.sh
+          # defaults to required; this makes the CI policy explicit.
+          NDK_SHA1_REQUIRED: "1"
         run: |
           chmod +x ./build.sh
           ./build.sh all
@@ -156,7 +162,7 @@ jobs:
           path: |
             stage/rust-src/build/x86_64-unknown-linux-gnu/llvm
             stage/rust-src/build/aarch64-linux-android/llvm
-          key: llvm-${{ hashFiles('bootstrap.toml.template', 'build.sh') }}
+          key: llvm-v2-${{ hashFiles('bootstrap.toml.template', 'build.sh', 'env.sh', 'patches/**', 'shims/**') }}
 
       - name: Save ccache
         if: always()

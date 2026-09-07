@@ -102,7 +102,9 @@ class EditorViewModel(
     val treeAllFiles: StateFlow<Boolean> = _treeAllFiles.asStateFlow()
 
     // ---- run state ----
-    val console = ConsoleBuffer()
+    // scope-owned: the buffer's trailing-line publish is a child of the
+    // viewModelScope, cancelled when the VM dies — no leaked background work
+    val console = ConsoleBuffer(scope = viewModelScope)
 
     private val _running = MutableStateFlow(false)
     val running: StateFlow<Boolean> = _running.asStateFlow()

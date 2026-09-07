@@ -13,6 +13,13 @@ import java.io.IOException
  * ultimate gate: a real on-device compile+link+run of hello.rs through the
  * exact chain the IDE will use. A corrupted or partial install fails LOUD
  * with a per-check table instead of confusing silent errors later.
+ *
+ * [verify] is a SUSPEND function: subprocess probes/runs go directly
+ * through the injected [runner] (itself suspend, IO-dispatched), so the
+ * caller's cancellation propagates into the running subprocess — the
+ * nested runBlocking bridges are gone. Cancellation is NEVER mistaken
+ * for a failed check: [runCheck] rethrows CancellationException before
+ * the generic catch.
  */
 class ToolchainVerifier(
     private val paths: ToolchainPaths,
@@ -21,14 +28,18 @@ class ToolchainVerifier(
     private val caAssetProvider: (() -> ByteArray?)? = null,
 ) {
     /** Runs all checks; [onCheck] fires after each one for live UI. */
-    fun verify(onCheck: (VerifyCheck) -> Unit = {}): List<VerifyCheck> {
+    suspend fun verify(onCheck: (VerifyCheck) -> Unit = {}): List<VerifyCheck> {
         val results = mutableListOf<VerifyCheck>()
-        fun runCheck(id: String, title: String, body: () -> String?) {
+        suspend fun runCheck(id: String, title: String, body: suspend () -> String?) {
             val started = VerifyCheck(id, title, CheckStatus.RUNNING)
             onCheck(started)
             val result = try {
                 val detail = body()
                 VerifyCheck(id, title, if (detail == null) CheckStatus.PASS else CheckStatus.FAIL, detail)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // a cancelled verification run is not a failed check —
+                // propagate so the service/VM scope unwinds correctly
+                throw e
             } catch (e: Exception) {
                 VerifyCheck(id, title, CheckStatus.FAIL, e.message ?: e.javaClass.simpleName)
             }
@@ -144,9 +155,7 @@ class ToolchainVerifier(
         val env = ProcEnv.env(paths.prefix, filesDir)
         var rustcVersion = ""
         runCheck("rustc-version", "rustc --version runs") {
-            val out = kotlinx.coroutines.runBlocking {
-                runner.probe(listOf(paths.rustc.absolutePath, "--version"), env)
-            }
+            val out = runner.probe(listOf(paths.rustc.absolutePath, "--version"), env)
             if (!out.startsWith("rustc ")) "unexpected output: '${out.take(80)}'" else {
                 rustcVersion = out.lineSequence().first()
                 null
@@ -154,9 +163,7 @@ class ToolchainVerifier(
         }
         var cargoVersion = ""
         runCheck("cargo-version", "cargo --version runs") {
-            val out = kotlinx.coroutines.runBlocking {
-                runner.probe(listOf(paths.cargo.absolutePath, "--version"), env)
-            }
+            val out = runner.probe(listOf(paths.cargo.absolutePath, "--version"), env)
             if (!out.startsWith("cargo ")) "unexpected output: '${out.take(80)}'" else {
                 cargoVersion = out.lineSequence().first()
                 null
@@ -173,12 +180,10 @@ class ToolchainVerifier(
             )
             helloBin.delete()
 
-            val linkResult = kotlinx.coroutines.runBlocking {
-                runner.run(
-                    listOf(paths.rustc.absolutePath, "hello.rs", "-o", "hello"),
-                    cwd = scratch, env = env,
-                )
-            }
+            val linkResult = runner.run(
+                listOf(paths.rustc.absolutePath, "hello.rs", "-o", "hello"),
+                cwd = scratch, env = env,
+            )
             if (!linkResult.success) {
                 return@runCheck "rustc failed (exit ${linkResult.exitCode}) — see console"
             }
@@ -186,15 +191,13 @@ class ToolchainVerifier(
                 return@runCheck "no executable produced"
             }
             val runOut = StringBuilder()
-            val runResult = kotlinx.coroutines.runBlocking {
-                runner.run(
-                    listOf("./hello"), cwd = scratch, env = env,
-                    onLine = { line ->
-                        if (runOut.isNotEmpty()) runOut.append('\n')
-                        runOut.append(line.text)
-                    },
-                )
-            }
+            val runResult = runner.run(
+                listOf("./hello"), cwd = scratch, env = env,
+                onLine = { line ->
+                    if (runOut.isNotEmpty()) runOut.append('\n')
+                    runOut.append(line.text)
+                },
+            )
             when {
                 !runResult.success -> "hello exited ${runResult.exitCode}"
                 !runOut.contains("hello from RustDroid") ->

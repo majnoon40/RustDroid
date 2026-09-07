@@ -12,13 +12,35 @@
 #        repo — CI run #27 shipped a cargo built from PRISTINE curl-sys
 #        because the patch had applied to the wrong vendored crate version
 #        and nothing else in the pipeline could notice)
-#   [D]  smoke-compile: $PREFIX/bin/rustc hello.rs   (requires on-device Android)
+#   [L]  on-host cross-LINK smoke: rustc + kit shim + ld.lld produce an
+#        aarch64 PIE with bionic PT_INTERP (compile+link, NOT execution)
+#   [D]  smoke-compile: $PREFIX/bin/rustc hello.rs (requires on-device Android)
 #
 # [S] = static (runs on any Linux host with readelf)
+# [L] = link (host-runnable: exercises the real toolchain + kit, but the
+#       produced binary is never EXECUTED here — no Android loader/run)
 # [D] = dynamic (requires aarch64-linux-android execution environment)
 #
+# WARNING CLASSIFICATION (audit pass 3):
+#   FAIL = security/correctness invariant: RUNPATH to an unknown absolute
+#          path (the linker searches it at runtime — an unexpected entry
+#          is untrusted-by-default), unknown PT_INTERP (won't load on
+#          Android), missing link-kit pieces, smoke failures.
+#   WARN = genuinely informational / platform-dependent, each with its
+#          reason inline: no PT_INTERP at all (shared objects — normal),
+#          rust-lld as a symlink (repacking concern, bytes identical),
+#          libdl stub missing (dlopen-only; not on the default rustc link
+#          line), rustc missing the prefix STRING (env vars still route
+#          resolution — check 2 enforces the real RUNPATH invariant).
+#
+# RUNTIME VERIFICATION STATUS: without --device, this script performs
+# STATIC + LINK verification only — no Android loader, no execution.
+# The real on-device compile+link+run gate runs in the Android app itself
+# (ToolchainVerifier smoke test at install time). CI output says so
+# explicitly at the end; release notes must not overclaim.
+#
 # Usage:
-#   ./verify.sh <dist-tarball-or-directory>            # run all [S] checks
+#   ./verify.sh <dist-tarball-or-directory>            # run all [S]+[L] checks
 #   ./verify.sh <dist-tarball-or-directory> --device    # also attempt [D] checks
 #                                                        (will fail if not on Android)
 
@@ -228,12 +250,19 @@ check_rpath() {
             elif [[ "$path" == "$RUSTDROID_PREFIX"/* || "$path" == "$RUSTDROID_PREFIX"* ]]; then
                 : # acceptable (anything under our prefix)
             else
-                warn "$f has unexpected RUNPATH: $path"
+                # SECURITY/CORRECTNESS INVARIANT (audit pass 3): the dynamic
+                # linker searches RUNPATH at runtime, on the DEVICE, where we
+                # cannot know which paths exist. An unknown absolute entry is
+                # untrusted-by-default — a build-host path (e.g. /home/builder)
+                # that happens to exist on a device could inject foreign
+                # libraries. This used to be a warn; it is now a failure.
+                echo "  FAIL: $f has unexpected RUNPATH: $path (allowed: $RUSTDROID_PREFIX*, \$ORIGIN*, /system/lib{,64})"
+                bad=$((bad + 1))
             fi
         done <<< "$entries"
     done
     if [[ $bad -eq 0 ]]; then
-        pass "no DT_RPATH/DT_RUNPATH entries point at Termux"
+        pass "all DT_RPATH/DT_RUNPATH entries are prefix-, origin- or system-scoped (no Termux, no unknown absolute paths)"
     else
         fail "$bad bad RPATH/RUNPATH entries (see above)"
     fi
@@ -271,15 +300,20 @@ check_interp() {
                 bad=$((bad + 1))
                 ;;
             *)
-                warn "$f: PT_INTERP = $path (unknown — investigate)"
+                # CORRECTNESS INVARIANT: an interpreter we do not recognize
+                # means the binary will not load on Android. Was a warn;
+                # there is no platform on which an unknown PT_INTERP is OK.
+                echo "  FAIL: $f: PT_INTERP = $path (unknown interpreter — will not load on Android)"
+                bad=$((bad + 1))
                 ;;
         esac
     done
     if [[ $seen -eq 0 ]]; then
-        warn "no PT_INTERP entries found (all libs are shared objects, not PIEs — OK for lib check)"
+        # legitimately informational: shared objects carry no PT_INTERP
+        warn "no PT_INTERP entries found (all files are shared objects — normal for lib-only dists)"
     fi
     if [[ $bad -gt 0 ]]; then
-        fail "$bad binaries have a glibc dynamic linker (won't run on Android)"
+        fail "$bad binaries have a glibc or unknown dynamic linker (won't load on Android)"
     fi
 }
 
@@ -314,10 +348,10 @@ EOF
             if "$workdir/hello" 2>&1 | grep -q "hello from RustDroid"; then
                 pass "smoke-compile OK — output matches expected string"
             else
-                warn "smoke binary ran but output did not match expected string"
+                fail "smoke binary ran but output did not match the expected string"
             fi
         else
-            warn "rustc reported success but no output binary produced"
+            fail "rustc reported success but no output binary produced"
         fi
     else
         fail "smoke-compile failed — rustc did not produce a binary"
@@ -361,11 +395,17 @@ check_link_kit() {
     if [[ ! -f "$kit/sysroot/libc.so" ]]; then
         fail "link kit missing sysroot/libc.so (bionic link stub)"
     fi
-    for f in libm.so libdl.so; do
-        if [[ ! -f "$kit/sysroot/$f" ]]; then
-            warn "link kit missing sysroot/$f"
-        fi
-    done
+    # libm: correctness invariant — real-world rust programs link -lm via
+    # the C math symbols the std prelude can pull in; a kit without it
+    # links hello-world and nothing else.
+    if [[ ! -f "$kit/sysroot/libm.so" ]]; then
+        fail "link kit missing sysroot/libm.so (real-world links need it)"
+    fi
+    # libdl: genuinely informational — only dlopen()-using code links it,
+    # which is not on rustc's default link line for typical builds.
+    if [[ ! -f "$kit/sysroot/libdl.so" ]]; then
+        warn "link kit missing sysroot/libdl.so (only needed for dlopen code — not on the default rustc link line)"
+    fi
     pass "bionic link stubs present ($(ls "$kit/sysroot" 2>/dev/null | wc -l) .so files)"
 
     for f in cc clang gcc; do
@@ -427,11 +467,13 @@ check_link_kit() {
     fi
     if [[ -n "$lld" ]]; then
         if [[ -L "$lld" ]]; then
-            warn "rust-lld at $lld is a symlink (may not survive Windows repacking)"
+            warn "rust-lld at $lld is a symlink (distribution/repacking concern — Windows repacks can break symlinks; bytes identical)"
         fi
         pass "rust-lld present at ${lld#$TARGET_DIR/}"
     else
-        warn "rust-lld not found in extracted tree — shim exec target untested"
+        # the shims exec this path — its absence means every on-device
+        # link fails; correctness invariant, not cosmetic
+        fail "rust-lld (gcc-ld/ld.lld or rust-lld) not found in the dist tree — the cc shim has nothing to exec"
     fi
 }
 
@@ -553,8 +595,18 @@ check_link_kit
 check_link_smoke
 check_smoke_compile
 
-log "all static checks complete."
-log "Next steps for [D] device checks:"
-log "  1. Copy dist tarball to device via adb push to $RUSTDROID_PREFIX"
-log "  2. Extract: adb shell 'cd $RUSTDROID_PREFIX && tar xf <tarball>'"
-log "  3. Run:    adb shell 'cd /tmp && RUSTDROID_PREFIX=$RUSTDROID_PREFIX $RUSTDROID_PREFIX/bin/rustc hello.rs'"
+log "all static + link checks complete."
+if [[ $RUN_DEVICE_CHECKS -eq 1 ]]; then
+    log "RUNTIME STATUS: Android EXECUTION verified (--device checks ran above)."
+else
+    # loud and unambiguous: this run did NOT execute anything on Android
+    log "RUNTIME STATUS: Android EXECUTION was NOT performed."
+    log "  This run did: static ELF verification [S] + on-host cross-LINK smoke [L]"
+    log "  (rustc + kit shim + ld.lld; the produced binary was never loaded/run)."
+    log "  On-device compile+link+RUN is gated by the Android app's install-time"
+    log "  ToolchainVerifier smoke test, or manually:"
+    log "    1. Copy dist to device via adb push to $RUSTDROID_PREFIX"
+    log "    2. Extract: adb shell 'cd $RUSTDROID_PREFIX && tar xf <tarball>'"
+    log "    3. Run:    adb shell 'cd /tmp && RUSTDROID_PREFIX=$RUSTDROID_PREFIX $RUSTDROID_PREFIX/bin/rustc hello.rs'"
+    log "  Release notes must say 'static + link verification' — NOT 'runtime verified'."
+fi

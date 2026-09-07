@@ -38,6 +38,9 @@ class ToolchainInstallService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
+    /** The ONE operation job this service instance is running. */
+    private var activeJob: kotlinx.coroutines.Job? = null
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -56,16 +59,42 @@ class ToolchainInstallService : Service() {
         val reverify = intent?.action == ACTION_REVERIFY
         startInForeground(reverify)
 
-        // drive the run; terminal state stops the service
-        scope.launch {
-            if (reverify) {
-                manager.reverify()
-            } else {
-                manager.installFromNetwork()
+        // ONE active operation per service instance. A start arriving
+        // while a job is running is a duplicate, and the RUNNING job wins:
+        //  - same action twice: a plain duplicate — ignored;
+        //  - re-verify during install: the install already concludes with
+        //    a full verification, and re-verifying a mid-swap prefix is
+        //    meaningless — ignored;
+        //  - install during re-verify: the install is the user's newer,
+        //    heavier intent but the manager mutex would just serialize it
+        //    behind the re-verify for minutes — also ignored; the Settings
+        //    screen offers re-verify explicitly afterwards.
+        // Ignored starts never reach the job's terminal block, so they can
+        // never stopSelf() out from under the running operation.
+        if (activeJob?.isActive == true) {
+            android.util.Log.i(
+                TAG,
+                "ignoring duplicate ${if (reverify) "re-verify" else "install"} start — " +
+                    "another operation is already running"
+            )
+            return START_NOT_STICKY
+        }
+
+        activeJob = scope.launch {
+            try {
+                if (reverify) {
+                    manager.reverify()
+                } else {
+                    manager.installFromNetwork()
+                }
+            } finally {
+                // runs on success, failure AND cancellation (the manager
+                // rethrows CancellationException); the service stops only
+                // from the terminal block of the ACTIVE job
+                val success = manager.state.value is ToolchainState.Ready
+                finishNotification(success, reverify)
+                stopSelf()
             }
-            val success = manager.state.value is ToolchainState.Ready
-            finishNotification(success, reverify)
-            stopSelf()
         }
         return START_NOT_STICKY
     }
@@ -159,6 +188,7 @@ class ToolchainInstallService : Service() {
     }
 
     companion object {
+        private const val TAG = "RustDroidSvc"
         const val CHANNEL_ID = "toolchain-install"
         const val NOTIF_ID = 42
         const val ACTION_REVERIFY = "dev.rustdroid.ide.action.REVERIFY"

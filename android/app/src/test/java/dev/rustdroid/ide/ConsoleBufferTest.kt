@@ -16,8 +16,14 @@ class ConsoleBufferTest {
      * always publishes (instant first output — desirable), so tests that
      * verify holding behavior start after one publish+clear cycle.
      */
-    private fun warmedBuffer(capacity: Int = 2000, intervalMs: Long = 10_000): ConsoleBuffer {
-        val buf = ConsoleBuffer(capacity = capacity, publishIntervalMs = intervalMs)
+    private fun warmedBuffer(
+        capacity: Int = 2000,
+        intervalMs: Long = 10_000,
+        scope: kotlinx.coroutines.CoroutineScope? = null,
+    ): ConsoleBuffer {
+        val buf = ConsoleBuffer(
+            capacity = capacity, publishIntervalMs = intervalMs, scope = scope,
+        )
         buf.append(line(-1)) // publishes -> window opens
         buf.clear()          // publishes (reset) -> window stays open
         return buf
@@ -77,5 +83,73 @@ class ConsoleBufferTest {
         buf.clear()
         assertEquals(0, buf.lines.value.size)
         assertEquals(0, buf.droppedOverflow)
+    }
+
+    // ------------------------------------------------------------------
+    // Trailing-line publishing (scope-owned)
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `trailing burst lines publish after the rate-limit window elapses`() {
+        kotlinx.coroutines.runBlocking {
+            val buf = warmedBuffer(intervalMs = 100, scope = this)
+            buf.append(line(1))
+            buf.append(line(2))
+            // rate-limited: nothing published yet, and nobody will call flush
+            assertEquals(0, buf.lines.value.size)
+            // the buffer's own trailing publish fires after the window
+            kotlinx.coroutines.withTimeoutOrNull(2_000) {
+                while (buf.lines.value.size < 2) kotlinx.coroutines.delay(20)
+            } ?: throw AssertionError("trailing lines never published")
+            assertEquals("line 2", buf.lines.value.last().text)
+        }
+    }
+
+    @Test
+    fun `explicit flush publishes immediately and cancels the trailing job`() {
+        kotlinx.coroutines.runBlocking {
+            val buf = warmedBuffer(intervalMs = 5_000, scope = this)
+            buf.append(line(1))
+            assertEquals(0, buf.lines.value.size)
+            buf.flush()
+            assertEquals(1, buf.lines.value.size)
+            // no late double-publish from a stale trailing job
+            kotlinx.coroutines.delay(200)
+            assertEquals(1, buf.lines.value.size)
+        }
+    }
+
+    @Test
+    fun `concurrent append and flush never lose lines or throw`() {
+        val threads = 8
+        val perThread = 500
+        val buf = ConsoleBuffer(capacity = threads * perThread, publishIntervalMs = 0)
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(threads)
+        try {
+            val futures = (0 until threads).map { t ->
+                pool.submit<Int> {
+                    repeat(perThread) { i ->
+                        buf.append(line(t * perThread + i))
+                        if (i % 50 == 0) buf.flush()
+                    }
+                    perThread
+                }
+            }
+            futures.forEach { it.get(30, java.util.concurrent.TimeUnit.SECONDS) }
+        } finally {
+            pool.shutdownNow()
+        }
+        buf.flush()
+        // every line survived
+        assertEquals(threads * perThread, buf.lines.value.size)
+        val indices = buf.lines.value.map { it.text.removePrefix("line ").toInt() }
+        // complete: no index lost or duplicated
+        assertEquals(threads * perThread, indices.toSet().size)
+        // within each thread, order is preserved (interleaving across
+        // threads is free, but a thread's own lines must be ascending)
+        for (t in 0 until threads) {
+            val own = indices.filter { it / perThread == t }
+            assertEquals((0 until perThread).map { t * perThread + it }, own)
+        }
     }
 }

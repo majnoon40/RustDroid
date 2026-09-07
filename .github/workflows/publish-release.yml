@@ -160,7 +160,7 @@ jobs:
           cat > new-body.md <<EOF
           ## RustDroid toolchain — rust 1.85.0, aarch64-linux-android
 
-          Built from main @ ${{ env.HEAD_SHA }} (run #${{ env.RUN_ID }}, verified by its CI: static ELF checks + kit checks + real cross-link smoke test).
+          Built from main @ ${{ env.HEAD_SHA }} (run #${{ env.RUN_ID }}). CI verification: static ELF checks (Termux strings, RUNPATH scope, PT_INTERP) + link-kit checks + on-host cross-LINK smoke (rustc + kit shim + ld.lld; the binary is not executed in CI). On-device compile+link+run is gated at app install time by RustDroid's ToolchainVerifier smoke test.
 
           | Asset | Size | SHA-256 |
           |-------|------|---------|

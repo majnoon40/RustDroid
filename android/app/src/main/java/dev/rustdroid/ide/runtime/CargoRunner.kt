@@ -21,13 +21,16 @@ import java.util.concurrent.TimeUnit
  * (destroy -> grace -> destroyForcibly). Cleanup runs before rethrowing
  * cancellation, so state stays consistent under structured concurrency.
  *
+ * `open` purely so JVM tests can subclass with hanging/fake probes and
+ * assert cancellation propagation — no production subclassing intended.
+ *
  * Cancellation kills the WHOLE process tree, not just the direct child:
  * [signal] (injected; Android wires it to android.os.Process.sendSignal)
  * SIGKILLs every descendant found via [ProcTree] — Java's ProcessBuilder
  * creates no process group, so process.destroy() alone leaves cargo's
  * rustc/ld.lld children running as orphans, burning CPU and battery.
  */
-class CargoRunner(
+open class CargoRunner(
     /** Raw-pid signal sender. Default: no-op (pure JVM tests). */
     private val signal: (pid: Long, sig: Int) -> Unit = { _, _ -> },
 ) {
@@ -37,7 +40,7 @@ class CargoRunner(
      * Pumps are child coroutines of the caller: cancelling the caller
      * tears the process down.
      */
-    suspend fun run(
+    open suspend fun run(
         command: List<String>,
         cwd: File,
         env: Map<String, String>,
@@ -106,18 +109,26 @@ class CargoRunner(
     private fun kill(process: Process) {
         val pid = pidOf(process)
         if (pid != null) {
-            // parent first: it cannot spawn replacements once dead, then
-            // sweep the orphaned descendants (rustc, ld.lld, build scripts)
-            process.destroy()
-            ProcTree.descendantPids(File("/proc"), pid).forEach { signal(it, 9) }
+            // parent first: it cannot spawn replacements once dead; the
+            // identity-validated sweep then kills the orphaned descendants
+            // (rustc, ld.lld, build scripts) without ever touching a PID
+            // that was reused by an unrelated process
+            ProcTree.terminateTree(
+                procRoot = File("/proc"),
+                rootPid = pid,
+                signal = signal,
+                destroyRoot = { process.destroy() },
+                isRootAlive = { process.isAlive },
+            )
         } else {
             process.destroy()
+            try {
+                if (process.isAlive) process.waitFor(2, TimeUnit.SECONDS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
         }
-        try {
-            if (process.isAlive) process.waitFor(2, TimeUnit.SECONDS)
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-        }
+        // final hard kill of the direct child if it ignored TERM/KILL
         if (process.isAlive) process.destroyForcibly()
     }
 
@@ -138,19 +149,27 @@ class CargoRunner(
         }.getOrNull()
     }
 
-    /** Runs a short probe (e.g. `rustc --version`) and returns its stdout. */
-    suspend fun probe(
+    /**
+     * Runs a short probe (e.g. `rustc --version`) and returns its stdout.
+     * Streams and the process are always cleaned up (try/finally), the
+     * reader runs on a child coroutine joined before returning, and a
+     * timeout terminates the subprocess so stderr can never wedge the
+     * probe forever.
+     */
+    open suspend fun probe(
         command: List<String>,
         env: Map<String, String>,
         timeoutSec: Long = 15,
     ): String = withContext(Dispatchers.IO) {
+        var process: Process? = null
+        var reader: BufferedReader? = null
         try {
-            val p = ProcessBuilder(command).apply {
+            process = ProcessBuilder(command).apply {
                 environment().clear()
                 environment().putAll(env)
             }.start()
             val out = StringBuilder()
-            val reader = BufferedReader(InputStreamReader(p.inputStream, Charsets.UTF_8))
+            reader = BufferedReader(InputStreamReader(process.inputStream, Charsets.UTF_8))
             val job = launch {
                 try {
                     while (true) {
@@ -161,12 +180,12 @@ class CargoRunner(
                 } catch (_: IOException) {}
             }
             val finished = try {
-                p.waitFor(timeoutSec, TimeUnit.SECONDS)
-            } catch (e: InterruptedException) {
+                process.waitFor(timeoutSec, TimeUnit.SECONDS)
+            } catch (_: InterruptedException) {
                 false
             }
             if (!finished) {
-                p.destroyForcibly()
+                process.destroyForcibly()
                 job.cancel()
                 return@withContext ""
             }
@@ -174,6 +193,13 @@ class CargoRunner(
             out.toString().trim()
         } catch (e: IOException) {
             ""
+        } finally {
+            runCatching { reader?.close() }
+            process?.let { p ->
+                runCatching { p.inputStream.close() }
+                runCatching { p.errorStream.close() }
+                runCatching { p.outputStream.close() }
+            }
         }
     }
 
