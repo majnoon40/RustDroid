@@ -40,8 +40,8 @@ class ProcTreeTest {
         File(tmp.root, "acpi").mkdirs()
     }
 
-    private fun rewriteStat(pid: Long, start: Long, ppid: Long = 1L) {
-        File(tmp.root, "$pid/stat").writeText(statLine(pid, "fake$pid", "R", ppid, start))
+    private fun rewriteStat(pid: Long, start: Long, ppid: Long = 1L, state: String = "R") {
+        File(tmp.root, "$pid/stat").writeText(statLine(pid, "fake$pid", state, ppid, start))
     }
 
     // ------------------------------------------------------------------
@@ -353,5 +353,86 @@ class ProcTreeTest {
         val kills = rec.sent.count { it == 200L to ProcTree.SIGKILL }
         assertTrue("expected <= 3 kills, got $kills", kills <= 3)
         assertTrue(kills >= 1)
+    }
+
+    // ------------------------------------------------------------------
+    // Zombie exclusion in the final sweep (regression: the sweep used to
+    // count state-Z corpses as "remaining", so the early-return never
+    // fired and every cancellation paid the full maxSweeps budget
+    // re-signaling processes that were already dead and pending reap)
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `zombie state is read from the first token after the comm field`() {
+        proc(Triple(100L, 1L, 10L))
+        assertFalse(ProcTree.isZombie(tmp.root, 100L)) // R state, alive
+        rewriteStat(100L, 10L, state = "Z")
+        assertTrue(ProcTree.isZombie(tmp.root, 100L))
+        // a zombie KEEPS its identity — same start time, state Z: the
+        // PID-reuse defense must still see the original process
+        assertEquals(ProcTree.ProcessId(100L, 10L), ProcTree.identity(tmp.root, 100L))
+        rewriteStat(100L, 10L, state = "R")
+        assertFalse(ProcTree.isZombie(tmp.root, 100L))
+        // vanished /proc entry: not a zombie, just gone
+        File(tmp.root, "100").deleteRecursively()
+        assertFalse(ProcTree.isZombie(tmp.root, 100L))
+    }
+
+    @Test
+    fun `killed descendant that becomes a zombie is not re-signaled and unblocks the early return`() {
+        // The live scenario this mirrors: root (cargo) dies first, its
+        // child (rustc) is reparented to init; the sweep SIGKILLs the
+        // child; the child becomes a state-Z corpse pending reap by its
+        // NEW parent (init) — /proc entry and identity INTACT. The old
+        // code kept counting it as "remaining", never early-returned,
+        // and burned the full sweep budget signaling the corpse.
+        proc(Triple(100L, 1L, 10L), Triple(200L, 100L, 20L))
+        val rec = Recorder()
+        var slept = 0
+        rec.onRootDestroyed = {
+            // root dead AND reaped: /proc/100 gone; 200 now hangs off init
+            File(tmp.root, "100").deleteRecursively()
+            rewriteStat(200L, 20L, ppid = 1L) // reparented, still alive
+        }
+        val killMakesZombie: (Long, Int) -> Unit = { pid, sig ->
+            rec.signal(pid, sig)
+            if (pid == 200L && sig == ProcTree.SIGKILL) {
+                // SIGKILL lands: 200 terminates but is NOT reaped by its
+                // new parent yet — state flips to Z, identity unchanged
+                rewriteStat(200L, 20L, ppid = 1L, state = "Z")
+            }
+        }
+        ProcTree.terminateTree(
+            tmp.root, 100L, killMakesZombie, rec.destroyRoot, { rec.rootAlive },
+            maxSweeps = 5, sweepDelayMs = 0, sleeper = { slept += 1 },
+        )
+        assertTrue(rec.rootDestroyed)
+        // the kill happened exactly once — sweeps after the kill see a
+        // zombie-only "remaining", which is EMPTY by the exclusion
+        val kills = rec.sent.count { it == 200L to ProcTree.SIGKILL }
+        assertEquals("zombie corpse must not be re-signaled", 1, kills)
+        // sweep 0 signals+sleeps, sweep 1 sees only the zombie and
+        // returns early: with maxSweeps=5 the old code would have slept
+        // 4 times; the fixed code sleeps exactly once
+        assertEquals("early return must fire on the sweep after the kill", 1, slept)
+    }
+
+    @Test
+    fun `a live stubborn descendant still gets the full bounded sweep`() {
+        // guard against over-exclusion: a process that stays RUNNING (not
+        // zombie, identity intact, refuses to die) must still receive the
+        // full bounded re-signaling budget — the zombie exclusion may
+        // only skip the DEAD
+        proc(Triple(100L, 1L, 10L), Triple(200L, 100L, 20L))
+        val rec = Recorder()
+        var slept = 0
+        rec.onRootDestroyed = { File(tmp.root, "100").deleteRecursively() }
+        ProcTree.terminateTree(
+            tmp.root, 100L, rec.signal, rec.destroyRoot, { rec.rootAlive },
+            maxSweeps = 3, sweepDelayMs = 0, sleeper = { slept += 1 },
+        )
+        val kills = rec.sent.count { it == 200L to ProcTree.SIGKILL }
+        assertEquals(3, kills)
+        assertEquals(2, slept)
     }
 }

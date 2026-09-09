@@ -145,6 +145,37 @@ object ProcTree {
     private const val STARTTIME_FIELD = 22
 
     /**
+     * True when `/proc/<pid>` shows state 'Z' — the process TERMINATED
+     * and is awaiting reap by its parent. A zombie holds its PID and
+     * stat identity (same start time) until reaped, so it still
+     * "matches" in the PID-reuse sense while being dead in every
+     * operational sense: signals — SIGKILL included — do nothing to a
+     * corpse; only reaping (or its parent dying and init inheriting it)
+     * removes it from /proc.
+     */
+    fun isZombie(procRoot: File, pid: Long): Boolean =
+        stateOf(File(procRoot, "$pid/stat")) == 'Z'
+
+    /**
+     * `/proc/<pid>/stat` state character (field 3 — the first token
+     * after the LAST ')'; the comm field may contain spaces and ')').
+     * Null when the file is missing/unreadable/malformed — treated as
+     * "not a zombie": an unparseable stat also fails identity
+     * revalidation, so such a process can never reach the sweep's
+     * signal path anyway.
+     */
+    private fun stateOf(stat: File): Char? {
+        if (!stat.isFile) return null
+        return runCatching {
+            val text = stat.readText()
+            val close = text.lastIndexOf(')')
+            if (close < 0) return@runCatching null
+            val tokens = text.substring(close + 1).trim().split(' ')
+            tokens.getOrNull(0)?.firstOrNull()
+        }.getOrNull()
+    }
+
+    /**
      * Identity-preserving process-tree termination.
      *
      * Sequence:
@@ -163,9 +194,14 @@ object ProcTree {
      *     by an unrelated process; every discovery is revalidated
      *     immediately before its signal;
      *  6. bounded final sweep: SIGKILL every captured process that STILL
-     *     matches its identity, until none remain or the pass budget is
-     *     exhausted. A PID that no longer matches was reused — it is
-     *     never signaled.
+     *     matches its identity AND is not a zombie, until none remain or
+     *     the pass budget is exhausted. A PID that no longer matches was
+     *     reused — it is never signaled. A zombie (state Z) is excluded
+     *     from "remaining": a killed descendant reparented to init when
+     *     the root died first sits in /proc with identity intact pending
+     *     reap, so without the exclusion the sweep can never observe an
+     *     empty `remaining` and every cancellation burns the full budget
+     *     re-signaling corpses.
      *
      * All /proc reads are best-effort: processes vanishing mid-traversal
      * simply drop out of the sweep. No new dependencies.
@@ -213,9 +249,17 @@ object ProcTree {
             }
         }
 
-        // 6) bounded final sweep — kill only identity-matching processes
+        // 6) bounded final sweep — kill only identity-matching LIVING
+        // processes. Zombies (state Z) are dead pending reap: SIGKILL is
+        // a no-op on a corpse, but its /proc entry and identity persist
+        // until the reaper comes, so an unexcluded zombie keeps
+        // `remaining` non-empty forever — the early-return never fires
+        // and the caller pays the full sweep budget re-signaling the
+        // dead. Excluded here: dead is dead.
         for (sweep in 0 until maxSweeps) {
-            val remaining = captured.filter { stillMatches(procRoot, it) }
+            val remaining = captured.filter {
+                stillMatches(procRoot, it) && !isZombie(procRoot, it.pid)
+            }
             if (remaining.isEmpty()) return
             for (id in remaining) signal(id.pid, SIGKILL)
             if (sweep < maxSweeps - 1) sleeper(sweepDelayMs)

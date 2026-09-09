@@ -632,3 +632,45 @@ already-fixed area re-verified intact (190 JVM tests, 0 failures).
   by `startForeground`, else "did not then call Service.startForeground"
   — the crash the naive fix would trade in) by re-asserting the CURRENT
   operation's state. Job cancellation/cleanup behavior unchanged.
+
+## 9. Zombie sweep fix + Phase 4 (terminal) architecture pass (2026-09-09)
+
+Landed together, ahead of any terminal implementation code:
+
+- **`ProcTree.terminateTree` zombie-state exclusion (live latency bug in
+  `main`, ordered fixed before Phase 3/4 work)**: the final sweep counted
+  a captured process as "remaining" whenever `stillMatches` held — but a
+  killed descendant that was reparented to init when the root died first
+  sits in `/proc` as a state-`Z` zombie pending reap, holding its PID and
+  start-time identity, so `remaining` NEVER emptied: the early-return
+  never fired and every cancellation burned the full `maxSweeps` budget
+  re-signaling corpses that cannot respond to SIGKILL. Fix: the sweep now
+  excludes processes whose `/proc/<pid>/stat` state character (first
+  token after the last `)`) is `Z` — new `ProcTree.isZombie`, same
+  last-`)` parsing discipline as `startTimeOf`. Identity semantics are
+  untouched: a zombie still matches its identity (PID-reuse defense
+  intact — the exclusion only says "dead is dead, stop signaling"). Three
+  regression tests: state-character parsing (incl. zombie-keeps-identity),
+  a killed-then-zombie descendant is SIGKILLed exactly once and the
+  early-return fires on the next sweep (proven to FAIL on the pre-fix
+  code), and a live stubborn descendant still receives the full bounded
+  sweep (guards against over-exclusion). Suite: 193 JVM tests, 0 failures.
+- **`android.yml` push trigger — false alarm, no fix needed**: an initial
+  read of the workflow showed `branches: ain]`, but byte-level inspection
+  (`od -c`) proved the file has always contained `branches: [main]` — the
+  earlier rendering was the same display artifact that eats `[m`
+  sequences. Recorded here so nobody re-reports it; no change was made.
+- **Phase 4 architecture plan** (`docs/phase3-terminal-architecture.md`):
+  pre-implementation gate document for the native-terminal work —
+  vendoring terminal-emulator/terminal-view @ termux-app `3b66f87`
+  (Apache-2.0, `termux-shared` explicitly excluded with a no-transitive-
+  pull proof), the three upstream JNI defects confirmed at that commit
+  and their fix plan (plus regression-test design), an async-signal-safe
+  fork→exec restructure, session/process-group teardown (NOT a ProcTree
+  extension — new `sessionMembers` keyed on stat field 6), BusyBox 1.38.0
+  static build via the Termux recipe pattern with GPL-2.0 source-release
+  obligations, generalized bundle distribution, and the CI matrix. No
+  implementation code yet — the plan goes to independent review first,
+  per the task brief. Companion inventory: `THIRD_PARTY.md` (new).
+
+Version 0.1.6 (versionCode 7).

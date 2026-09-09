@@ -330,7 +330,8 @@ guarded on the current destination.
 ## Known v1 limits
 
 - No PTY: stdin is a line-send field; programs needing raw tty interaction
-  (vim-style) won't be usable.
+  (vim-style) won't be usable. **Phase 4 (in architecture review)** adds a
+  real PTY terminal — plan: `docs/phase3-terminal-architecture.md`.
 - No C compilation: the cc shim is link-only (build scripts using the `cc`
   crate fail with a clear message) — real clang is later-phase work.
 - No git in the bundle: `cargo new` runs with `--vcs none` (+ the same default
@@ -347,8 +348,11 @@ guarded on the current destination.
   before the parent dies (nothing new spawns, nothing escapes), the
   tree is re-walked while the root PID still belongs to the original
   process, and the final SIGKILL sweeps are bounded and
-  identity-checked. A pid-extraction failure or missing /proc degrades
-  to signalling only the direct child.
+  identity-checked. Zombies (state Z — killed descendants pending reap,
+  whose /proc entries and identities persist) are excluded from the
+  sweep's "remaining" count, so a corpse never blocks the early-return
+  or eats the sweep budget re-signaling the dead. A pid-extraction
+  failure or missing /proc degrades to signalling only the direct child.
 - Cancellation is never misreported as failure: the install/verify path
   rethrows `CancellationException` before any generic catch, so a
   backgrounded service being torn down does not surface as

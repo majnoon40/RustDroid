@@ -14,6 +14,7 @@ The repo contains two things:
 | **1 — Toolchain** | Self-hosting rustc + cargo for `aarch64-linux-android`, built via GitHub Actions, verified statically + on-device | **VALIDATED ON-DEVICE** (2026-09-02): full `rustc` compile + link + run works on a TECNO-LJ9 via the `rustdroid-link` kit (`hello from RustDroid on Android`). CI: runs #22/#23 green; kit + libunwind fix landed in 0f7eb19/2cc5296, baked into artifacts from run #26 on |
 | **2 — App shell** | Android app that downloads/installs the toolchain, gate screen, settings, foreground-service download | **BUILT, on-device first pass done** (see `android/`): install/download/verify loop works on a TECNO-LJ9; first-report bugs fixed in-app; SHA-256-pinned bundle |
 | **3 — IDE experience** | Code editor with Rust TextMate syntax, project templates, build output panel with diagnostics, `cargo run` console, crates.io dependency search + fetch | **BUILT**: editor + tabs + file tree, DiagnosticsParser-backed problems panel, selectable/copyable console, deps screen with search/fetch and a self-healing TLS trust store |
+| **4 — Native terminal** | Real PTY terminal (vendored Apache-2.0 Termux `terminal-emulator`/`terminal-view`, JNI defects fixed) + BusyBox ash/coreutils, session-aware process teardown | **ARCHITECTED, not yet implemented** — pre-implementation plan under independent review: `docs/phase3-terminal-architecture.md` (the task brief calls this "Phase 3"; README numbering keeps Phase 3 = IDE experience, so the terminal is Phase 4 here) |
 
 ## The app
 
@@ -167,6 +168,9 @@ adb shell run-as dev.rustdroid.ide sh -c '
 ```
 ├── .github/workflows/main.yml     # CI build + verify + artifact upload (workflow_dispatch)
 ├── .github/workflows/android.yml  # Android debug APK build on push
+├── docs/                          # architecture plans (Phase 4 terminal: phase3-terminal-architecture.md)
+├── LICENSES/                      # per-component third-party license texts (Phase 4 grows this)
+├── THIRD_PARTY.md                 # third-party inventory: licenses, pins, vendored commits
 ├── android/                       # the IDE app (Compose, dev.rustdroid.ide)
 │   └── app/src/main/assets/ssl/cacert.pem   # pinned Mozilla CA bundle (MPL-2.0)
 ├── env.sh                         # single source of truth (paths, versions, triples)
@@ -182,4 +186,4 @@ adb shell run-as dev.rustdroid.ide sh -c '
 
 ## License & attribution
 
-MIT. Design references Termux's public `rust/build.sh` but contains no Termux code or branding. Rust is MIT/Apache-2.0 (rust-lang.org); the Android NDK is Apache-2.0 + LLVM-variant (Google); the bundled CA store is Mozilla's (`cacert.pem`, MPL-2.0, via curl.se).
+MIT. Design references Termux's public `rust/build.sh` but contains no Termux code or branding. Rust is MIT/Apache-2.0 (rust-lang.org); the Android NDK is Apache-2.0 + LLVM-variant (Google); the bundled CA store is Mozilla's (`cacert.pem`, MPL-2.0, via curl.se). The full third-party inventory — licenses, pins, vendored commits — lives in `THIRD_PARTY.md` (Phase 4 will add Termux's Apache-2.0 `terminal-emulator`/`terminal-view` as vendored source and BusyBox as a separate GPL-2.0 executable with published corresponding source; see `docs/phase3-terminal-architecture.md`).
