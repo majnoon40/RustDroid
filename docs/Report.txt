@@ -1,0 +1,191 @@
+Adversarial Review — Phase 4 Native Terminal Architecture Plan
+
+Verification method and limits
+
+I read the plan in full, then independently checked its checkable claims against primary sources: termux-app/LICENSE.md, termux-shared/LICENSE.md, terminal-emulator/build.gradle, terminal-view/build.gradle, terminal-emulator/src/main/jni/termux.c, busybox.net, and Android NDK release data. I re-read ProcTree.kt at repo HEAD (e6f637c) in the previous pass.
+
+Explicitly UNVERIFIED: I fetched Termux files from master, not from commit 3b66f8799635a4dba4a206563048ff0e6792c487. I cannot confirm that SHA exists or that its contents match what I read, so every "confirmed at the pinned commit" claim below is confirmed at master and must be re-checked against the pin. I also could not verify the BusyBox 1.38.0 SHA-256 value, the claim that termux.c is unchanged since 438cd73, the zero-match rg result, the "18 JUnit test classes" count, the "193 tests, 0 failures" claim, or the current state of CargoRunner.kt/ToolchainVerifier.kt (crawler failed repeatedly on those paths). I ran no code.
+
+This plan is substantially better than the typical pre-implementation document — it verified its own premises against primary sources, it states residual risks instead of hiding them, and its central instinct (session-keyed teardown, not an extension of the ppid walker) is correct. It also contains one factual error in its most important section that invalidates a stated guarantee and one test expectation, plus a likely-fatal Android assumption. Both are fixable before implementation.
+
+Part 1 — Confirmed bugs in the plan
+
+[P0] The core sessionMembers guarantee is factually wrong: setsid() changes the session ID
+
+Section: §5.2, §5.4, §6.4, §6.6
+
+Problem: §5.2 states "a setsid'd daemon keeps sid == shellPid forever and stays visible." This is backwards. setsid(2) creates a new session whose SID equals the calling process's own PID, and makes the caller its leader. That is the entire purpose of the call. A process that calls setsid() therefore has sid == itsOwnPid, not shellPid, and disappears from sessionMembers(procRoot, shellPid) immediately and permanently.
+
+What Sonnet correctly identified is a different fact: reparenting to init does not change the SID. That is true and is a genuine advantage of session keying over the ppid walk — an orphaned-but-not-detached process stays visible. But the plan conflates "reparented" with "setsid'd" and claims immunity to both.
+
+Consequence for the plan's own test matrix: §6.4 requires a synthetic-/proc case with "a setsid'd escapee" that "must appear," and §6.6 lists "setsid sleep 300 escapee killed by session teardown" as an on-device validation item. Both encode the wrong expected behavior. If implemented, the synthetic test would be written to match the buggy belief and would pass while the real behavior differs — a pure test-of-the-implementation, exactly the failure class you asked me to hunt for. The on-device check would fail and would be the first honest signal that the model is wrong.
+
+Impact: the plan's headline claim — that teardown is immune to the escape routes the ppid walker misses — is false for the single most common escape route. nohup, setsid, and any double-fork daemon (which conventionally calls setsid() between the two forks) all escape both models.
+
+Concrete correction, in two parts. First, fix the guarantee statement: a terminal that kills deliberately detached processes is arguably wrong Unix behavior — setsid/nohup exist precisely so a job survives terminal teardown. The defensible guarantee is "everything still attached to the session dies; deliberately detached processes survive by design," which is what a real terminal does. Second, if you want best-effort coverage anyway, take the union of three discovery sets rather than relying on session ID alone:
+
+members = sessionMembers(procRoot, shellSid)
+        ∪ descendants(procRoot, shellPid)        // existing ppid walk
+        ∪ processesWhoseTtyNrMatches(ptsDevice)  // /proc//stat field 7
+
+Field 7 (tty_nr) is the strongest of the three for a terminal: a process keeps the controlling-terminal device number even after setsid() unless it explicitly detaches from the tty, so a setsid sleep 300 that still has the pts open remains discoverable. Compute the pts device number in the parent at PTY creation (fstat the slave, take st_rdev) and pass it to the controller. Union the three, dedupe by ProcessId, and keep the existing identity revalidation.
+
+Regression test that would actually catch this: a synthetic /proc where a process has sid == itsOwnPid, ppid == 1, and tty_nr == ptsDev. Assert sessionMembers alone does not return it (pinning the true kernel semantics), and that the union discovery does. Writing the first assertion is what prevents the wrong belief from being re-encoded later.
+
+[P0] close_range() via raw syscall will be killed by Android's seccomp filter on many devices
+
+Section: §4.4, Assumption 2
+
+Problem: The plan proposes syscall(SYS_close_range) with number 436 declared locally, gated on "Linux ≥ 5.9, i.e. Android 11+ devices." Kernel version does not determine whether an app may make a syscall on Android. Since Android O, app processes run under a seccomp-bpf allowlist derived from bionic's supported syscall set, and a syscall outside that allowlist does not return ENOSYS — it delivers SIGSYS and kills the process. close_range was added to bionic well after it appeared in the kernel, so on devices whose seccomp policy predates that addition, a kernel that supports close_range and a policy that forbids it coexist. This failure mode is documented in the wild on aarch64 Android.
+
+Why it's severe here specifically: the call happens in the forked child, after fork() and before execve(). SIGSYS kills that child silently. The parent gets a valid master fd and a valid PID, sees no error, and waits forever for output from a shell that never execed. The user sees "terminal opens, blank, nothing happens." There is no diagnostic, no exception, no log — the exact "only appears on real devices, only on some devices" bug class you asked me to find. And because fork succeeded, the plan's RD_FORK failure-injection tests will never reach it.
+
+Also note the runtime-probe trap: you cannot safely probe close_range in the parent to decide, because a blocked syscall kills the app process, not just returns an error.
+
+Concrete correction: drop close_range from the child path entirely for v0. The pre-scanned close-list from the parent is already the fallback, is pure close(2) (unquestionably allowlisted), and is sufficient. The plan's own residual-risk analysis already concedes the list is "strictly no worse than the status quo," so close_range buys a narrow improvement at the cost of a silent-death risk on an unknown fraction of devices. If you want it later, probe it exactly once at app startup inside a throwaway forked child whose sole job is to attempt the syscall and _exit(0); the parent interprets death-by-SIGSYS via WIFSIGNALED/WTERMSIG == SIGSYS and caches "unavailable." That is the only safe probe, and it is not worth the complexity in v0.
+
+Regression test: not host-testable (the harness runs on glibc/x86 with no Android seccomp policy). This must be an on-device checklist item across at least Android 9, 11, and 14 devices. The host harness giving a green light here is precisely a false positive.
+
+[P1] The SIGSTOP freeze makes the SIGHUP step dead code
+
+Section: §5.3 steps 2–3
+
+Problem: Step 2 SIGSTOPs every session member. Step 3 then sends killpg(shellPgid, SIGHUP) with the stated rationale "SIGHUP first so an interactive shell gets to forward the hangup to its jobs before the hard kill," immediately followed by killpg(shellPgid, SIGKILL).
+
+A stopped process does not execute signal handlers. SIGHUP delivered to a SIGSTOPped process remains pending until SIGCONT; if SIGKILL arrives first, the process dies without ever running its handler. So the shell cannot forward anything. Even under the reading that the shell itself is stopped last, its jobs are already frozen and cannot act on a forwarded hangup either. Compounding it, there is no stated grace interval between SIGHUP and SIGKILL — even without the freeze, a shell would need scheduling time it isn't given.
+
+The two goals are in direct conflict: freezing to prevent escape-during-teardown is mutually exclusive with graceful hangup notification. The plan asserts both.
+
+Concrete correction: pick one and say which. My recommendation, because it matches real terminals and preserves shell-managed cleanup: drop the freeze from the graceful phase. Sequence becomes close the master fd first (the kernel sends SIGHUP to the foreground process group automatically — you get graceful hangup for free, from the kernel, with correct semantics), wait a bounded grace period (200–500 ms), then snapshot, freeze, and SIGKILL the survivors. This also fixes the ordering problem in step 6 below. If you instead keep freeze-first, delete the SIGHUP step and its rationale, because it does nothing.
+
+Regression test: Recorder-based ordering assertion that no SIGSTOP precedes the SIGHUP-equivalent for a given PID, and that a grace delay is observed between them.
+
+[P1] Closing the PTY master last, while a reader thread is blocked on it, is a use-after-close with fd-number reuse
+
+Section: §5.3 step 6
+
+Problem: Step 6 closes the master fd at the end of teardown. The plan does not specify stopping the output-reader thread first. A blocked read(2) on an fd that another thread closes is undefined in the worst practical sense: the fd number is immediately available for reuse, and if any thread in the app (OkHttp socket, file open, another terminal session's ptmx) acquires that number in the window, the reader resumes reading from an unrelated file descriptor and pipes its bytes into the terminal display. With close_range gone and multiple sessions in scope (§11.6), fd churn is guaranteed.
+
+Impact: intermittent garbage in a terminal, potential disclosure of unrelated file or socket content into the UI, and reader threads that never exit. This is a textbook "thousands of commands later" bug.
+
+Concrete correction: reverse the ordering and make it explicit. Signal the reader to stop, join it with a bounded timeout, and only then close(ptm). If you adopt the close-first graceful sequence from the previous finding, the same discipline applies — the close must be performed by the thread that owns the fd, after the reader is joined. On Linux, once the child is gone, read on the master returns EIO rather than 0, which is the natural wakeup; treat EIO as normal end-of-session, not an error (see §Part 2).
+
+Regression test: not unit-testable meaningfully; make it an on-device stress item — open and close 200 sessions in a loop while a background download runs, assert no cross-talk and no thread leak (Thread.activeCount stable).
+
+[P1] Vendored terminal-emulator tests will not compile/pass without unitTests.returnDefaultValues
+
+Section: §4.1, §4.6
+
+Problem: The plan drops upstream's Groovy build files and writes new build.gradle.kts per module, and separately claims the upstream JUnit suite is "pure JVM, zero Android dependencies." I read upstream terminal-emulator/build.gradle and it contains:
+
+testOptions {
+    unitTests.returnDefaultValues = true
+}
+
+That flag exists precisely because the code touches Android framework classes that are unimplemented stubs in the JVM unit-test classpath. Without it, calls into android. throw "not mocked" RuntimeExceptions. So the tests are *not Android-free; they depend on a build-script setting the plan proposes to discard.
+
+Impact: step 1 of the implementation order ("upstream tests green") fails immediately, and the natural reaction under time pressure is to delete the failing tests — losing the behavioral baseline that is the main reason for vendoring them.
+
+Concrete correction: carry testOptions { unitTests.returnDefaultValues = true } into both new build.gradle.kts files. Also carry compileOptions at least at 1.8 source level (raising to 17 is fine), and note that upstream's cFlags include -Werror — NDK r27c's clang is newer than what upstream builds with, so new warnings may break the native build; be prepared to drop -Werror or add targeted -Wno- flags rather than patching upstream C for warning cosmetics.
+
+[P1] BusyBox 1.38.0 is upstream-labelled unstable; the last stable is 1.36.1
+
+Section: §7.2, §2
+
+Problem: busybox.net's own release listing marks 1.38.0 (unstable), released 2026-05-13, and 1.37.0 (unstable) before it; 1.36.1 (2023-05-19) is the most recent release marked stable. The plan pins 1.38.0 with no acknowledgment of that status.
+
+This matters more than usual because the plan's entire justification for choosing BusyBox over Toybox is shell maturity (§7.1). Pinning the newest unstable release of the thing you chose for maturity undercuts the argument. BusyBox's "unstable" label is not merely nominal — the shell and line-editing code are exactly where its point releases have historically fixed regressions.
+
+Relatedly, the plan says the 1.38.0 SHA-256 was "cross-checked against the Termux recipe's pin." I could not verify that, and it is unlikely to be possible if Termux pins an older version. Mark that claim UNVERIFIED and treat it as probably false; a checksum should be verified against busybox.net's own published sums, not inferred.
+
+Concrete correction: pin 1.36.1 for v0 unless you have a specific applet or fix that requires newer, in which case pin 1.37.0/1.38.0 deliberately and record in DEVIATIONS.md that you are shipping an upstream-unstable release and why. Verify the checksum against busybox.net directly and record where you got it.
+
+[P2] Child path does not reset inherited signal dispositions — SIG_IGN survives execve
+
+Section: §4.4 step 2
+
+Problem: The child does sigprocmask(SIG_UNBLOCK, full), which handles the mask. It does not reset signal dispositions. execve resets handled signals to default but explicitly preserves SIG_IGN. The ART runtime sets several signals to ignored or handled; SIGPIPE is the classic case a JVM ignores.
+
+Impact: the shell and every command it runs inherit SIGPIPE == SIG_IGN. Shell pipelines then misbehave in ways that look like the shell is broken: yes | head -1 never terminates, find | head hangs, cargo build 2>&1 | head hangs. Writers get EPIPE return values they may not check instead of dying. This is a well-known Android/JVM subprocess footgun and it will surface within minutes of real use — but not in a host harness spawning /bin/sh -c 'echo ok'.
+
+Concrete correction: in the child, before execve, loop for (int i = 1; i  ../../../../data/data/com.other/files/x must be rejected.
+
+[P3] Static BusyBox loses bionic NSS; DNS-dependent applets will misbehave
+
+Section: §7.2
+
+CONFIG_STATIC=y is right for exec-anywhere and no DT_NEEDED, and the verifier's no-PT_INTERP check is the correct inverse test. But statically linked bionic loses the dynamic NSS/DNS resolution path, so wget, ping, nslookup, and telnet may fail to resolve hostnames even with working connectivity. Since cargo/rustc do their own networking through the app's OkHttp and the toolchain's curl, this is cosmetic for the core use case — but it will generate "wget is broken" reports. Either drop the network client applets alongside the servers, or document the limitation in the README known-limits section.
+
+[P3] dataSync is the wrong FGS type for a terminal on any future targetSdk
+
+Section: §8.3
+
+The reasoning is correct today: at targetSdk 28, FGS type enforcement is off, so reusing dataSync works. But a terminal session is not data sync, and if targetSdk is ever raised (API 34+ enforces type-appropriateness; API 35 adds a ~6h/day cap on dataSync), this becomes a policy violation and a timeout. Mark it in the plan as a known migration blocker and note that specialUse (with a declared justification) is the type a terminal would need. Flagging as INFO-adjacent because the current claim is accurate at the current target — this is exactly the "true on old Android, false on modern Android" category you asked about, and the plan gets it right but doesn't record the debt.
+
+[P3] Add R8/ProGuard keep rules for the JNI class now, not later
+
+Section: §4.2
+
+isMinifyEnabled = false today, so nothing breaks. But com.termux.terminal.JNI's native methods and any Java methods called from native must survive shrinking, and the failure mode (UnsatisfiedLinkError or a silently missing callback) appears only in release builds if minification is ever enabled. Add -keepclasseswithmembernames class com.termux.terminal.JNI { native ; } plus keeps for native-invoked callbacks in proguard-rules.pro as part of step 1.
+
+Part 2 — Likely risks (not confirmed defects)
+
+The fork() in a multithreaded ART process remains the deepest residual risk even after the restructure, and the plan's mitigation is the right shape but its enforcement has a gap: the whitelist-grep and the malloc interposer both operate on the code you wrote, not on what bionic does internally. sigaction, close, dup2, setsid, open, chdir, and execve are all thin syscall wrappers in bionic, so this is very likely fine — but "likely" is the honest word, and the on-device soak (open/close hundreds of sessions under memory pressure and background load) is the only test that would surface a fork-window allocator deadlock. Budget for it explicitly rather than treating the host harness as sufficient.
+
+Reading the master fd after the child exits returns EIO on Linux, not a clean EOF. Java's FileInputStream.read will surface that as IOException. If the reader treats it as an error rather than normal session termination, every single session close will produce a spurious error in the UI. The plan doesn't mention EOF/HUP handling at all; specify it.
+
+Non-UTF-8 handling is genuinely well-covered — §6.3's every-split-offset test against mUtf8ToFollow/mUtf8InputBuffer is the right test and, notably, upstream already does incremental stateful decoding, which resolves the concern I raised in my previous review. One gap: the test asserts on the rendered row, which couples it to the emulator's grid behavior. Also assert on the decoder's intermediate state so a regression in split handling is distinguishable from a rendering change.
+
+Backpressure is not addressed anywhere in the plan. The correct behavior is to let the child block on writing to the pts when the reader falls behind — that is the kernel doing flow control for you. The risk is that someone "fixes" a perceived stall by buffering output unboundedly in Kotlin, which turns a 64 MB cargo build --verbose into an OOM. State the non-goal explicitly: no unbounded output buffering, scrollback capped, kernel backpressure is the mechanism.
+
+sessionMembers scanning all of /proc on every teardown is O(all processes) per session close; with a session tab strip and users closing many sessions, plus the sweep re-reading stat per captured member per sweep, this is more /proc traffic than the build path ever generated. Not a correctness issue, but cache the discovery map within a teardown rather than re-reading.
+
+Security boundary: nothing here escapes the app sandbox, correctly. But the plan should state plainly what a terminal changes about the threat model — it hands the user, and any script they paste, interactive execution as the app's UID with INTERNET and WRITE_EXTERNAL_STORAGE, full read/write of the toolchain prefix, the CA bundle, and the insecure-tls marker that disables cargo certificate verification globally. Nothing to fix; document it, because "a terminal is strictly more dangerous than a build button" belongs in the security section of DEVIATIONS.md.
+
+Part 3 — Independent licensing verification
+
+Verified facts, from primary sources at master. termux-app/LICENSE.md states GPLv3-only for the repository with an explicit carve-out: "Terminal Emulator for Android code is used which is released under Apache 2.0 license. Check terminal-view and terminal-emulator libraries." Sonnet's Apache-2.0 conclusion for both modules is correct. terminal-emulator/build.gradle shows dependencies of only androidx.annotation:annotation:1.9.0 and JUnit; terminal-view/build.gradle shows implementation "androidx.annotation:annotation:1.9.0" and api project(":terminal-emulator"). So the dependency claim in §3.2 — the two modules depend only on androidx.annotation and each other — is confirmed, and there is no build-graph path to termux-shared.
+
+One precision correction, which strengthens rather than weakens the plan. §2 says the GPLv3 subtree "holds TermuxConstants and the hardcoded /data/data/com.termux/... assumptions." The actual termux-shared/LICENSE.md says the library is MIT overall, GPLv3-only applies to src/main/java/com/termux/shared/termux/, *"unless specifically specified by a file/directory, like the TermuxConstants.java and TermuxPropertyConstants.java files [which] are released under the MIT license."* So TermuxConstants.java is specifically MIT, not GPLv3. There is also a GPLv2-with-Classpath-exception carve-out for com.termux.shared.file.filesystem/ (ojluni-derived) and an Apache-2.0 one for StreamGobbler.java that the plan doesn't mention. None of this changes the decision to exclude termux-shared — which remains correct and is the single most important licensing call in the plan — but the plan's stated reason is slightly wrong, and a wrong reason in a compliance document is worth fixing.
+
+Vendoring over the AAR: I independently reach the same conclusion, for both stated reasons. F-Droid's build-from-source policy versus an AAR containing prebuilt .so for four ABIs is a genuine conflict, and the three JNI defects are unfixable through a binary dependency. Apache-2.0 §4 obligations (retain notices, state changes) are satisfied by the THIRD_PARTY.md file-by-file divergence record — that's the right mechanism. The plan's claim that no upstream NOTICE file exists in either module is UNVERIFIED by me; check it, because if one exists, Apache-2.0 §4(d) requires you to reproduce it.
+
+BusyBox GPL-2.0-only is correct. The plan's compliance package (pristine tarball, config, patch set, build script, published as a release asset on the same release as the binary) is a reasonable reading of "complete corresponding source" for a config-driven C build, and GPLv2 §2's final paragraph explicitly permits aggregating an independent work with a GPL work on a distribution volume — which covers shipping busybox inside the same bundle zip as the Rust toolchain.
+
+The "mere aggregation" reasoning for the Kotlin app is legal interpretation, not verified fact, and the plan should label it as such. It happens to be the FSF's own stated position for separate programs communicating at arm's length via execve with no shared address space and no linking, and it is the same basis on which countless Android apps ship GPL binaries. I think it's correct. It is not something I can verify, and "if this ever matters commercially, have a lawyer confirm" is the right footnote. One concrete addition: your compliance offer must reach bundle recipients, and the bundle is downloaded by the app rather than from the release page — so surface the source-asset URL in the in-app Licenses screen (§7.5 already plans this; make it a requirement, not a nicety).
+
+Part 4 — BusyBox vs Toybox, independent re-assessment
+
+I reach the same conclusion, and Sonnet's evidence is better than mine was. In my previous review I flagged the toysh-maturity claim as something I could not verify and told you to check it before relying on it; the plan verified it from android.googlesource.com and landley.net, and the argument it constructs — AOSP ships Toybox for utilities while deliberately retaining mksh as the system shell — is the strongest available signal, since Toybox's largest deployer is also the party best positioned to use toysh if it were ready. Combined with build.rs/cc-wrapper/pkg-config shelling out constantly in Rust builds, shell quality is load-bearing for this app specifically, and Toybox's 0BSD advantage doesn't outweigh it.
+
+Two adjustments to the build plan beyond the version pin above. Dropping the network servers is right; consider dropping the network clients too given the static-NSS issue. And keeping vi (§11.3) is the right call for a terminal, but note CONFIG_ASH_JOB_CONTROL=y is the setting that actually matters most for your §6.6 job-control checklist — make sure CONFIG_SH_IS_ASH=y plus job control plus ASH_INTERNAL_GLOB and the line-editing options (FEATURE_EDITING, FEATURE_EDITING_HISTORY, FEATURE_TAB_COMPLETION) are explicitly pinned in the config, because a shell without history or tab completion will read as broken to users regardless of POSIX correctness.
+
+Retargeting Termux's @TERMUX_PREFIX@ patches to @RUSTDROID_PREFIX@, and using only recipe/patch knowledge rather than their binaries, is exactly the right relationship to Termux and mirrors what the repo already did for the Rust toolchain. Making patch application fatal rather than warning is the correct lesson carried forward from the openssl-probe episode.
+
+Part 5 — Where Sonnet is right, wrong, and what to reconsider
+
+Sonnet is correct about: the Apache-2.0 status of both terminal modules and the requirement to exclude termux-shared; the no-transitive-pull dependency analysis (I verified both build files); vendoring over the AAR and both reasons for it; keeping the com.termux.terminal package so Java_com_termux_terminal_ symbol names stay valid while renaming only LOCAL_MODULE/loadLibrary — that is precisely right and the no-runtime-collision reasoning is sound; all three JNI defect classes (I independently confirmed the ReleaseStringUTFChars(env, cmd, cmd_cwd) mismatch and the missing close(ptm) on the fork-failure return, and the argv/envp early-return leaks are visible in the same function); the single-exit cleanup structure as the fix; that ProcTree's ppid model *remains correct for the cargo path* — and the deeper reason it must not be replaced there is one the plan implies but should state outright: cargo shares the *app's session, so session-keyed teardown on the build path would enumerate and kill the app itself; the diagnosis that the fork window violates async-signal-safety, with an accurate per-call violation table; moving all string/array/fd-enumeration work pre-fork; execve with a wholesale envp making clearenv/putenv unnecessary; _exit over exit; execve over execvp; opening the slave without O_NOCTTY after setsid() to acquire the controlling terminal; setting winsize pre-fork so the shell never starts at 0×0; that the upstream emulator is already a stateful incremental UTF-8 decoder and the gap is test coverage, not design; a separate terminal screen rather than merging into the diagnostic console, including the AndroidView interop precedent and the gesture-overlay lesson; distributing busybox through the existing bundle/transaction/verifier/rollback pipeline instead of building a parallel installer; decoupling busybox.yml from the 2.5-hour main.yml; the honesty of §5.4's survival table and refusing to claim session persistence; and BusyBox over Toybox on shell-maturity grounds.
+
+Sonnet is wrong or incomplete about: the setsid()/SID claim in §5.2, which inverts the semantics and invalidates the §5.4 escape-immunity framing plus two test expectations (P0); close_range availability being a function of kernel version rather than Android's seccomp policy, with SIGSYS-in-child as the failure mode (P0); the SIGSTOP-then-SIGHUP sequence, where the freeze makes the graceful step inert (P1); the claim that vendored upstream tests are Android-dependency-free, when they require unitTests.returnDefaultValues that the plan proposes to discard (P1); pinning BusyBox 1.38.0 without noting it is upstream-unstable while arguing maturity, plus an unverifiable Termux-recipe checksum cross-check (P1); signal dispositions (SIG_IGN surviving exec) as distinct from the signal mask, with shell pipelines as the casualty (P2); describing manifest-driven symlink creation as reuse of the existing link pass (P2); the precise termux-shared carve-out structure, where TermuxConstants.java is specifically MIT (P3); and it silently omits master-fd close ordering versus the reader thread (P1), SIGCONT for freeze survivors (P2), EOF/EIO semantics, and backpressure.
+
+Things to reconsider before implementation: whether killing setsid'd processes is even desirable, since that is what nohup/setsid are for — I'd scope the guarantee to attached processes and add tty_nr union discovery as best-effort rather than claiming immunity; whether the freeze belongs in the graceful phase at all (recommend: close master → grace → snapshot → freeze → kill); adopting the FGS in v0 — I agree with the recommendation to include it, because a terminal killed by routine backgrounding is worse than no terminal, but record the specialUse migration debt; and deferring close_range entirely rather than shipping a device-dependent silent-death path.
+
+Part 6 — Testing audit
+
+The strongest part of the plan is that every named defect gets a test that is proven to fail on the unfixed code — that discipline is what separates real regression tests from decoration, and §6.1 already demonstrates it for the zombie fix. The mock-JNIEnv harness recording release-pairing is a genuinely good design for defect 1, RD_FORK returning −1 plus asserting fcntl(ptm, F_GETFD) == EBADF is exactly right for defect 2, and LeakSanitizer with injected GetStringUTFChars/malloc failures is right for defect 3.
+
+Four gaps. The close_range path is not testable on the host — no Android seccomp policy exists there, so the harness passing is a false positive on the most dangerous item in the plan; this must be an on-device matrix item across several API levels. The malloc interposer proves your code doesn't allocate but says nothing about bionic internals, so it's necessary-not-sufficient; the real test is an on-device soak under memory pressure. The §6.4 setsid cases encode the wrong expected behavior and would pass while being wrong — fix the expectation first, then write the test, and include an assertion pinning the true kernel semantics (sessionMembers alone must not find a setsid'd process) so the misconception can't be re-introduced. And the §6.3 UTF-8 test asserting on rendered rows couples decoder correctness to grid rendering; assert decoder state too.
+
+Missing tests I'd add: SIGPIPE disposition after exec (via sh -c 'yes | head -1' with timeout); master-close-versus-reader-join ordering; manifest-v2 symlink traversal rejection; and an fd-leak assertion around repeated session create/destroy (count /proc/self/fd entries before and after 200 cycles).
+
+Verdict
+
+APPROVE WITH CONDITIONS
+
+The architecture is fundamentally sound and I want to be clear about that: session/process-group keying is the correct primitive for terminal teardown, refusing to extend the ppid walker is the right call, retaining it for the cargo path is right for a reason the plan almost states, the vendoring and licensing analysis is accurate where it matters most, the JNI defect analysis is independently confirmed, the fork-window restructure is correctly motivated and mostly correctly designed, the distribution plan reuses existing hardened infrastructure instead of building a parallel installer, and §5.4 is honest where it would have been easy not to be. The two P0s are a factual error and a platform assumption, not structural flaws — the shape of the design survives both corrections.
+
+Conditions, all pre-implementation:
+
+Correct the setsid()/session-ID semantics in §5.2/§5.4, restate the teardown guarantee to scope it to attached processes, adopt union discovery (session ∪ ppid-descendants ∪ tty_nr), and fix the §6.4/§6.6 expectations — including a test that pins the true kernel behavior. Remove close_range from the child path for v0, relying on the pre-scanned close-list, and if it is ever reintroduced, only behind a forked-child SIGSYS probe. Resolve the SIGSTOP/SIGHUP contradiction explicitly, preferably by closing the master first for kernel-delivered SIGHUP, then a bounded grace, then freeze-and-kill. Specify that the output reader is stopped and joined before the master fd is closed, and that EIO is normal end-of-session. Add signal-disposition reset (SIG_DFL loop) to the child whitelist alongside sigprocmask(SIG_SETMASK, empty). Carry unitTests.returnDefaultValues = true into both vendored modules' build scripts. Re-pin BusyBox to 1.36.1 (or justify an unstable pin in DEVIATIONS.md) with the checksum verified against busybox.net. Guard every injected signal/killpg/destroy call with runCatching in both terminateTree and the new controller, and add SIGCONT for freeze survivors after budget exhaustion. Route manifest-v2 symlinks through Fs.resolveChild + Fs.requireInside with a traversal-rejection test. Re-verify every "@ 3b66f87" claim against that actual commit rather than master, and confirm the NOTICE-file absence. Finally, correct the termux-shared carve-out description and label the mere-aggregation reasoning as legal interpretation.
+
+None of these is an architectural blocker. The first two are the ones that would otherwise have shipped as silent, device-dependent, or guarantee-violating failures, and both are cheaper to fix now than after the teardown tests have been written to match the wrong model.
