@@ -672,5 +672,63 @@ Landed together, ahead of any terminal implementation code:
   obligations, generalized bundle distribution, and the CI matrix. No
   implementation code yet — the plan goes to independent review first,
   per the task brief. Companion inventory: `THIRD_PARTY.md` (new).
+  (The v1 plan's 1.38.0 pin was superseded by the 1.36.1 re-pin in
+  §10 below.)
 
 Version 0.1.6 (versionCode 7).
+
+## 10. Phase 4 plan v2 — adversarial-review response (2026-09-10)
+
+The independent adversarial review of the Phase 4 terminal architecture
+plan returned **APPROVE WITH CONDITIONS** (`docs/Report.txt`). All
+findings accepted, all conditions adopted; the plan was revised in place
+(v2, change log in plan §12.3) with the point-by-point response in
+`docs/phase3-review-response.md`. The corrections that change future
+*implementation* behavior (not just plan text) are recorded here because
+they are deviations from what §9 above originally specified:
+
+- **Teardown semantics (plan §5.2/§5.3)**: `setsid(2)` creates a new
+  session — the v1 plan's "a setsid'd daemon keeps `sid == shellPid`"
+  claim inverted the syscall. Teardown discovery is now the union of
+  three sets (session ∪ ppid-descendants ∪ `tty_nr` match on the pts
+  device number), the guarantee is scoped to *attached* processes
+  (deliberately detached survivors are by design), and the teardown
+  order is close-master → grace → freeze → kill → SIGCONT survivors,
+  with the output reader joined before any master-fd close.
+- **`close_range` is out of v0 entirely** (seccomp/SIGSYS risk in the
+  forked child — device-dependent silent death); the child closes fds
+  from the parent's pre-scanned list only. Never probe `close_range`
+  from the app process; the only safe probe shape is a throwaway forked
+  child (plan §4.4).
+- **Child path resets signal dispositions to SIG_DFL** (signals 1..64)
+  before `execve` — ART ignores SIGPIPE and SIG_IGN survives exec;
+  without the reset, `yes | head -1` hangs forever.
+- **BusyBox re-pinned 1.38.0 (upstream-unstable) → 1.36.1 (stable)**,
+  checksum from busybox.net's own `.sha256` (recorded in THIRD_PARTY.md);
+  network client applets dropped alongside servers (static-bionic NSS).
+- **Manifest v2 symlinks** are guarded by `Fs.resolveChild` +
+  `Fs.requireInside` with a traversal-rejection regression test — no
+  blind reuse of the extractor's link pass.
+
+**targetSdk-28 debt list (additions, review P3-10)**: `TerminalService`
+ships in v0 with `foregroundServiceType=dataSync` — correct at
+targetSdk 28 (type enforcement off), wrong from API 34 (type
+appropriateness enforced) and worse at API 35 (~6 h/day dataSync cap).
+The terminal's eventual type is `specialUse` with a declared
+justification. This joins the existing targetSdk-28 debt items
+(WRITE_EXTERNAL_STORAGE model, etc.) as a *known migration blocker*,
+recorded so it is not discovered late.
+
+**Security notes (review Part 2, plan §8.5)**: a terminal is strictly
+more dangerous than a build button — it hands the user, and any script
+they paste, interactive execution as the app's UID with `INTERNET` and
+`WRITE_EXTERNAL_STORAGE`, full read/write of the toolchain prefix, the
+CA bundle, and the **insecure-tls marker that disables cargo
+certificate verification globally** (a pasted `curl | sh` runs with all
+of it). No new permission is requested for the terminal; the sandbox is
+unchanged; the honest mitigation is this documentation, mirrored in the
+README known-limits at implementation time.
+
+The "193 JVM tests, 0 failures" count in §9 is re-verified at each
+implementation step; the running count lives in this section's
+implementation log (appended as terminal-layer tests land).

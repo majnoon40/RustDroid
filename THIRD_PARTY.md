@@ -27,7 +27,7 @@ Test-only (not shipped): JUnit 4 (EPL-2.0).
 |---|---|---|---|
 | Rust (rustc, cargo, rust-std, rust-src) | MIT OR Apache-2.0 | rust-lang/rust tag `1.85.0` (commit `4d91de4e48198da2e33413efdcd9cd2cc0c46688`), built from source by CI | binaries + vendored crates per `build.sh` |
 | Android NDK runtime pieces (`libc++_shared.so`, crt objects, `libunwind.a`, bionic stubs) | Apache-2.0 (LLVM variant for libc++) | NDK r27c | link kit |
-| **Phase 4 (planned, not yet shipped):** BusyBox 1.38.0 | **GPL-2.0-only** | busybox.net tarball (SHA-256-pinned), built statically by CI from our config+patches | separate executable (mere aggregation); complete corresponding source published as a release asset; see `LICENSES/busybox-GPL-2.0.txt` (added at implementation) |
+| **Phase 4 (planned, not yet shipped):** BusyBox **1.36.1** (latest stable per busybox.net's news listing; v2 re-pin — review P1-6) | **GPL-2.0-only** | busybox.net tarball, SHA-256 `b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314` taken from busybox.net's own `busybox-1.36.1.tar.bz2.sha256` (fetched and re-verified), built statically by CI from our config+patches | separate executable (mere aggregation — legal interpretation, see plan §7.4); complete corresponding source published as a release asset (`busybox-1.36.1-src.zip`); see `LICENSES/busybox-GPL-2.0.txt` (added at implementation) |
 
 ## Vendored source in this repo
 
@@ -37,7 +37,9 @@ Test-only (not shipped): JUnit 4 (EPL-2.0).
 | **Phase 4 (planned, not yet vendored):** `terminal-view` | Apache-2.0 (incl. AOSP-derived `support/PopupWindowCompatGingerbread.java`, header preserved) | same commit | build script replaced |
 
 No NOTICE files exist upstream in either Termux module (verified at the
-pinned commit); Apache-2.0 requires license text preservation, which
+pinned commit `3b66f87` — recursive `find` over both module trees, this
+session's post-review re-verification); Apache-2.0 §4(d) therefore
+imposes nothing beyond license-text preservation, which
 `LICENSES/terminal-{emulator,view}-Apache-2.0.txt` will carry (added at
 vendoring time).
 
@@ -45,7 +47,7 @@ vendoring time).
 
 | Component | License | Why not |
 |---|---|---|
-| `termux-shared` (Termux) | MIT overall, but `com/termux/shared/termux/*` subtree is **GPLv3-only** | excluded by design: `TermuxConstants` + hardcoded `/data/data/com.termux/...` assumptions live there. Verified: neither vendored module references it; not in our Gradle graph. |
+| `termux-shared` (Termux) | MIT overall; the **GPLv3-only** scope is `com/termux/shared/termux/*` *unless specifically overridden* — `TermuxConstants.java` and `TermuxPropertyConstants.java` are specifically **MIT** (the v1 wording "the subtree holds TermuxConstants" was imprecise; conclusion unchanged); also `com/termux/shared/file/filesystem/*` is GPLv2+Classpath-exception (ojluni-derived), `StreamGobbler.java` is Apache-2.0 (libsuperuser-derived) | excluded by design: hardcoded `/data/data/com.termux/...` assumptions live in the GPLv3-only subtree. Verified at the pin: neither vendored module references `termux-shared`/`TermuxConstants` (rg, zero matches); not in our Gradle graph. |
 | Toybox | 0BSD | not used — shell quality decision (see plan §7.1): AOSP ships Toybox utilities but keeps mksh as its shell; toysh not production-proven |
 | Termux prebuilt AAR/JitPack artifacts | mixed | prebuilt 4-ABI `.so` — F-Droid-hostile and unfixable; vendored source instead |
 
