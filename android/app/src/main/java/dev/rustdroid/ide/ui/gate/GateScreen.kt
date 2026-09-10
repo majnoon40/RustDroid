@@ -117,6 +117,19 @@ fun GateScreen(
                                 arrayOf("application/zip", "application/x-zip-compressed")
                             )
                         },
+                        // Rescue path: files from an install whose VERIFICATION
+                        // failed (e.g. a false-negative check) sit unverified on
+                        // disk — the rollback of a first install has nothing to
+                        // restore, so it leaves them in place without a ready
+                        // marker. Re-running the health check costs no download;
+                        // if it passes, this prefix is promoted to Ready.
+                        hasExistingFiles = manager.paths.isInstalled(),
+                        onReverifyExisting = {
+                            if (Build.VERSION.SDK_INT >= 33) {
+                                notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            }
+                            ToolchainInstallService.startReverify(container.context)
+                        },
                     )
 
                     is ToolchainState.Downloading -> DownloadCard(state as ToolchainState.Downloading)
@@ -172,7 +185,12 @@ private fun ReadyCard() {
 }
 
 @Composable
-private fun InstallPrompt(onDownload: () -> Unit, onImport: () -> Unit) {
+private fun InstallPrompt(
+    onDownload: () -> Unit,
+    onImport: () -> Unit,
+    hasExistingFiles: Boolean = false,
+    onReverifyExisting: () -> Unit = {},
+) {
     Card(Modifier.fillMaxWidth()) {
         Column(
             Modifier.padding(20.dp).fillMaxWidth(),
@@ -203,6 +221,19 @@ private fun InstallPrompt(onDownload: () -> Unit, onImport: () -> Unit) {
                 onClick = onDownload,
                 modifier = Modifier.fillMaxWidth(),
             ) { Text("Download (${Fs.humanBytes(ToolchainDistro.expectedSizeBytes)})") }
+            if (hasExistingFiles) {
+                OutlinedButton(
+                    onClick = onReverifyExisting,
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Verify files already on this device…") }
+                Text(
+                    "Toolchain files were found from an earlier install that never " +
+                        "finished verification — re-run the health checks on them " +
+                        "first; a pass skips the download entirely.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             OutlinedButton(
                 onClick = onImport,
                 modifier = Modifier.fillMaxWidth(),

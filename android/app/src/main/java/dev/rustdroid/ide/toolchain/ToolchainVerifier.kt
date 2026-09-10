@@ -183,11 +183,12 @@ class ToolchainVerifier(
             when {
                 !busybox.isFile -> "missing ${busybox.path} — the bundle is pre-busybox?"
                 !busybox.canExecute() -> "${busybox.path} not executable"
-                else -> when (val elf = elfStaticAarch64(busybox)) {
-                    null -> "not an ELF file (magic mismatch)"
-                    is String -> elf // diagnostic from the parser
-                    else -> null // static AArch64, no PT_INTERP
-                }
+                // elfStaticAarch64's contract: null = valid static AArch64
+                // with no PT_INTERP (check PASSES); a non-null String IS
+                // the failure detail. The earlier wrapper inverted this —
+                // it returned "not an ELF file (magic mismatch)" for every
+                // VALID busybox, so no install could ever pass this gate.
+                else -> elfStaticAarch64(busybox)
             }
         }
         runCheck("busybox-sh", "busybox sh -c 'echo ok' runs in the terminal env") {

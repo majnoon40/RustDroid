@@ -17,8 +17,8 @@ android {
         // F-Droid distribution only — not Play-eligible at this target.
         minSdk = 24
         targetSdk = 28
-        versionCode = 7
-        versionName = "0.1.6"
+        versionCode = 8
+        versionName = "0.1.7"
 
         // arm64-v8a only, everywhere (Phase 4 plan §4.1): the vendored
         // terminal modules build arm64-v8a only, and this filters the

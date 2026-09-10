@@ -1074,3 +1074,40 @@ implementation log (appended as terminal-layer tests land).
   upstream has none), `assembleDebug/Release` green; APK =
   `lib/arm64-v8a/` only, `assets/licenses/` embedded. CI: steps 1-4
   green (faf6efd = step 4, run 34464468685).
+
+## 11. On-device hotfix: busybox gate inverted verdict (2026-09-10, v0.1.7)
+
+First real on-device install of the manifest-v2 bundle: download,
+extraction, and every check up to the busybox gate passed, then
+"check 'busybox present, executable, static AArch64 ELF' failed: not an
+ELF file (magic mismatch)" — reported for a perfectly VALID static
+AArch64 busybox.
+
+- **Root cause (ToolchainVerifier §6.5 gate)**: the check wrapped
+  `elfStaticAarch64`'s result in a `when` that inverted its
+  null-means-valid contract — `null` (valid static AArch64, no
+  PT_INTERP) was mapped to the failure detail "not an ELF file (magic
+  mismatch)", and the parser's own non-ELF diagnostic (plain "not an
+  ELF file", no suffix) was the only other reachable branch. The
+  observed "(magic mismatch)" text itself proves the good-file branch
+  fired: no install could ever pass the gate. The 226-test suite
+  missed it because no test reached the busybox check's success path
+  (the cancellation test parks at the version probes; the
+  empty-prefix test fails earlier). Fixed by returning the parser's
+  result directly; three new regression pins (valid ELF passes;
+  non-ELF and PT_INTERP fail with the parser's own diagnostics)
+  exercise the gate through the public `verify()`. 229/0 (1 skip).
+- **Gate rescue path (GateScreen)**: a first install whose verification
+  fails leaves the extracted prefix on disk with no ready marker (the
+  rollback has nothing to restore, by design). The gate's NotInstalled
+  prompt now offers "Verify files already on this device…" when
+  `isInstalled()` holds — the foreground-service re-verify, no
+  re-download. Recovers exactly the stranded-prefix situation this
+  incident produced on the reporting device (its prefix verified
+  healthy through the cargo-version probes before the false failure).
+- **SHA-256 re-pin (ToolchainDistro)**: the documented step-5 follow-up,
+  now that the v2 release exists — hash taken from the release's
+  SHA256SUMS.txt (`20fd976c…` for rustdroid-app-bundle-aarch64.zip,
+  118,262,640 bytes). Downloads are integrity-pinned end to end.
+- versionCode 8 / versionName 0.1.7 so the fixed build is identifiable
+  on the device.

@@ -11,6 +11,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Rule
@@ -62,6 +63,32 @@ class ToolchainVerifierTest {
         ): String = ""
     }
 
+    /**
+     * Subprocess results for a HEALTHY install: version probes answer,
+     * busybox sh answers — enough for verify() to run to completion so
+     * the busybox gate itself can be asserted on. run() reports success
+     * without producing files (the smoke check fails; not under test).
+     */
+    private class VersionProbeRunner : CargoRunner() {
+        override suspend fun run(
+            command: List<String>,
+            cwd: File,
+            env: Map<String, String>,
+            onLine: (ConsoleLine) -> Unit,
+            stdin: StdinPipe?,
+        ): RunResult = RunResult(0, true, 0)
+
+        override suspend fun probe(
+            command: List<String>,
+            env: Map<String, String>,
+            timeoutSec: Long,
+        ): String = when (command.firstOrNull()?.substringAfterLast('/')) {
+            "rustc" -> "rustc 1.85.0 (test)"
+            "cargo" -> "cargo 1.85.0 (test)"
+            else -> "ok" // busybox sh -c 'echo ok'
+        }
+    }
+
     // ------------------------------------------------------------------
     // Layout helpers: a structurally valid prefix so verification reaches
     // the subprocess checks (where the hanging runner parks).
@@ -74,6 +101,32 @@ class ToolchainVerifierTest {
         h[5] = 1   // little-endian
         h[18] = 0xB7.toByte(); h[19] = 0 // EM_AARCH64
         return h
+    }
+
+    /**
+     * Minimal ELF64 aArch64 busybox stand-in: 64-byte ehdr + one 56-byte
+     * phdr per entry in [phdrTypes] (1 = PT_LOAD, 3 = PT_INTERP). This is
+     * everything [ToolchainVerifier]'s static-ELF parser reads — exactly
+     * the shape a REAL static busybox presents to it.
+     */
+    private fun staticAarch64Elf(phdrTypes: IntArray = intArrayOf(1)): ByteArray {
+        val e = ByteArray(64 + 56 * phdrTypes.size)
+        e[0] = 0x7F; e[1] = 'E'.code.toByte(); e[2] = 'L'.code.toByte(); e[3] = 'F'.code.toByte()
+        e[4] = 2  // ELFCLASS64
+        e[5] = 1  // little-endian
+        e[16] = 2 // e_type = ET_EXEC
+        e[18] = 0xB7.toByte() // e_machine = EM_AARCH64
+        e[32] = 64            // e_phoff = 64 (u64 LE)
+        e[54] = 56            // e_phentsize (u16 LE)
+        e[56] = phdrTypes.size.toByte() // e_phnum (u16 LE)
+        phdrTypes.forEachIndexed { i, type ->
+            val base = 64 + 56 * i
+            e[base] = (type and 0xFF).toByte()
+            e[base + 1] = ((type shr 8) and 0xFF).toByte()
+            e[base + 2] = ((type shr 16) and 0xFF).toByte()
+            e[base + 3] = ((type shr 24) and 0xFF).toByte()
+        }
+        return e
     }
 
     /** GNU-style ar member: 60-byte header + payload, even-padded. */
@@ -177,5 +230,64 @@ class ToolchainVerifierTest {
         // many checks must FAIL (bins missing, crt missing, ...) — loud,
         // structured, no exception
         assertTrue("expected several failing checks, got ${failed.size}", failed.size >= 5)
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 4 §6.5 busybox gate — regression pin for the inverted-
+    // when bug found on-device: a VALID static AArch64 ELF was reported
+    // as "not an ELF file (magic mismatch)" (the null-branch of a when
+    // that misread elfStaticAarch64's null-means-valid contract), so NO
+    // install could ever pass the gate.
+    // ------------------------------------------------------------------
+
+    private fun installBusybox(paths: ToolchainPaths, bytes: ByteArray) {
+        val f = File(paths.bin, "busybox")
+        f.writeBytes(bytes)
+        f.setExecutable(true)
+    }
+
+    private fun busyboxCheck(
+        paths: ToolchainPaths,
+        filesDir: File,
+    ): dev.rustdroid.ide.model.VerifyCheck = runBlocking {
+        val verifier = ToolchainVerifier(
+            paths, filesDir, VersionProbeRunner(), caAssetProvider = { pem },
+        )
+        verifier.verify().first { it.id == "busybox" }
+    }
+
+    @Test
+    fun `busybox gate passes for a valid static AArch64 ELF`() {
+        val (paths, filesDir) = fakePrefix()
+        installBusybox(paths, staticAarch64Elf())
+
+        val check = busyboxCheck(paths, filesDir)
+
+        assertTrue(
+            "expected busybox PASS, got ${check.status}: ${check.detail}",
+            check.status == CheckStatus.PASS,
+        )
+    }
+
+    @Test
+    fun `busybox gate fails with the parser diagnostic for a non-ELF file`() {
+        val (paths, filesDir) = fakePrefix()
+        installBusybox(paths, "definitely not an elf".toByteArray())
+
+        val check = busyboxCheck(paths, filesDir)
+
+        assertEquals(CheckStatus.FAIL, check.status)
+        assertEquals("not an ELF file", check.detail)
+    }
+
+    @Test
+    fun `busybox gate fails for a dynamic ELF with PT_INTERP`() {
+        val (paths, filesDir) = fakePrefix()
+        installBusybox(paths, staticAarch64Elf(intArrayOf(1, 3))) // + PT_INTERP
+
+        val check = busyboxCheck(paths, filesDir)
+
+        assertEquals(CheckStatus.FAIL, check.status)
+        assertEquals("PT_INTERP present — busybox is not static", check.detail)
     }
 }

@@ -27,14 +27,12 @@ object ToolchainDistro {
      * (also in the release's SHA256SUMS.txt + body table).
      * Empty string disables pinning (dev builds only).
      *
-     * NOTE (Phase 4 step 5): the busybox-carrying bundle is published by
-     * the extended publish workflow; until that release exists this pin
-     * intentionally blocks downloads of the OLD bundle (whose layout
-     * this app version can no longer accept — busybox is required).
-     * Re-pin here when publish-release.yml runs with the busybox
-     * artifact. (Dev builds: set to "" to skip pinning.)
+     * Phase 4 step 5 follow-up (2026-09-10): the busybox-carrying v2
+     * bundle is published at the tag above; hash taken from the release's
+     * SHA256SUMS.txt (asset rustdroid-app-bundle-aarch64.zip) — downloads
+     * are now integrity-pinned end to end.
      */
-    const val SHA256 = ""
+    const val SHA256 = "20fd976ccce2f69ef3920e5ed19f5dc425eba25bc62cb8eece1d0002ad0144cd"
 
     val expectedSizeBytes: Long = 118_500_000L // approximate; display only
 
