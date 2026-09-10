@@ -11,6 +11,7 @@ The companion plan for the Phase 4 additions is
 | Component | License | Origin / pin | Where |
 |---|---|---|---|
 | sora-editor `editor` + `language-textmate` | LGPL-2.1 | Maven `io.github.Rosemoe.sora-editor:0.23.6` (dynamically linked AAR) | code editor |
+| Termux `terminal-emulator` + `terminal-view` (vendored source, Apache-2.0 — see the vendored-source section below) | Apache-2.0 | `android/terminal-{emulator,view}` vendored @ `3b66f8799635a4dba4a206563048ff0e6792c487` | terminal emulation + view |
 | VS Code Rust TextMate grammar + themes | MIT | `assets/textmate/rust.tmLanguage.json` etc. (vendored from the vscode-rust grammar) | editor highlighting |
 | Kotlin / Compose / AndroidX / kotlinx-coroutines / kotlinx-serialization | Apache-2.0 | Google Maven + Maven Central (see `android/gradle/libs.versions.toml`) | runtime |
 | OkHttp | Apache-2.0 | Maven 4.12.0 | networking |
@@ -33,15 +34,32 @@ Test-only (not shipped): JUnit 4 (EPL-2.0).
 
 | Component | License | Upstream pin | Divergences |
 |---|---|---|---|
-| **Phase 4 (planned, not yet vendored):** `terminal-emulator` | Apache-2.0 | termux/termux-app commit `3b66f8799635a4dba4a206563048ff0e6792c487` (origin: jackpal/Android-Terminal-Emulator) | build script replaced; JNI library renamed `libtermux` → `librustdroidpty`; `termux.c` patch set (3 defect fixes + async-signal-safe fork window + `sendSignalToProcessGroup`); enumerated file-by-file here at vendoring time |
-| **Phase 4 (planned, not yet vendored):** `terminal-view` | Apache-2.0 (incl. AOSP-derived `support/PopupWindowCompatGingerbread.java`, header preserved) | same commit | build script replaced |
+| `terminal-emulator` | Apache-2.0 | termux/termux-app commit `3b66f8799635a4dba4a206563048ff0e6792c487` (origin: jackpal/Android-Terminal-Emulator) | see the file-by-file record below |
+| `terminal-view` | Apache-2.0 (incl. AOSP-derived `support/PopupWindowCompatGingerbread.java`, header preserved) | same commit | see the file-by-file record below |
+
+### File-by-file divergence record (vendored 2026-09-10, implementation step 1)
+
+Vendored trees live at `android/terminal-emulator/` and
+`android/terminal-view/`; the source trees are **copied verbatim** from
+the pin (verified: `diff -r` against the checked-out pin is empty). At
+step 1 (this record) the only divergences are build-script-level:
+
+| File | Upstream @ 3b66f87 | Vendored | Divergence |
+|---|---|---|---|
+| `terminal-emulator/build.gradle` (Groovy) | present | **replaced** by `build.gradle.kts` (ours) | `testOptions.unitTests.isReturnDefaultValues = true`, cFlags, and dependency set carried verbatim (review P1-5); `compileOptions` 1.8→17; `compileSdk` 36→35, `minSdk` 21→24, `ndkVersion` → r27c (27.2.12479018); `abiFilters` stripped to `arm64-v8a` only; maven-publish + `sourceJar` dropped; `targetSdk` 28 kept (upstream's own value) |
+| `terminal-emulator/proguard-rules.pro` | comment-only boilerplate | vendored as-is | none |
+| `terminal-emulator/src/**` (14 Java main, 19 test files, `jni/termux.c`, `jni/Android.mk`) | — | vendored as-is | **none** — no source patches at step 1; the JNI library rename (`libtermux`→`librustdroidpty` in `Android.mk` + `JNI.java` `loadLibrary`), the `termux.c` defect-fix patch set, and `sendSignalToProcessGroup` land in step 2 and will be recorded here then |
+| `terminal-view/build.gradle` (Groovy) | present | **replaced** by `build.gradle.kts` (ours) | deps carried (`androidx.annotation`, `api :terminal-emulator`, JUnit); `unitTests.isReturnDefaultValues` added for symmetry (§4.6); `compileOptions` 1.8→17; `compileSdk` 36→35, `minSdk` 21→24, `ndkVersion` → r27c; `testInstrumentationRunner` (ancient `android.support.test` boilerplate, no instrumented tests exist) and maven-publish blocks dropped |
+| `terminal-view/proguard-rules.pro` | comment-only boilerplate | vendored as-is | none |
+| `terminal-view/src/**` (Java + res) | — | vendored as-is | none |
+
+License texts: `LICENSES/terminal-{emulator,view}-Apache-2.0.txt`.
 
 No NOTICE files exist upstream in either Termux module (verified at the
-pinned commit `3b66f87` — recursive `find` over both module trees, this
-session's post-review re-verification); Apache-2.0 §4(d) therefore
-imposes nothing beyond license-text preservation, which
-`LICENSES/terminal-{emulator,view}-Apache-2.0.txt` will carry (added at
-vendoring time).
+pinned commit `3b66f87` — recursive `find` over both module trees, and
+re-verified `git ls-tree -r` at vendoring time); Apache-2.0 §4(d)
+therefore imposes nothing beyond license-text preservation, which the
+`LICENSES/` files carry.
 
 ## Explicitly NOT used
 

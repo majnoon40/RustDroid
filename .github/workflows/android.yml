@@ -11,6 +11,11 @@ on:
     branches: [main]
     paths:
       - 'android/**'
+      # Phase 4 (plan §9): the vendored modules trigger CI explicitly —
+      # android/** already subsumes both; kept visible for the Phase 4
+      # trigger surface.
+      - 'android/terminal-emulator/**'
+      - 'android/terminal-view/**'
       - '.github/workflows/android.yml'
   workflow_dispatch:
 
@@ -48,13 +53,21 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('android/gradle/libs.versions.toml', 'android/app/build.gradle.kts', 'android/build.gradle.kts') }}
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/gradle/libs.versions.toml', 'android/app/build.gradle.kts', 'android/build.gradle.kts', 'android/terminal-emulator/build.gradle.kts', 'android/terminal-view/build.gradle.kts') }}
           restore-keys: gradle-${{ runner.os }}-
 
-      - name: JVM unit tests
+      - name: App JVM unit tests
         run: |
           chmod +x gradlew
           ./gradlew :app:testDebugUnitTest --console=plain
+
+      # Phase 4 step-1 gate (plan §12.2): the vendored upstream suite
+      # (19 files: 18 test classes + TerminalTestCase base) must be green
+      # BEFORE any source patch lands. Needs the
+      # unitTests.isReturnDefaultValues flag carried in our build scripts
+      # (review P1-5).
+      - name: Vendored terminal-emulator unit tests
+        run: ./gradlew :terminal-emulator:testDebugUnitTest --console=plain
 
       - name: Assemble debug APK
         run: ./gradlew :app:assembleDebug --console=plain

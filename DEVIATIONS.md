@@ -732,3 +732,63 @@ README known-limits at implementation time.
 The "193 JVM tests, 0 failures" count in §9 is re-verified at each
 implementation step; the running count lives in this section's
 implementation log (appended as terminal-layer tests land).
+
+### Implementation log (§12.2 order, each step lands green)
+
+**Step 1 — vendoring (2026-09-10)**:
+
+- `terminal-emulator` + `terminal-view` vendored at pin
+  `3b66f8799635a4dba4a206563048ff0e6792c487` (sparse-checkout
+  blob-partial clone; `diff -r` of both src trees against the pin:
+  empty — verbatim). **No source patches at this step.**
+- Pin claims re-verified at vendoring time (third independent check,
+  matching plan §2 and review-response §1): no `NOTICE*` file anywhere
+  in the tree (`git ls-tree -r`); `rg "termux\.shared|TermuxConstants"`
+  over both modules → zero matches; 19 test files (18 classes +
+  `TerminalTestCase`); `unitTests.returnDefaultValues = true` in
+  upstream `terminal-emulator/build.gradle`; deps exactly
+  `androidx.annotation:annotation:1.9.0` + `junit:junit:4.13.2`;
+  `termux.c` last touched upstream by `438cd73` (author 2022-11-16,
+  committer 2024-09-26).
+- New build scripts (ours): Kotlin DSL, `com.android.library`;
+  `unitTests.isReturnDefaultValues = true` in BOTH modules (P1-5);
+  Java 17 `compileOptions`; `compileSdk 35` / `minSdk 24` / `ndkVersion
+  27.2.12479018` (r27c); `abiFilters` arm64-v8a only; upstream cFlags
+  carried verbatim (incl. `-Werror`, with the documented in-build-script
+  fallback if r27c's clang warns); maven-publish dropped. Full
+  file-by-file divergence record: THIRD_PARTY.md.
+- `settings.gradle.kts` includes `:terminal-emulator` / `:terminal-view`;
+  app gains `implementation(project(…))` on both (terminal-view also
+  `api`s terminal-emulator upstream-style); Gradle cache key extended
+  to the new build scripts.
+- App `proguard-rules.pro`: JNI keep rules for
+  `com.termux.terminal.JNI` (P3-11 — inert while `isMinifyEnabled =
+  false`, present so a future minify flip cannot ship a broken
+  release).
+- CI (`android.yml`): vendored-module path triggers; explicit
+  `:terminal-emulator:testDebugUnitTest` step — the step-1 gate
+  (upstream suite green before any patch lands).
+- App-level `ndk { abiFilters += "arm64-v8a" }` added (beyond the
+  module-level filters): without it the APK still packaged 3 extra ABIs
+  of `androidx.graphics.path.so` (Compose AAR) — "arm64-v8a only,
+  everywhere" per the plan; graphics.path degrades to its Java fallback
+  on non-arm64 hosts. `terminal-view`'s build script carries the filter
+  too (inert — no native code there — but symmetric and future-proof,
+  plan §4.1).
+- Local verification (JDK 17 Temurin, AGP 8.7.3, NDK r27c
+  auto-installed by AGP): `:terminal-emulator:testDebugUnitTest`
+  **145 tests, 0 failures**; `:app:testDebugUnitTest` **193 tests,
+  0 failures** (1 skipped — the pre-existing opt-in bundle test);
+  `:app:assembleDebug` + `:app:assembleRelease` green; both APKs
+  contain exactly `lib/arm64-v8a/{libtermux.so,
+  androidx.graphics.path.so}` — one ABI, both vendored modules
+  packaged. `termux.c` compiles under the verbatim upstream cFlags
+  (incl. `-Werror`) with r27c clang — no fallback needed.
+- `LICENSES/terminal-{emulator,view}-Apache-2.0.txt` added (canonical
+  text, provenance headers; upstream namespaces `com.termux.emulator` /
+  `com.termux.view` preserved; Java packages `com.termux.terminal` /
+  `com.termux.view` untouched — attribution-preserving vendoring).
+- Still **upstream-verbatim in v0 at this step**: `Android.mk`
+  `LOCAL_MODULE libtermux` and `JNI.java`
+  `System.loadLibrary("termux")` — the `librustdroidpty` rename is
+  step 2, by plan §12.2 ordering.

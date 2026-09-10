@@ -19,6 +19,15 @@ android {
         targetSdk = 28
         versionCode = 7
         versionName = "0.1.6"
+
+        // arm64-v8a only, everywhere (Phase 4 plan §4.1): the vendored
+        // terminal modules build arm64-v8a only, and this filters the
+        // packaged AAR-native libs (e.g. androidx.graphics.path, which
+        // degrades gracefully to its Java fallback when its .so is absent)
+        // so the APK ships exactly one ABI.
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
     }
 
     buildTypes {
@@ -100,6 +109,13 @@ dependencies {
 
     // Cargo.toml parsing
     implementation(libs.tomlj)
+
+    // Phase 4 terminal: vendored Termux modules (Apache-2.0, @ 3b66f87 —
+    // see THIRD_PARTY.md). terminal-view exposes terminal-emulator via api,
+    // but we depend on both explicitly since the app uses the emulator
+    // session classes directly as well as the view.
+    implementation(project(":terminal-emulator"))
+    implementation(project(":terminal-view"))
 
     // Unit tests (pure JVM)
     testImplementation(libs.junit)

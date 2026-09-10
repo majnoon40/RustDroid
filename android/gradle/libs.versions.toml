@@ -14,6 +14,7 @@ commons-compress = "1.27.1"
 xz = "1.10"
 tomlj = "1.1.1"
 junit = "4.13.2"
+androidx-annotation = "1.9.0"
 
 [libraries]
 androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activity-compose" }
@@ -42,9 +43,11 @@ xz = { module = "org.tukaani:xz", version.ref = "xz" }
 tomlj = { module = "org.tomlj:tomlj", version.ref = "tomlj" }
 
 junit = { module = "junit:junit", version.ref = "junit" }
+androidx-annotation = { module = "androidx.annotation:annotation", version.ref = "androidx-annotation" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
+android-library = { id = "com.android.library", version.ref = "agp" }
 kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
 kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
