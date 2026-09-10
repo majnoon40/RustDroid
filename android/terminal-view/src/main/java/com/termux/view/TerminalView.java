@@ -986,6 +986,25 @@ public final class TerminalView extends View {
         int viewHeight = getHeight();
         if (viewWidth == 0 || viewHeight == 0 || mTermSession == null) return;
 
+        // RUSTDROID DEVIATION (v0.1.9, vs upstream 3b66f87): upstream expects
+        // the hosting activity to call setTextSize() before attachSession() —
+        // setTextSize() is the only place a TerminalRenderer is created. A host
+        // that attaches a session without configuring the view first crashed
+        // here with "Attempt to read from field 'float
+        // com.termux.view.TerminalRenderer.mFontWidth' on a null object
+        // reference" (TerminalView.java:990). Recover by creating the renderer
+        // with a 14dp default instead of crashing; the loud log below means a
+        // host call site is still missing the setTextSize() contract (logged
+        // via android.util.Log because mClient is not guaranteed to be set in
+        // exactly the failure mode this guard protects against).
+        if (mRenderer == null) {
+            int defaultTextSizePx = (int) (getResources().getDisplayMetrics().density * 14);
+            android.util.Log.w(LOG_TAG, "updateSize() called before setTextSize(); " +
+                "creating renderer with default text size " + defaultTextSizePx + "px");
+            setTextSize(defaultTextSizePx);
+            if (mRenderer == null) return;
+        }
+
         // Set to 80 and 24 if you want to enable vttest.
         int newColumns = Math.max(4, (int) (viewWidth / mRenderer.mFontWidth));
         int newRows = Math.max(4, (viewHeight - mRenderer.mFontLineSpacingAndAscent) / mRenderer.mFontLineSpacing);

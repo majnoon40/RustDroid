@@ -196,6 +196,19 @@ private fun TerminalPane(
             // LaunchedEffect fires); a null client there is an NPE that
             // killed the app the instant a session opened.
             setTerminalViewClient(RdViewClient(this, ctrlState))
+            // v0.1.9 hardening: create the renderer HERE, at creation — the
+            // second half of the same upstream host contract. setTextSize()
+            // is the ONLY place a TerminalRenderer is ever created
+            // (TerminalView.java:515), and attachSession() -> updateSize()
+            // reads mRenderer.mFontWidth at :990 the moment a session is
+            // attached. By then the view is already measured (the create
+            // pipeline resolves ~70ms later than the first frame), so the
+            // zero-size guard at :987 does not apply — the v0.1.8 flight
+            // recorder caught exactly this NPE at the terminal:view-attach
+            // crumb. NOTE: the value is PIXELS despite the upstream javadoc
+            // claiming dp (TerminalRenderer hands it straight to
+            // Paint.setTextSize()); 14dp matches the code editor's default.
+            setTextSize((TERMINAL_FONT_SIZE_DP * context.resources.displayMetrics.density).toInt())
         }
     }
 
@@ -355,6 +368,14 @@ private fun EmptyState(
 }
 
 private const val PREFIX_LITERAL = "\$PREFIX"
+
+/**
+ * Terminal font size in dp (14, matching the code editor's default —
+ * CodeEditorPane's editor.setTextSize(14f)). Converted to px at the view
+ * creation site: the vendored renderer expects px (Paint.setTextSize),
+ * despite upstream's javadoc claiming dp.
+ */
+private const val TERMINAL_FONT_SIZE_DP = 14
 
 /**
  * The minimal v0 extra-keys row (plan §11.4): Esc, Tab, Ctrl (toggle),

@@ -1162,3 +1162,83 @@ TerminalSession/TerminalView/termux.c):
   with $PREFIX/bin; CARGO_HOME/CA channels unchanged, all absolute).
   HOME remains $RUSTDROID_HOME via env. TerminalScreen's empty state
   now says exactly this.
+
+## 13. Terminal view-attach NPE — the renderer half of the host contract (2026-09-10, v0.1.9)
+
+The v0.1.8 flight recorder earned its keep on the very next session
+open: the persisted crash (files/last-crash.txt, pasted back by the
+user) is an NPE with a complete breadcrumb chain —
+
+    terminal:create:start → env-built → session-built → fgs-started
+    → view-attach  ← crash, 71ms after create:start
+
+    NullPointerException: Attempt to read from field 'float
+    com.termux.view.TerminalRenderer.mFontWidth' on a null object reference
+      at TerminalView.updateSize(TerminalView.java:990)
+      at TerminalView.attachSession(TerminalView.java:298)
+      at TerminalScreenKt$TerminalPane$2$1.invokeSuspend(TerminalScreen.kt:214)
+
+Root cause (verified against the vendored tree, which matches upstream
+3b66f87 line-for-line in this region — the crash line :990 IS upstream's
+`mRenderer.mFontWidth` line): v0.1.8 fixed ONE half of an undocumented
+upstream host contract (set the view client before attach, because
+updateSize() calls mClient.onEmulatorSet() at :996). The OTHER half:
+`setTextSize()` is the ONLY place a TerminalRenderer is ever created
+(TerminalView.java:515; the constructor creates none, setTypeface only
+replaces an existing one). TerminalPane never called it. The zero-size
+guard at :987 could not save us: the create pipeline resolves ~70ms
+after the first frame, so the view was already measured when
+attachSession ran — width/height non-zero, mTermSession just assigned,
+mRenderer never created → :990 dereferences null. Deterministic, not a
+race: every session open on every device.
+
+Two follow-on facts from the same audit, both handled:
+
+- **Unit trap**: upstream's javadoc on setTextSize claims
+  "density-independent pixels", but TerminalRenderer hands the value
+  straight to Paint.setTextSize() — PIXELS. The host must convert.
+- **The hazard chain continues past :990**: with a null renderer,
+  onDraw() at :1019 (mRenderer.render, guarded only on mEmulator) would
+  be the NEXT NPE after the first resize — attach-without-setTextSize
+  is unconditionally fatal in stock upstream code. Upstream never sees
+  this because Termux's own activity always configures the view before
+  attaching.
+
+Fix (both halves, same commit):
+
+- **TerminalScreen (host contract, root cause)** — `setTextSize()` now
+  called at view creation in the `remember` block, immediately after
+  the v0.1.8 `setTerminalViewClient()`. 14dp × density → px (14 matches
+  the code editor's `editor.setTextSize(14f)`; constant
+  `TERMINAL_FONT_SIZE_DP`, documented with the px-not-dp trap). Safe
+  pre-attach: setTextSize → updateSize early-returns while
+  mTermSession == null; the real resize then happens inside
+  attachSession as upstream intends.
+- **Vendored TerminalView (defense-in-depth, recorded in
+  THIRD_PARTY.md)** — `updateSize()` now guards `mRenderer == null`:
+  auto-creates the renderer at a 14dp px-converted default and logs a
+  loud `android.util.Log.w` (mClient logging is unusable here — an
+  unset client is part of the failure class being guarded). The log is
+  a tripwire, not noise: if it ever appears, some host call site is
+  still missing setTextSize() and the terminal is running on the
+  fallback font. setTextSize() itself calls updateSize(), so the guard
+  recurses exactly one level and terminates.
+
+Verification honesty: no build/test environment here (no Android SDK —
+same constraint as v0.1.8), so verification was static: the vendored
+file was diffed line-for-line against pristine upstream 3b66f87 in the
+crash region; the renderer-creation invariant (only :515/:520 assign
+mRenderer) was re-checked against the pin; and the Kotlin edit compiles
+by inspection against the existing imports (no new imports needed).
+No host-side regression test exists for this defect class, deliberately:
+reaching :990 requires an attached session (a real TerminalSession
+forks via JNI — untestable on the JVM), and under
+`returnDefaultValues` both View.layout and Paint.measureText are
+no-ops, so even the guard's fallback metrics would all read zero.
+Robolectric + a session seam would be the honest host test — recorded
+as a follow-up, not smuggled in unverifiable. On-device checklist for
+the next open: (1) session opens, prompt renders at 14dp; (2) logcat
+contains NO "updateSize() called before setTextSize()" warning;
+(3) rotate/split → `stty size` follows (SIGWINCH through updateSize);
+(4) crumbs now reach terminal:view-attached; (5) 200 open/close cycles
+→ no renderer regression, no fd growth.

@@ -56,7 +56,8 @@ step 1 (this record) the only divergences are build-script-level:
 | `terminal-emulator/src/**` otherwise (14 Java main, 19 test files) | — | vendored as-is; ONE added test class `Utf8SplitAcrossReadsTest.java` (RustDroid addition, plan §6.3) | the 19 upstream test files untouched; our split-across-reads test joins the suite |
 | `terminal-view/build.gradle` (Groovy) | present | **replaced** by `build.gradle.kts` (ours) | deps carried (`androidx.annotation`, `api :terminal-emulator`, JUnit); `unitTests.isReturnDefaultValues` added for symmetry (§4.6); `compileOptions` 1.8→17; `compileSdk` 36→35, `minSdk` 21→24, `ndkVersion` → r27c; `testInstrumentationRunner` (ancient `android.support.test` boilerplate, no instrumented tests exist) and maven-publish blocks dropped |
 | `terminal-view/proguard-rules.pro` | comment-only boilerplate | vendored as-is | none |
-| `terminal-view/src/**` (Java + res) | — | vendored as-is | none |
+| `terminal-view/src/main/java/com/termux/view/TerminalView.java` | — | `updateSize()` null-renderer guard added (v0.1.9) | upstream assumes the host calls `setTextSize()` before `attachSession()` (it is the only place a `TerminalRenderer` is created); a host violating that crashed with an NPE at `:990` (`mRenderer.mFontWidth` on a null reference). The guard auto-creates the renderer at a 14dp px-converted default and logs via `android.util.Log` — `mClient` logging is not usable here because an unset client is part of the failure class being guarded. Host-side contract now honored in `TerminalScreen.kt` (client + text size set at view creation); the guard is defense-in-depth, and its warning in logcat means a host call site is still missing, not benign. |
+| `terminal-view/src/**` otherwise (Java + res) | — | vendored as-is | none |
 
 License texts: `LICENSES/terminal-{emulator,view}-Apache-2.0.txt`.
 
