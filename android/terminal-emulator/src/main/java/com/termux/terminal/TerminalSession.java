@@ -61,9 +61,16 @@ public final class TerminalSession extends TerminalOutput {
 
     /**
      * The file descriptor referencing the master half of a pseudo-terminal pair, resulting from calling
-     * {@link JNI#createSubprocess(String, String, String[], String[], int[], int, int, int, int)}.
+     * {@link JNI#createSubprocess(String, String, String[], String[], int[], int[], int, int, int, int)}.
      */
     private int mTerminalFileDescriptor;
+
+    /**
+     * The pts slave's device number (fstat st_rdev, computed in the parent at PTY creation). RustDroid
+     * addition (plan §5.2): consumed by the session controller's union discovery — /proc stat field 7
+     * (tty_nr) carries this number even after setsid while the tty is still held. 0 if not started.
+     */
+    private int mPtsDevice;
 
     /** Set by the application for user identification of session, not by terminal. */
     public String mSessionName;
@@ -124,8 +131,10 @@ public final class TerminalSession extends TerminalOutput {
         mEmulator = new TerminalEmulator(this, columns, rows, cellWidthPixels, cellHeightPixels, mTranscriptRows, mClient);
 
         int[] processId = new int[1];
-        mTerminalFileDescriptor = JNI.createSubprocess(mShellPath, mCwd, mArgs, mEnv, processId, rows, columns, cellWidthPixels, cellHeightPixels);
+        int[] ptsDevice = new int[1];
+        mTerminalFileDescriptor = JNI.createSubprocess(mShellPath, mCwd, mArgs, mEnv, processId, ptsDevice, rows, columns, cellWidthPixels, cellHeightPixels);
         mShellPid = processId[0];
+        mPtsDevice = ptsDevice[0];
         mClient.setTerminalShellPid(this, mShellPid);
 
         final FileDescriptor terminalFileDescriptorWrapped = wrapFileDescriptor(mTerminalFileDescriptor, mClient);
@@ -291,6 +300,11 @@ public final class TerminalSession extends TerminalOutput {
 
     public int getPid() {
         return mShellPid;
+    }
+
+    /** The pts slave's device number for the controller's union discovery (RustDroid addition, plan §5.2). */
+    public int getPtsDevice() {
+        return mPtsDevice;
     }
 
     /** Returns the shell's working directory or null if it was unavailable. */

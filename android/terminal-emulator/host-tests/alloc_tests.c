@@ -30,8 +30,8 @@
 
 JNIEXPORT jint JNICALL Java_com_termux_terminal_JNI_createSubprocess(
         JNIEnv* env, jclass clazz, jstring cmd, jstring cwd, jobjectArray args,
-        jobjectArray envVars, jintArray processIdArray, jint rows, jint columns,
-        jint cell_width, jint cell_height);
+        jobjectArray envVars, jintArray processIdArray, jintArray ptsDeviceArray,
+        jint rows, jint columns, jint cell_width, jint cell_height);
 
 static JNIEnv* mock_env(void)
 {
@@ -59,7 +59,7 @@ int main(void)
 
     JNIEnv* env_ptr = mock_env();
     jint ptm = Java_com_termux_terminal_JNI_createSubprocess(
-        env_ptr, NULL, c.cmd, c.cwd, c.args, c.envVars, c.pidArray,
+        env_ptr, NULL, c.cmd, c.cwd, c.args, c.envVars, c.pidArray, c.ptsArray,
         24, 80, 10, 20);
 
     /* Parent's copy of the write end can go now; the child holds its own. */

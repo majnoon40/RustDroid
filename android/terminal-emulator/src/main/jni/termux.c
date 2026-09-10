@@ -175,15 +175,30 @@ static void rd_child_exec(int ptm,
 
 /* Scan /proc/self/fd in the PARENT (opendir/readdir are fine here; in
  * the forked child they would allocate against a dead allocator).
- * Returns a RD_MALLOC'd int array (caller frees) of fds to close in the
- * child, excluding 0/1/2, the scan's own directory fd, and ptm.
- * On opendir failure or allocation failure returns NULL with *count = 0
- * (tolerated, matching upstream's opendir tolerance). */
-static int* scan_fds_to_close(size_t* count, int ptm)
+ * Returns a RD_MALLOC'd int array (caller frees in the parent) of fds
+ * for the child to close, excluding 0/1/2, the scan's own directory
+ * fd, and ptm. [always_close] is GUARANTEED to be in the returned
+ * list (appended if the scan missed it — it is the pts probe fd, and
+ * a child that kept it would never deliver EIO-on-exit to the
+ * session reader). On opendir failure returns a list containing just
+ * [always_close] (tolerated, matching upstream's opendir tolerance);
+ * on allocation failure returns NULL with *count = 0 — callers must
+ * then fail the session loudly (a child without the fd discipline is
+ * a broken session, not a degraded one).
+ * Residual: regular fds beyond the 256-entry scan window are dropped
+ * (documented in plan §4.4 — no worse than the pre-scan residual).
+ */
+static int* scan_fds_to_close(size_t* count, int ptm, int always_close)
 {
     *count = 0;
     DIR* self_dir = opendir("/proc/self/fd");
-    if (self_dir == NULL) return NULL;
+    if (self_dir == NULL) {
+        int* only = (int*) RD_MALLOC(sizeof(int));
+        if (only == NULL) return NULL;
+        only[0] = always_close;
+        *count = 1;
+        return only;
+    }
 
     int self_dir_fd = dirfd(self_dir);
     struct dirent* entry;
@@ -191,17 +206,18 @@ static int* scan_fds_to_close(size_t* count, int ptm)
     size_t n = 0;
     while ((entry = readdir(self_dir)) != NULL) {
         int fd = atoi(entry->d_name);
-        if (fd > 2 && fd != self_dir_fd && fd != ptm && n < 256) {
+        if (fd > 2 && fd != self_dir_fd && fd != ptm && fd != always_close && n < 256) {
             list[n++] = fd;
         }
     }
     closedir(self_dir);
 
-    if (n == 0) return NULL;
-    int* result = (int*) RD_MALLOC(n * sizeof(int));
+    size_t total = n + 1; /* + always_close, appended below */
+    int* result = (int*) RD_MALLOC(total * sizeof(int));
     if (result == NULL) return NULL;
     memcpy(result, list, n * sizeof(int));
-    *count = n;
+    result[n] = always_close;
+    *count = total;
     return result;
 }
 
@@ -243,6 +259,7 @@ static int create_subprocess(JNIEnv* env,
         char* const argv[],
         char* const envp[],
         int* pProcessId,
+        int* pPtsDevice,
         jint rows,
         jint columns,
         jint cell_width,
@@ -258,6 +275,32 @@ static int create_subprocess(JNIEnv* env,
         return throw_runtime_exception(env, "Cannot grantpt()/unlockpt()/ptsname_r() on /dev/ptmx");
     }
 
+    /* Compute the pts device number in the PARENT (plan §5.2): fstat
+     * the slave and take st_rdev, so the session controller can
+     * union-discover by tty_nr (/proc/<pid>/stat field 7 keeps the
+     * controlling-terminal device number even after setsid while the
+     * tty is still held). The probe is opened O_NOCTTY — the parent is
+     * not a session leader, so no controlling-terminal acquisition is
+     * possible anyway — and held open ACROSS the fork (closing it
+     * before the child opens its own slave would put the master into
+     * the latched EIO state and lose output: the slave fd count must
+     * never hit zero in that window). The parent closes its copy
+     * right after fork; the child closes the inherited copy via the
+     * pre-scanned close-list — which is why the probe is guaranteed a
+     * slot in that list — after opening its own slave. */
+    int pts_probe = open(devname, O_RDONLY | O_NOCTTY);
+    if (pts_probe < 0) {
+        close(ptm);
+        return throw_runtime_exception(env, "Cannot open the pts slave for fstat");
+    }
+    struct stat pts_stat;
+    if (fstat(pts_probe, &pts_stat) != 0) {
+        close(pts_probe);
+        close(ptm);
+        return throw_runtime_exception(env, "Cannot fstat the pts slave");
+    }
+    *pPtsDevice = (int) pts_stat.st_rdev;
+
     // Enable UTF-8 mode and disable flow control to prevent Ctrl+S from locking up the display.
     struct termios tios;
     tcgetattr(ptm, &tios);
@@ -269,20 +312,34 @@ static int create_subprocess(JNIEnv* env,
     struct winsize sz = { .ws_row = (unsigned short) rows, .ws_col = (unsigned short) columns, .ws_xpixel = (unsigned short) (columns * cell_width), .ws_ypixel = (unsigned short) (rows * cell_height)};
     ioctl(ptm, TIOCSWINSZ, &sz);
 
-    /* Pre-fork (parent): scan the fds to close in the child. */
+    /* Pre-fork (parent): scan the fds to close in the child (the pts
+     * probe is guaranteed a slot — see its comment). */
     size_t close_count = 0;
-    int* close_list = scan_fds_to_close(&close_count, ptm);
+    int* close_list = scan_fds_to_close(&close_count, ptm, pts_probe);
+    if (close_list == NULL) {
+        /* Allocation failure is NOT tolerated here: without the list,
+         * the child would leak the probe (breaking EIO-on-exit session
+         * semantics) and every other parent fd into the exec'd shell. */
+        close(pts_probe);
+        close(ptm);
+        return throw_runtime_exception(env, "Cannot allocate the child fd close-list");
+    }
 
     pid_t pid = RD_FORK();
     if (pid < 0) {
         free(close_list);
+        close(pts_probe); /* parent's copy; fork failed, no child holds one */
         close(ptm); /* RustDroid fix: fd leak on the fork-failure path */
         return throw_runtime_exception(env, "Fork failed");
     } else if (pid > 0) {
         free(close_list);
+        close(pts_probe); /* the child holds its own inherited copy until its close-list runs */
         *pProcessId = (int) pid;
         return ptm;
     } else {
+        /* The child keeps the inherited probe fd open until its own
+         * slave open (inside rd_child_exec) precedes the close-list
+         * loop — the slave count never reaches zero in the window. */
         rd_child_exec(ptm, devname, cwd, argv, envp, cmd, close_list, close_count);
         /* never returns */
         _exit(127);
@@ -297,6 +354,7 @@ JNIEXPORT jint JNICALL Java_com_termux_terminal_JNI_createSubprocess(
         jobjectArray args,
         jobjectArray envVars,
         jintArray processIdArray,
+        jintArray ptsDeviceArray,
         jint rows,
         jint columns,
         jint cell_width,
@@ -309,6 +367,7 @@ JNIEXPORT jint JNICALL Java_com_termux_terminal_JNI_createSubprocess(
     char const* cmd_cwd = NULL;
     int ptm = -1;
     int procId = 0;
+    int ptsDevice = 0;
 
     jsize size = args ? (*env)->GetArrayLength(env, args) : 0;
     if (size > 0) {
@@ -356,7 +415,7 @@ JNIEXPORT jint JNICALL Java_com_termux_terminal_JNI_createSubprocess(
         goto cleanup;
     }
 
-    ptm = create_subprocess(env, resolved_cmd, cmd_cwd, argv, envp, &procId, rows, columns, cell_width, cell_height);
+    ptm = create_subprocess(env, resolved_cmd, cmd_cwd, argv, envp, &procId, &ptsDevice, rows, columns, cell_width, cell_height);
     if (ptm < 0) goto cleanup; /* create_subprocess already threw and cleaned up its own fds */
 
     int* pProcId = (int*) (*env)->GetPrimitiveArrayCritical(env, processIdArray, NULL);
@@ -369,6 +428,19 @@ JNIEXPORT jint JNICALL Java_com_termux_terminal_JNI_createSubprocess(
 
     *pProcId = procId;
     (*env)->ReleasePrimitiveArrayCritical(env, processIdArray, pProcId, 0);
+
+    /* The pts device number (st_rdev of the slave, plan §5.2), written
+     * in a SEPARATE critical section — two simultaneous critical
+     * sections are not supported by the JNI contract. */
+    int* pPtsDev = (int*) (*env)->GetPrimitiveArrayCritical(env, ptsDeviceArray, NULL);
+    if (!pPtsDev) {
+        close(ptm); /* same fd-leak discipline as the processId critical failure */
+        ptm = -1;
+        throw_runtime_exception(env, "JNI call GetPrimitiveArrayCritical(ptsDeviceArray) failed");
+        goto cleanup;
+    }
+    *pPtsDev = ptsDevice;
+    (*env)->ReleasePrimitiveArrayCritical(env, ptsDeviceArray, pPtsDev, 0);
 
 cleanup:
     /* RustDroid fix (defects 1 and 3): ONE exit — every marshalling

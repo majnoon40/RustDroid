@@ -80,7 +80,8 @@ static void mock_ReleaseStringUTFChars(JNIEnv* env, jstring str, const char* cha
 static jint* mock_GetPrimitiveArrayCritical(JNIEnv* env, jintArray array, jboolean* isCopy)
 {
     (void) env;
-    if (mock.fail_critical) return NULL;
+    mock.critical_calls++;
+    if (mock.fail_critical_at == mock.critical_calls) return NULL;
     if (!array) return NULL;
     if (isCopy) *isCopy = (jboolean) 0;
     return array->data;
@@ -163,7 +164,8 @@ void mock_reset(void)
     }
     mock.pin_count = 0;
     mock.fail_string_get_at = 0;
-    mock.fail_critical = 0;
+    mock.fail_critical_at = 0;
+    mock.critical_calls = 0;
     mock.threw = 0;
     mock.pair_violations = 0;
     mock.string_get_calls = 0;
@@ -205,4 +207,6 @@ void mock_call_build(mock_call* c, const char* cmd, const char* cwd,
     c->envVars = mock_objarray_new(env, nenv);
     c->pid_slot = 0;
     c->pidArray = mock_intarray_new(&c->pid_slot, 1);
+    c->pts_dev_slot = 0;
+    c->ptsArray = mock_intarray_new(&c->pts_dev_slot, 1);
 }

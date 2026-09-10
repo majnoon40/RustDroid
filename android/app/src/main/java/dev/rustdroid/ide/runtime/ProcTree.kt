@@ -117,16 +117,109 @@ object ProcTree {
      * (2) may contain spaces and ')' characters, so parsing starts after
      * the LAST ')'. Null when the file is missing/unreadable/malformed.
      */
-    private fun startTimeOf(stat: File): Long? {
+    private fun startTimeOf(stat: File): Long? = longFieldOf(stat, STARTTIME_FIELD)
+
+    /**
+     * `/proc/<pid>/stat` field 6 (session id), same last-')' parsing
+     * discipline. Null when the file is missing/unreadable/malformed.
+     */
+    private fun sessionOf(stat: File): Long? = longFieldOf(stat, SESSION_FIELD)
+
+    /**
+     * `/proc/<pid>/stat` field 7 (tty_nr — the controlling terminal's
+     * device number). Null when the file is missing/unreadable/malformed.
+     */
+    private fun ttyNrOf(stat: File): Long? = longFieldOf(stat, TTY_NR_FIELD)
+
+    /**
+     * Field [field] of a /proc stat file (field numbering per proc(5):
+     * tokens[0] is field 3, so field N -> tokens[N - 3]; the comm field
+     * (2) may contain spaces and ')' — parse after the LAST ')').
+     */
+    private fun longFieldOf(stat: File, field: Int): Long? {
         if (!stat.isFile) return null
         return runCatching {
             val text = stat.readText()
             val close = text.lastIndexOf(')')
             if (close < 0) return@runCatching null
-            // tokens[0] is field 3 (state); field N -> tokens[N - 3]
             val tokens = text.substring(close + 1).trim().split(' ')
-            tokens.getOrNull(STARTTIME_FIELD - 3)?.toLongOrNull()
+            tokens.getOrNull(field - 3)?.toLongOrNull()
         }.getOrNull()
+    }
+
+    /**
+     * All processes whose /proc/<pid>/stat field 6 (session id) equals
+     * [sessionId], each with captured identity — the session-keyed
+     * discovery set for terminal teardown.
+     *
+     * TRUE KERNEL SEMANTICS (plan §5.2, review P0-1 — pinned by a
+     * regression test so the misconception cannot be re-introduced):
+     * `setsid(2)` creates a NEW session whose SID equals the caller's
+     * own PID. A process that called setsid() therefore has
+     * `sid == itsOwnPid`, NOT `sessionId`, and leaves this set
+     * immediately and permanently. What IS true: reparenting to init
+     * does not change the SID (an orphaned but attached process stays
+     * visible), and tty_nr (field 7) survives setsid while the tty is
+     * held — which is why the caller UNIONS this set with
+     * [descendants] and [ttyMembers].
+     */
+    fun sessionMembers(procRoot: File, sessionId: Long): List<ProcessId> {
+        return statEntries(procRoot) { dir ->
+            val stat = File(dir, "stat")
+            val start = startTimeOf(stat) ?: return@statEntries null
+            val session = sessionOf(stat) ?: return@statEntries null
+            if (session == sessionId) ProcessId(dir.name.toLong(), start) else null
+        }
+    }
+
+    /**
+     * All processes whose /proc/<pid>/stat field 7 (tty_nr) equals
+     * [ttyDevice] (the st_rdev of the session's pts slave, computed in
+     * the parent at PTY creation). The strongest discovery signal for a
+     * terminal: a process keeps its controlling-terminal device number
+     * even after `setsid()` unless it explicitly detached from the tty.
+     */
+    fun ttyMembers(procRoot: File, ttyDevice: Long): List<ProcessId> {
+        return statEntries(procRoot) { dir ->
+            val stat = File(dir, "stat")
+            val start = startTimeOf(stat) ?: return@statEntries null
+            val ttyNr = ttyNrOf(stat) ?: return@statEntries null
+            if (ttyNr == ttyDevice) ProcessId(dir.name.toLong(), start) else null
+        }
+    }
+
+    /**
+     * Union discovery for terminal teardown (plan §5.2):
+     * `sessionMembers(procRoot, shellPid) ∪ descendants(procRoot, shellPid)
+     * ∪ ttyMembers(procRoot, ptsDevice)`, deduped by PID. The shell is
+     * the session leader (the child path calls setsid() before exec), so
+     * its SID equals its PID. Everything still ATTACHED to the terminal
+     * is visible to at least one of the three sets; a deliberately
+     * detached process (setsid + tty released) is invisible to all —
+     * and survives BY DESIGN (that is what nohup/setsid are for).
+     */
+    fun unionMembers(procRoot: File, shellPid: Long, ptsDevice: Long): List<ProcessId> {
+        val out = LinkedHashMap<Long, ProcessId>()
+        for (id in sessionMembers(procRoot, shellPid)) out[id.pid] = id
+        for (id in descendants(procRoot, shellPid)) out.putIfAbsent(id.pid, id)
+        for (id in ttyMembers(procRoot, ptsDevice)) out.putIfAbsent(id.pid, id)
+        return out.values.toList()
+    }
+
+    /** Lists all numeric /proc entries, mapping each through [mapper] (null drops it). */
+    private inline fun statEntries(
+        procRoot: File,
+        mapper: (File) -> ProcessId?,
+    ): List<ProcessId> {
+        val dirs = procRoot.listFiles() ?: return emptyList()
+        val out = ArrayList<ProcessId>()
+        for (d in dirs) {
+            val pid = d.name.toLongOrNull() ?: continue
+            val id = mapper(d) ?: continue
+            out.add(ProcessId(pid, id.startTime))
+        }
+        out.sortBy { it.pid } // deterministic (readdir order is fs-dependent)
+        return out
     }
 
     /** "PPid:\t<n>" from a /proc status file, or null. */
@@ -143,6 +236,8 @@ object ProcTree {
     }
 
     private const val STARTTIME_FIELD = 22
+    private const val SESSION_FIELD = 6
+    private const val TTY_NR_FIELD = 7
 
     /**
      * True when `/proc/<pid>` shows state 'Z' — the process TERMINATED
@@ -221,14 +316,17 @@ object ProcTree {
         val captured = ArrayList<ProcessId>()
         val seen = HashSet<Long>()
 
-        // 2-3) snapshot + freeze known descendants
+        // 2-3) snapshot + freeze known descendants. Every injected-lambda
+        // call is guarded (review condition 8): an ESRCH/EPERM race between
+        // identity check and signal — or a throwing test lambda — must
+        // never crash a teardown.
         for (id in descendants(procRoot, rootPid)) {
             if (seen.add(id.pid)) captured.add(id)
-            if (stillMatches(procRoot, id)) signal(id.pid, SIGSTOP)
+            if (stillMatches(procRoot, id)) runCatching { signal(id.pid, SIGSTOP) }
         }
 
         // 4) terminate the root — dead parents cannot spawn replacements
-        destroyRoot()
+        runCatching { destroyRoot() }
         var waited = 0L
         while (isRootAlive() && waited < rootGraceMs) {
             sleeper(50L)
@@ -261,7 +359,7 @@ object ProcTree {
                 stillMatches(procRoot, it) && !isZombie(procRoot, it.pid)
             }
             if (remaining.isEmpty()) return
-            for (id in remaining) signal(id.pid, SIGKILL)
+            for (id in remaining) runCatching { signal(id.pid, SIGKILL) }
             if (sweep < maxSweeps - 1) sleeper(sweepDelayMs)
         }
     }

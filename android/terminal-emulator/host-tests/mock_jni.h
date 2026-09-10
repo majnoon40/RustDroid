@@ -9,7 +9,9 @@
  *   mock.fail_string_get_at   — return NULL from the Nth GetStringUTFChars
  *                               call (0 = never fail) — argv/envp
  *                               marshalling failure injection.
- *   mock.fail_critical        — GetPrimitiveArrayCritical returns NULL.
+ *   mock.fail_critical_at     — return NULL from the Nth
+ *                               GetPrimitiveArrayCritical call (1 =
+ *                               processIdArray, 2 = ptsDeviceArray).
  *
  * GetStringUTFChars returns a malloc'd COPY by default (a real JVM is
  * free to copy), so a release against the wrong jstring is detectable
@@ -31,7 +33,7 @@ typedef struct {
 typedef struct {
     /* injectable failures */
     int fail_string_get_at;   /* 1-based call counter; 0 = never */
-    int fail_critical;
+    int fail_critical_at;     /* 1-based critical-call counter; 0 = never */
 
     /* call records */
     rd_pin_record pins[RD_MOCK_MAX_PINS];
@@ -46,6 +48,7 @@ typedef struct {
 
     /* stats */
     int string_get_calls;
+    int critical_calls;
 } rd_mock;
 
 extern rd_mock mock;
@@ -63,12 +66,14 @@ jobjectArray mock_objarray_new(const char* const* items, int count);
 jintArray mock_intarray_new(jint* data, int count);
 
 /* Convenience: a fully-built mock argument set for a createSubprocess
- * call (pid written back into pid_slot). */
+ * call (pid written back into pid_slot, pts device into pts_dev_slot). */
 typedef struct {
     jstring cmd, cwd;
     jobjectArray args, envVars;
     jintArray pidArray;
     jint pid_slot;
+    jintArray ptsArray;
+    jint pts_dev_slot;
 } mock_call;
 
 void mock_call_build(mock_call* c, const char* cmd, const char* cwd,

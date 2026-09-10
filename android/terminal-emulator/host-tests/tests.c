@@ -50,8 +50,8 @@
 /* The vendored C under test. */
 JNIEXPORT jint JNICALL Java_com_termux_terminal_JNI_createSubprocess(
         JNIEnv* env, jclass clazz, jstring cmd, jstring cwd, jobjectArray args,
-        jobjectArray envVars, jintArray processIdArray, jint rows, jint columns,
-        jint cell_width, jint cell_height);
+        jobjectArray envVars, jintArray processIdArray, jintArray ptsDeviceArray,
+        jint rows, jint columns, jint cell_width, jint cell_height);
 
 static int g_failed = 0;
 static int g_ran = 0;
@@ -75,7 +75,7 @@ static jint call_create(mock_call* c)
 {
     return Java_com_termux_terminal_JNI_createSubprocess(
         mock_env(), NULL, c->cmd, c->cwd, c->args, c->envVars, c->pidArray,
-        24, 80, 10, 20);
+        c->ptsArray, 24, 80, 10, 20);
 }
 
 static int fd_is_closed(int fd)
@@ -152,6 +152,7 @@ static void test_release_pairing(void)
 
     jint ptm = call_create(&c);
     int ok = ptm >= 0;
+    int pts_ok = c.pts_dev_slot > 0; /* st_rdev of a real pty is nonzero */
     if (ok) {
         ok = c.pid_slot > 0;
         waitpid(c.pid_slot, NULL, 0);
@@ -160,7 +161,8 @@ static void test_release_pairing(void)
     int threw = mock.threw;
     int pins_ok = mock_verify_pins() == 0;
     mock_destroy();
-    CHECK(ok && !threw && pins_ok, "ptm=%d pid=%d threw=%d pins_bad", (int) ptm, (int) c.pid_slot, threw);
+    CHECK(ok && pts_ok && !threw && pins_ok, "ptm=%d pid=%d pts=%d threw=%d pins_bad",
+          (int) ptm, (int) c.pid_slot, (int) c.pts_dev_slot, threw);
 }
 
 static void test_fd_leak_fork_failure(void)
@@ -210,9 +212,29 @@ static void test_fd_leak_critical_failure(void)
     const char* env[] = { "RD_TEST=1" };
     mock_call_build(&c, "/bin/true", "/", args, 1, env, 1);
 
-    mock.fail_critical = 1;
+    mock.fail_critical_at = 1; /* processIdArray critical */
     jint ptm = call_create(&c);
-    mock.fail_critical = 0;
+    mock.fail_critical_at = 0;
+
+    int threw = mock.threw && strstr(mock.last_thrown, "GetPrimitiveArrayCritical") != NULL;
+    int closed = fd_is_closed(probe);
+    reap_children(); /* the fork succeeded; the pid was never delivered */
+    mock_destroy();
+    CHECK(ptm < 0 && threw && closed, "ptm=%d threw=%d closed=%d", (int) ptm, threw, closed);
+}
+
+static void test_fd_leak_pts_critical_failure(void)
+{
+    mock_reset();
+    int probe = fd_probe();
+    mock_call c;
+    const char* args[] = { "true" };
+    const char* env[] = { "RD_TEST=1" };
+    mock_call_build(&c, "/bin/true", "/", args, 1, env, 1);
+
+    mock.fail_critical_at = 2; /* ptsDeviceArray critical (the RustDroid §5.2 out-param) */
+    jint ptm = call_create(&c);
+    mock.fail_critical_at = 0;
 
     int threw = mock.threw && strstr(mock.last_thrown, "GetPrimitiveArrayCritical") != NULL;
     int closed = fd_is_closed(probe);
@@ -307,6 +329,7 @@ static void test_happy_path_echo(void)
     char out[512];
     ssize_t n = -1;
     int status = -1;
+    int pts_ok = c.pts_dev_slot > 0;
     if (ptm >= 0) {
         n = read_master_all(ptm, out, sizeof out - 1);
         if (n >= 0) out[n] = '\0';
@@ -317,8 +340,8 @@ static void test_happy_path_echo(void)
     int exited0 = WIFEXITED(status) && WEXITSTATUS(status) == 0;
     int pins_ok = mock_verify_pins() == 0;
     mock_destroy();
-    CHECK(ptm >= 0 && echoed && exited0 && pins_ok,
-          "ptm=%d n=%d exited0=%d pins_ok=%d", (int) ptm, (int) n, exited0, pins_ok);
+    CHECK(ptm >= 0 && pts_ok && echoed && exited0 && pins_ok,
+          "ptm=%d pts=%d n=%d exited0=%d pins_ok=%d", (int) ptm, (int) c.pts_dev_slot, (int) n, exited0, pins_ok);
 }
 
 static int count_open_fds(void)
@@ -390,6 +413,7 @@ int main(void)
     test_fd_leak_fork_failure();
     test_fd_leak_grantpt_failure();
     test_fd_leak_critical_failure();
+    test_fd_leak_pts_critical_failure();
     test_marshall_leak_argv_get_failure();
     test_marshall_leak_envp_malloc_failure();
     test_sigpipe_reset();

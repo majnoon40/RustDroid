@@ -435,4 +435,141 @@ class ProcTreeTest {
         assertEquals(3, kills)
         assertEquals(2, slept)
     }
+
+    // ------------------------------------------------------------------
+    // Session / tty discovery + union (Phase 4, plan §5.2 / §6.4)
+    // ------------------------------------------------------------------
+
+    /**
+     * Builds a full synthetic stat line with pgrp (5), session (6) and
+     * tty_nr (7) populated — the field count matches the real kernel
+     * layout so the parser is exercised faithfully.
+     */
+    private fun statLineFull(
+        pid: Long, comm: String, state: String, ppid: Long,
+        pgrp: Long, session: Long, ttyNr: Long, start: Long,
+    ): String = (
+        listOf(pid.toString(), "($comm)", state, ppid.toString(),
+            pgrp.toString(), session.toString(), ttyNr.toString()) +
+            List(14) { "0" } +           // fields 8..21
+            listOf(start.toString()) +    // field 22: starttime
+            List(8) { "0" }).joinToString(" ")
+
+    /** Synthetic /proc entry with full session/tty identity. */
+    private fun procEntry(
+        pid: Long, ppid: Long, session: Long, ttyNr: Long, start: Long,
+        state: String = "R",
+    ) {
+        val dir = File(tmp.root, pid.toString()).apply { mkdirs() }
+        dir.resolve("status").writeText("Name:\tfake$pid\nState:\tR\nPPid:\t$ppid\n")
+        dir.resolve("stat").writeText(
+            statLineFull(pid, "fake$pid", state, ppid, session, session, ttyNr, start)
+        )
+    }
+
+    @Test
+    fun `sessionMembers returns only processes whose session id matches`() {
+        // shell 100 is the session leader (sid == 100): children 200/300
+        // share the session; 999 is in another session.
+        procEntry(100L, 1L, 100L, 0L, 10L)
+        procEntry(200L, 100L, 100L, 0L, 20L)
+        procEntry(300L, 200L, 100L, 0L, 30L)
+        procEntry(999L, 1L, 999L, 0L, 99L)
+        val members = ProcTree.sessionMembers(tmp.root, 100L)
+        // the session leader (the shell itself) is a member of its own
+        // session — teardown freezes and kills it too
+        assertEquals(listOf(100L, 200L, 300L), members.map { it.pid })
+        assertEquals(listOf(10L, 20L, 30L), members.map { it.startTime })
+    }
+
+    @Test
+    fun `a setsid-d process is NOT a session member - it is its own session leader`() {
+        // THE kernel-semantics pin (plan §5.2, review P0-1): setsid(2)
+        // creates a NEW session whose SID equals the CALLER'S OWN PID.
+        // The v1 plan believed a setsid'd daemon keeps `sid == shellPid`
+        // forever — that inverts the syscall, and this test exists so
+        // the misconception cannot be re-introduced: a process with
+        // `sid == ownPid` must be invisible to sessionMembers.
+        procEntry(100L, 1L, 100L, 0L, 10L)                     // shell
+        procEntry(400L, 100L, 100L, 0L, 40L)                   // plain child
+        procEntry(500L, 1L, 500L, 34817L, 50L)                 // setsid'd: sid == own pid
+        val members = ProcTree.sessionMembers(tmp.root, 100L)
+        assertEquals(listOf(100L, 400L), members.map { it.pid })
+        assertFalse(members.any { it.pid == 500L })
+    }
+
+    @Test
+    fun `ttyMembers matches the pts device number even after setsid`() {
+        // tty_nr (field 7) survives setsid while the tty is still held —
+        // the strongest discovery signal for a terminal.
+        procEntry(100L, 1L, 100L, 34817L, 10L)
+        procEntry(500L, 1L, 500L, 34817L, 50L)    // setsid'd but tty held
+        procEntry(600L, 1L, 600L, 0L, 60L)        // detached: no tty
+        val members = ProcTree.ttyMembers(tmp.root, 34817L)
+        assertEquals(listOf(100L, 500L), members.map { it.pid })
+    }
+
+    @Test
+    fun `union discovery catches a setsid-d escapee still holding the tty`() {
+        // The union of the three keyed sets: plain child via session,
+        // grandchild via session, setsid'd-tty-held via tty_nr.
+        procEntry(100L, 1L, 100L, 34817L, 10L)    // shell (leader)
+        procEntry(200L, 100L, 100L, 34817L, 20L)  // plain child
+        procEntry(300L, 200L, 100L, 34817L, 30L)  // grandchild
+        procEntry(500L, 1L, 500L, 34817L, 50L)    // setsid'd, tty still held (ppid 1)
+        val union = ProcTree.unionMembers(tmp.root, 100L, 34817L)
+        assertEquals(listOf(100L, 200L, 300L, 500L), union.map { it.pid })
+    }
+
+    @Test
+    fun `a fully detached escapee is invisible to all three sets - and survives by design`() {
+        // setsid + tty released: invisible to sessionMembers (new
+        // session), to descendants (ppid 1, no parent link), and to
+        // ttyMembers (tty_nr 0). SURVIVING IS THE DESIGNED BEHAVIOR —
+        // nohup/setsid exist precisely so a job outlives the terminal.
+        // This test asserts the invisibility so nobody "fixes" it.
+        procEntry(100L, 1L, 100L, 34817L, 10L)
+        procEntry(200L, 100L, 100L, 34817L, 20L)
+        procEntry(700L, 1L, 700L, 0L, 70L)        // fully detached
+        assertEquals(listOf(100L, 200L), ProcTree.sessionMembers(tmp.root, 100L).map { it.pid })
+        // tty set sees the shell and the plain child — never the escapee
+        assertEquals(listOf(100L, 200L), ProcTree.ttyMembers(tmp.root, 34817L).map { it.pid })
+        val union = ProcTree.unionMembers(tmp.root, 100L, 34817L)
+        assertEquals(listOf(100L, 200L), union.map { it.pid })
+        assertFalse(union.any { it.pid == 700L })
+    }
+
+    @Test
+    fun `unrelated processes with other sessions and ttys are excluded from the union`() {
+        procEntry(100L, 1L, 100L, 34817L, 10L)
+        procEntry(200L, 100L, 100L, 34817L, 20L)
+        procEntry(800L, 1L, 888L, 34999L, 80L)    // different session AND tty
+        val union = ProcTree.unionMembers(tmp.root, 100L, 34817L)
+        assertEquals(listOf(100L, 200L), union.map { it.pid })
+    }
+
+    @Test
+    fun `process vanishing mid-walk is dropped from session and tty discovery`() {
+        // 200 has no stat file (vanished between listFiles and the read):
+        // unreadable identity -> unsafe to signal -> dropped.
+        val dir = File(tmp.root, "100").apply { mkdirs() }
+        dir.resolve("status").writeText("Name:\ta\nPPid:\t1\n")
+        dir.resolve("stat").writeText(statLineFull(100L, "a", "R", 1L, 100L, 100L, 34817L, 10L))
+        val gone = File(tmp.root, "200").apply { mkdirs() }
+        gone.resolve("status").writeText("Name:\tb\nPPid:\t100\n")
+        // no stat file for 200
+        assertEquals(listOf(100L), ProcTree.sessionMembers(tmp.root, 100L).map { it.pid })
+        assertEquals(
+            listOf(100L),
+            ProcTree.ttyMembers(tmp.root, 34817L).map { it.pid },
+        )
+    }
+
+    @Test
+    fun `sessionMembers is empty for a missing proc root`() {
+        assertEquals(
+            emptyList<ProcTree.ProcessId>(),
+            ProcTree.sessionMembers(File("/nonexistent-proc"), 100L),
+        )
+    }
 }

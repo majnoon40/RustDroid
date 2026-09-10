@@ -23,10 +23,14 @@ final class JNI {
      * @param args      An array of arguments to the command
      * @param envVars   An array of strings of the form "VAR=value" to be added to the environment of the process
      * @param processId A one-element array to which the process ID of the started process will be written.
+     * @param ptsDevice A one-element array to which the pts slave's device number (fstat st_rdev, computed in the
+     *                  parent at PTY creation) will be written. RustDroid addition (plan §5.2): the session
+     *                  controller unions session-, descendant-, and tty-nr-keyed discovery, and /proc stat field 7
+     *                  (tty_nr) carries this device number even after setsid while the tty is held.
      * @return the file descriptor resulting from opening /dev/ptmx master device. The sub process will have opened the
      * slave device counterpart (/dev/pts/$N) and have it as stdint, stdout and stderr.
      */
-    public static native int createSubprocess(String cmd, String cwd, String[] args, String[] envVars, int[] processId, int rows, int columns, int cellWidth, int cellHeight);
+    public static native int createSubprocess(String cmd, String cwd, String[] args, String[] envVars, int[] processId, int[] ptsDevice, int rows, int columns, int cellWidth, int cellHeight);
 
     /** Set the window size for a given pty, which allows connected programs to learn how large their screen is. */
     public static native void setPtyWindowSize(int fd, int rows, int cols, int cellWidth, int cellHeight);

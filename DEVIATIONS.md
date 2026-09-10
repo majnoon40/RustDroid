@@ -859,3 +859,66 @@ implementation log (appended as terminal-layer tests land).
   vendored JVM suite + app suite green; `termux.c` compiles clean
   under gcc (host, `-D_GNU_SOURCE` for glibc POSIX visibility) and
   NDK r27c clang aarch64 (verbatim upstream cFlags incl. `-Werror`).
+
+**Step 3 — UTF-8 split test + session discovery + teardown controller
+(2026-09-10)**:
+
+- **UTF-8 split-across-reads regression test** (plan §6.3): new
+  `Utf8SplitAcrossReadsTest` in the vendored module (upstream's 19 test
+  files untouched). Every split offset of a mixed 2/3/4-byte string,
+  plus 3-way splits inside every multi-byte sequence at each internal
+  boundary pair; asserts rendered row AND decoder intermediate state
+  (`mUtf8ToFollow == 0`, pending buffer empty — via reflection, the
+  fields are private) so a decoder regression is distinguishable from
+  a rendering change (review Part 6). Corrupted continuation byte —
+  whole or split — yields exactly one U+FFFD; truncated sequences hold
+  state without rendering. Suite: **150 tests, 0 failures**.
+- **`ProcTree` session discovery** (plan §5.2): `sessionMembers`
+  (stat field 6), `ttyMembers` (field 7), `unionMembers`
+  (session ∪ descendants ∪ tty_nr, dedup by `ProcessId`); stat field
+  parsing unified through `longFieldOf` with the existing last-`)`
+  discipline. The kernel-semantics-pinning test (review P0-1): a
+  process with `sid == ownPid` is NOT a session member; a
+  `setsid`'d-but-tty-holding escapee IS caught by the union via
+  tty_nr; a fully detached escapee is invisible to all three sets and
+  asserted to be (survives by design). The shell itself IS a member of
+  its own session (teardown freezes/kills it too).
+- **`TerminalSessionController`** (plan §5.3, exact v2 sequence):
+  quiesce (caller contract) → stop reader → bounded join (P1-4) →
+  close master (kernel-delivered SIGHUP, P1-3) → bounded 300 ms grace
+  → union snapshot (identity map cached for the teardown) → SIGSTOP
+  freeze (identity revalidation before every signal) → shell-group
+  `killpg(SIGKILL)` (a pgrp cannot span sessions, so it can only hit
+  session members) → bounded zombie-excluded sweeps with early return
+  → SIGCONT freeze survivors after budget (condition 8). Every
+  injected `signal`/`killpg`/`closeMaster`/`stopReader`/`joinReader`
+  call wrapped in `runCatching` (condition 8). The kill phase is the
+  sweep loop itself (first sweep = kill pass — the same shape as
+  `terminateTree`); no separate initial per-PID pass.
+- **Retroactive `runCatching` guards on `ProcTree.terminateTree`**
+  (condition 8): every `signal`/`destroyRoot` call site now guarded.
+- **pts device number out-param** (plan §5.2): `createSubprocess`
+  computes `st_rdev` of the pts slave in the parent (open O_NOCTTY +
+  fstat) and returns it via a new `int[1]` array (separate JNI
+  critical section — two simultaneous critical sections are not
+  supported by the JNI contract); `TerminalSession` stores/exposes it
+  (`getPtsDevice()`, recorded in THIRD_PARTY.md). **Subtlety found and
+  fixed while testing**: the probe must be held open ACROSS the fork —
+  closing it before the child opens its own slave puts the master into
+  a latched-EIO state and the session's first reads lose output
+  (verified empirically; the slave fd count must never hit zero in
+  that window). The probe is therefore guaranteed a slot in the
+  pre-scanned close-list (appended even if the 256-entry scan window
+  overflowed — a child that kept it would never deliver
+  EIO-on-exit), the parent closes its copy right after fork, and
+  close-list allocation failure now FAILS the session loudly instead
+  of being tolerated (a child without the fd discipline is a broken
+  session, not a degraded one — the tolerance note in the upstream
+  comparison only ever covered opendir failure).
+- Host harness updated for the new signature (pts out-array + a
+  second GetPrimitiveArrayCritical failure test: the pts critical path
+  closes the ptm too) — **10 checks, 0 failures** + alloc window
+  clean; the harness also now asserts `ptsDevice > 0` on real ptys.
+- Local totals: terminal-emulator **150/0**, app **212/0** (193
+  pre-existing + 8 ProcTree session/tty/union tests + 11 controller
+  Recorder tests), `:app:assembleDebug` green.
