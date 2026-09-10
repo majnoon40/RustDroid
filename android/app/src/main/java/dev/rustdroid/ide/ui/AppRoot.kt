@@ -41,7 +41,15 @@ import dev.rustdroid.ide.ui.terminal.TerminalScreen
 object Routes {
     const val GATE = "gate"
     const val HOME = "home"
-    const val TERMINAL = "terminal"
+
+    /**
+     * v0.2: the terminal is a PROJECT-scoped destination (opened from a
+     * project card or the editor toolbar) with an optional project ref —
+     * the same REF scheme as EDITOR/DEPS (internal name or URL-encoded
+     * external absolute path; resolved by ProjectRepository.resolve).
+     * Blank/absent = the projects-root default (v0.1.8 behavior).
+     */
+    const val TERMINAL = "terminal?project={project}"
 
     /**
      * The project argument is a REF, not just a name: internal projects are
@@ -58,6 +66,9 @@ object Routes {
     fun editor(project: String, file: String = ""): String =
         "editor/${android.net.Uri.encode(project)}?file=${android.net.Uri.encode(file)}"
     fun deps(project: String) = "deps/${android.net.Uri.encode(project)}"
+    fun terminal(project: String? = null): String =
+        if (project.isNullOrBlank()) "terminal"
+        else "terminal?project=${android.net.Uri.encode(project)}"
 }
 
 /** Tiny VM holding toolchain state for navigation decisions. */
@@ -118,13 +129,27 @@ fun AppRoot(
                 container,
                 onOpenProject = { ref -> nav.navigate(Routes.editor(ref)) },
                 onOpenSettings = { nav.navigate(Routes.SETTINGS) },
-                onOpenTerminal = { nav.navigate(Routes.TERMINAL) },
+                onOpenTerminal = { ref -> nav.navigate(Routes.terminal(ref)) },
             )
         }
-        composable(Routes.TERMINAL) {
+        composable(
+            Routes.TERMINAL,
+            arguments = listOf(
+                navArgument("project") {
+                    type = NavType.StringType
+                    defaultValue = ""
+                },
+            ),
+        ) { entry ->
             // A first-class destination (plan §8.1): a character-grid
-            // terminal — NOT a mode of the Editor console.
-            TerminalScreen(container, onBack = { nav.popBackStack() })
+            // terminal — NOT a mode of the Editor console. v0.2: project-
+            // scoped — the first session starts in the given project.
+            val project = entry.arguments?.getString("project").orEmpty()
+            TerminalScreen(
+                container,
+                onBack = { nav.popBackStack() },
+                projectRef = project.ifBlank { null },
+            )
         }
         composable(
             Routes.EDITOR,
@@ -142,6 +167,7 @@ fun AppRoot(
                 container, project,
                 initialFile = file.ifBlank { null },
                 onOpenDeps = { nav.navigate(Routes.deps(it)) },
+                onOpenTerminal = { ref -> nav.navigate(Routes.terminal(ref)) },
             )
         }
         composable(Routes.DEPS) { entry ->

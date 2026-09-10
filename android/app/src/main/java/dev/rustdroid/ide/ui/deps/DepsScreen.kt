@@ -283,7 +283,7 @@ private fun CrateResultRow(crate: CrateSummary, onAdd: () -> Unit) {
                     )
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        "${Fs.humanBytes(crate.downloads)} downloads",
+                        "${Fs.humanCount(crate.downloads)} downloads",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.outline,
                     )

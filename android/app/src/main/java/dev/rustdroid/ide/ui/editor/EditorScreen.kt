@@ -18,7 +18,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
@@ -99,6 +98,7 @@ fun EditorScreen(
     container: AppContainer,
     projectName: String,
     onOpenDeps: (String) -> Unit,
+    onOpenTerminal: (String) -> Unit = {},
     initialFile: String? = null,
 ) {
     val vm: EditorViewModel = viewModel(
@@ -265,6 +265,12 @@ fun EditorScreen(
                     title = { Text(projectName.substringAfterLast('/')) },
                     actions = {
                         TextButton(onClick = { onOpenDeps(projectName) }) { Text("Deps") }
+                        // v0.2: per-project terminal from where the script is
+                        // written — the session starts IN this project's
+                        // directory (cargo run / fetch / test with no cd).
+                        IconButton(onClick = { onOpenTerminal(projectName) }) {
+                            Icon(RdIcons.Terminal, contentDescription = "Open terminal in this project")
+                        }
                         if (running) {
                             IconButton(onClick = { vm.stop() }) {
                                 Icon(RdIcons.Stop, contentDescription = "Stop", tint = MaterialTheme.colorScheme.error)
@@ -383,7 +389,22 @@ fun EditorScreen(
                 // panel comes back the moment the keyboard closes. Typing in
                 // the console's stdin bar keeps the panel (it owns focus
                 // there) with the console shrunk to 88dp instead of 220dp.
-                val imeVisible = WindowInsets.isImeVisible
+                //
+                // v0.2 console-delay fix: the raw IME inset stays > 0 for the
+                // ENTIRE closing animation (~300ms+ on many OEM skins) and
+                // the old isImeVisible flag only flipped at the very end —
+                // the console felt like it took a second to come back after
+                // closing the keyboard. The IME inset animates per-frame, so
+                // comparing it against a collapse threshold (a keyboard is
+                // ~40-50% of screen height; 12% is deep into the collapse)
+                // brings the panel back the moment the collapse STARTS. The
+                // one trade: the panel also hides slightly late while the
+                // keyboard is OPENING (near the animation's end) — brief
+                // overlap beats a dead-feeling panel.
+                val density = androidx.compose.ui.platform.LocalDensity.current
+                val config = androidx.compose.ui.platform.LocalConfiguration.current
+                val imeCollapsePx = with(density) { (config.screenHeightDp * 0.12f).dp.toPx() }
+                val imeVisible = WindowInsets.ime.getBottom(density) > imeCollapsePx
                 val hideBottom = imeVisible && editorFocused
                 val errorCount = problems.count { it.severity == Severity.ERROR }
                 val warningCount = problems.count { it.severity == Severity.WARNING }

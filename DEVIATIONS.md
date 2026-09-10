@@ -1242,3 +1242,84 @@ contains NO "updateSize() called before setTextSize()" warning;
 (3) rotate/split → `stty size` follows (SIGWINCH through updateSize);
 (4) crumbs now reach terminal:view-attached; (5) 200 open/close cycles
 → no renderer regression, no fd growth.
+
+## 14. The v0.2 user-experience pass (2026-09-10, v0.2.0)
+
+User report after v0.1.9 (terminal now OPENS and renders): "I can't
+type anything", "the UI is very big", "the terminal should be in the
+projects, not the home menu, where you can run commands for the script
+like cargo run / cargo fetch / cargo test", "downloading a dep shows an
+incorrect size like 1.56 GB for rand", "closing the keyboard while
+writing a script takes a second to display the console", "polish the
+entire UI and make this a big 0.2 update". All six addressed:
+
+- **Fixed: terminal input (the "can't type" report)** — root cause is a
+  documented Android behavior our Compose interop inherited:
+  `requestFocus()` alone does NOT show the soft keyboard (developer.
+  android.com, "Handle input method visibility"), and no code path ever
+  called `InputMethodManager.showSoftInput`. Termux's own app layer
+  calls it; ours had a client that only did `requestFocus()`. The fix is
+  `requestFocusAndShowKeyboard()` (focus + explicit `showSoftInput`)
+  at BOTH entry points: after `attachSession` (keyboard appears when
+  the terminal opens, like Termux) and from the view client's
+  `onSingleTapUp` (every tap re-focuses AND re-shows). The session-side
+  write path was audited first and is intact upstream design
+  (ByteQueue → TermSessionOutputWriter thread → master fd), so the
+  failure was IME engagement, not I/O.
+- **Fixed: "UI very big"** — v0.1.9's 14dp terminal font was a third
+  larger than Termux's house style. v0.2 default is 11dp, plus
+  Termux-style pinch-to-scale (the vendored view's accumulated-scale
+  `onScale` contract, clamped 0.5x–2.5x, live `setTextSize` with
+  redundant calls skipped). Proper window insets were also missing: the
+  terminal screen had NO Scaffold, so with edge-to-edge the tab strip
+  sat under the status bar and the extra-keys row under the gesture bar;
+  and without `imePadding()` the keyboard would have covered the prompt
+  line — the screen now runs Scaffold + TopAppBar + imePadding.
+- **Moved: terminal → projects (user's explicit ask)** — removed from
+  the Home toolbar; added per-project: a terminal icon on every project
+  card, one in the Editor toolbar ("run commands for the script"), and
+  a project-scoped route `terminal?project={project}` (the same REF
+  scheme as EDITOR/DEPS). The FIRST session auto-opens IN that project's
+  directory (resolve + isDirectory guarded) so `cargo run`, `cargo
+  fetch`, `cargo test` work with no cd; the session's tab is titled by
+  the project name (TerminalCenter.createSession already accepted cwd —
+  it was simply never called with one). New sessions created inside the
+  screen (top-bar + / empty state) stay in the same project. Sessions
+  survive navigation (they live in TerminalCenter); re-entering reuses
+  existing sessions instead of spawning duplicates.
+- **Fixed: "1.56 GB for rand"** — not a size: DepsScreen formatted
+  crates.io download COUNTS with `Fs.humanBytes` (rand's count is ~1.56
+  billion). New `Fs.humanCount` (42 / 456K / 13.4M / 1.6B), pinned by a
+  FsTest case including an explicit never-"GB" assertion. No more
+  byte-formatting a number that was never a size.
+- **Fixed: console's second-long return after closing the keyboard**
+  (Editor) — the old `WindowInsets.isImeVisible` flag only flips when
+  the IME inset reaches 0, i.e. at the very END of the closing animation
+  (~300ms+ on many OEM skins, longer with insets dispatch latency). The
+  IME inset animates per-frame, so v0.2 compares it against a collapse
+  threshold (12% of screen height — a keyboard is 40–50%): the console
+  panel returns the moment the collapse STARTS. Trade (accepted,
+  commented in code): the panel also hides slightly late while the
+  keyboard is opening.
+- **Polish** — terminal screen: proper TopAppBar (back arrow, project
+  title, new-session action), styled session tabs (Close icon instead
+  of a "×" text glyph, finished-sessions marked by a dim dot), extra-
+  keys row rebuilt as evenly weighted 40dp touch targets, shared
+  EmptyState widget. Editor toolbar: terminal action. Home: project
+  cards carry the terminal action.
+
+Verification honesty: no Android SDK here (same constraint as v0.1.8/
+v0.1.9) — compile-correctness is by inspection (every interface
+signature was checked against the vendored sources; the only callers
+of the three changed screen signatures are in AppRoot and were all
+updated). The Fs.humanCount behavior is pinned by a JVM unit test
+(the one part of this pass that IS host-verifiable). On-device
+checklist: (1) open terminal from a project card — prompt appears at
+11dp, keyboard shows immediately, typing echoes (incl. via extra-keys
+Esc/Tab/arrows); (2) pinch scales the font live and it survives
+session switches; (3) rotate/split — `stty size` follows; (4) back
+arrow pops navigation, sessions keep running (tab strip, FGS
+notification); (5) editor: close keyboard mid-script — console returns
+with the collapse, not after it; (6) Deps search: rand shows "1.6B
+downloads"; (7) no new crash-dialog on next launch (CrashRecorder
+clean).

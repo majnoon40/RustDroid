@@ -119,6 +119,31 @@ object Fs {
         return "%.2f GB".format(mb / 1024.0)
     }
 
+    /** Compact COUNT formatting ("1.6B", "13.4M", "456K", "42") — for
+     *  download/usage counts. v0.2 fix: DepsScreen ran crates.io download
+     *  COUNTS through [humanBytes] and printed "1.56 GB downloads" for
+     *  rand (its count is ~1.56 BILLION, not bytes — the field was never a
+     *  size). Counts now format as counts. */
+    fun humanCount(count: Long): String {
+        if (count < 1_000) return count.toString()
+        var value = count / 1_000.0
+        var unit = 'K'
+        if (value >= 1_000.0) { value /= 1_000.0; unit = 'M' }
+        if (value >= 1_000.0) { value /= 1_000.0; unit = 'B' }
+        // rounding at the top of a unit can cross the boundary
+        // (999,999 -> "1000K"): bump before formatting
+        if (value >= 999.5) {
+            value /= 1_000.0
+            unit = when (unit) { 'K' -> 'M'; 'M' -> 'B'; else -> 'T' }
+        }
+        return trimCount(value) + unit
+    }
+
+    private fun trimCount(v: Double): String {
+        val s = if (v >= 100.0) "%.0f".format(v) else "%.1f".format(v)
+        return if (s.endsWith(".0")) s.dropLast(2) else s
+    }
+
     /** Safe entry-name resolution: rejects absolute paths and '..' traversal.
      *
      * LEXICAL check only — a symlink created inside the root can still route

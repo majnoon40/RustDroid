@@ -169,7 +169,12 @@ class TerminalCenter(
                 client,
             )
             CrashRecorder.crumb("terminal:create:session-built")
-            val entry = SessionEntry(nextId.getAndIncrement(), termSession, "sh", false)
+            // v0.2: a project-rooted session is titled by its project so
+            // the tab strip tells sessions apart (plain ones stay "sh").
+            val entry = SessionEntry(
+                nextId.getAndIncrement(), termSession,
+                cwd?.name?.takeIf { it.isNotBlank() } ?: "sh", false,
+            )
             _sessions.value = _sessions.value + entry
             TerminalService.ensureRunning(context, _sessions.value.size)
             CrashRecorder.crumb("terminal:create:fgs-started")

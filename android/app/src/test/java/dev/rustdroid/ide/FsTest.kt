@@ -3,6 +3,7 @@ package dev.rustdroid.ide
 import dev.rustdroid.ide.util.Fs
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -122,6 +123,24 @@ class FsTest {
         assertEquals("512 B", Fs.humanBytes(512))
         assertEquals("1.0 KB", Fs.humanBytes(1024))
         assertEquals("1.5 MB", Fs.humanBytes(1024 * 1024 + 512 * 1024))
+    }
+
+    @Test
+    fun `human count formats counts not bytes`() {
+        // v0.2 regression: DepsScreen formatted crates.io download COUNTS
+        // with humanBytes — "1.56 GB downloads" for rand whose count is
+        // ~1.56 billion. Pin the count formatter (and that the billion-scale
+        // case reads as B, never GB).
+        assertEquals("42", Fs.humanCount(42))
+        assertEquals("457K", Fs.humanCount(456_789))
+        assertEquals("1K", Fs.humanCount(1_000))
+        assertEquals("999K", Fs.humanCount(999_499))
+        // rounding crosses the unit boundary: 999,999 reads as 1M, not 1000K
+        assertEquals("1M", Fs.humanCount(999_999))
+        assertEquals("13.4M", Fs.humanCount(13_400_000))
+        assertEquals("1.6B", Fs.humanCount(1_560_000_000))
+        assertEquals("23B", Fs.humanCount(23_000_000_000))
+        assertNotEquals("GB", Fs.humanCount(1_560_000_000).takeLast(2))
     }
 
     @Test

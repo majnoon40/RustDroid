@@ -27,8 +27,10 @@ class TerminalViewModel(val center: TerminalCenter) : ViewModel() {
         _currentId.value = id
     }
 
-    fun createSession() {
-        when (val result = center.createSession()) {
+    /** Create a session, optionally rooted in a project directory (v0.2:
+     *  opened-from-a-project terminals run cargo right there). */
+    fun createSession(cwd: java.io.File? = null) {
+        when (val result = center.createSession(cwd)) {
             is TerminalCenter.CreateResult.Ok -> _currentId.value = result.entry.id
             is TerminalCenter.CreateResult.NotInstalled -> _lastCreateError.value = result.detail
             is TerminalCenter.CreateResult.Error -> _lastCreateError.value = result.detail

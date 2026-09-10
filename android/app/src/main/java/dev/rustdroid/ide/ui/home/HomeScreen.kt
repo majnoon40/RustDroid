@@ -64,7 +64,7 @@ fun HomeScreen(
     container: AppContainer,
     onOpenProject: (String) -> Unit,
     onOpenSettings: () -> Unit,
-    onOpenTerminal: () -> Unit = {},
+    onOpenTerminal: (String) -> Unit,
 ) {
     val vm: HomeViewModel = viewModel(factory = HomeViewModel.factory(container))
     val projects by vm.projects.collectAsState()
@@ -121,11 +121,9 @@ fun HomeScreen(
                     IconButton(onClick = openFolderPicker) {
                         Icon(RdIcons.FolderOpen, contentDescription = "Open folder as project")
                     }
-                    // Phase 4 terminal (plan §8.1): a first-class destination
-                    // from the Home toolbar.
-                    IconButton(onClick = onOpenTerminal) {
-                        Icon(RdIcons.Terminal, contentDescription = "Open terminal")
-                    }
+                    // v0.2: the terminal moved OUT of the Home toolbar and
+                    // ONTO each project card (plus the editor toolbar) — it
+                    // is a per-project tool, not a global menu entry.
                     IconButton(onClick = onOpenSettings) {
                         Icon(Icons.Filled.Settings, contentDescription = "Settings")
                     }
@@ -172,6 +170,9 @@ fun HomeScreen(
                         project = project,
                         onClick = {
                             onOpenProject(container.projectRepository.refOf(project.dir))
+                        },
+                        onOpenTerminal = {
+                            onOpenTerminal(container.projectRepository.refOf(project.dir))
                         },
                         onDelete = { deleteTarget = project },
                         onRename = { if (!project.external) renameTarget = project },
@@ -258,6 +259,7 @@ fun HomeScreen(
 private fun ProjectCard(
     project: ProjectSummary,
     onClick: () -> Unit,
+    onOpenTerminal: () -> Unit,
     onDelete: () -> Unit,
     onRename: () -> Unit,
 ) {
@@ -310,6 +312,15 @@ private fun ProjectCard(
                 IconButton(onClick = onRename) {
                     Icon(Icons.Filled.Edit, contentDescription = "Rename", tint = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
+            }
+            // v0.2: per-project terminal — the session starts IN this
+            // project's directory (cargo run / fetch / test with no cd).
+            IconButton(onClick = onOpenTerminal) {
+                Icon(
+                    RdIcons.Terminal,
+                    contentDescription = "Open terminal in ${project.name}",
+                    tint = MaterialTheme.colorScheme.primary,
+                )
             }
             IconButton(onClick = onDelete) {
                 Icon(
