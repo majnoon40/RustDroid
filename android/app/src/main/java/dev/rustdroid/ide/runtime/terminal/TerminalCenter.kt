@@ -3,11 +3,11 @@ package dev.rustdroid.ide.runtime.terminal
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import android.content.Intent
 import android.util.Log
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import dev.rustdroid.ide.model.ToolchainState
+import dev.rustdroid.ide.runtime.CrashRecorder
 import dev.rustdroid.ide.runtime.ProcEnv
 import dev.rustdroid.ide.toolchain.ToolchainManager
 
@@ -47,6 +47,12 @@ import java.util.concurrent.atomic.AtomicLong
 class TerminalCenter(
     private val context: Context,
     private val toolchainManager: ToolchainManager,
+    /** Internal projects root (files/projects) — the DEFAULT session cwd:
+     *  a fresh session lands next to the user's projects so `cd <project>
+     *  && cargo run` is one keystroke away (v0.1.8, the PyDroid-style
+     *  workflow). HOME stays $RUSTDROID_HOME via the env — CARGO_HOME etc.
+     *  are absolute and do not care about the session cwd. */
+    private val projectsRoot: File,
 ) {
     /** One entry per live session; observed by the ViewModel and the service glue. */
     data class SessionEntry(
@@ -121,16 +127,22 @@ class TerminalCenter(
     sealed interface CreateResult {
         data class Ok(val entry: SessionEntry) : CreateResult
         data class NotInstalled(val detail: String) : CreateResult
+
+        /** An unexpected exception during session construction (v0.1.8):
+         *  loud in the terminal's error state — the app NEVER dies with
+         *  an uncaught create-path exception. */
+        data class Error(val detail: String) : CreateResult
     }
 
     /**
-     * Creates a session running `$PREFIX/bin/sh` in `$HOME` with the
-     * [TerminalEnv] environment. Fails LOUDLY (never silently) when the
-     * toolchain is not Ready or the shell is absent — the BusyBox binary
-     * ships with the Phase 4 bundle (plan §7.3); until then the terminal
-     * says exactly that.
+     * Creates a session running `$PREFIX/bin/sh` — by default in the
+     * PROJECTS directory (see [projectsRoot]), or [cwd] when given — with
+     * the [TerminalEnv] environment. Fails LOUDLY (never silently) when
+     * the toolchain is not Ready, the shell is absent, or session
+     * construction throws: the exception is captured into the error
+     * state (and a breadcrumb) instead of killing the process.
      */
-    fun createSession(): CreateResult {
+    fun createSession(cwd: File? = null): CreateResult {
         val state = toolchainManager.state.value
         if (state !is ToolchainState.Ready) {
             return CreateResult.NotInstalled("Toolchain not installed")
@@ -143,19 +155,31 @@ class TerminalCenter(
                 "Shell not found at ${shell.absolutePath} — ships with the Phase 4 busybox bundle"
             )
         }
-        val env = TerminalEnv.env(prefix, filesDir)
-        val termSession = TerminalSession(
-            shell.absolutePath,
-            ProcEnv.homeDir(filesDir).absolutePath,
-            TerminalEnv.shellArgs(),
-            env.entries.map { "${it.key}=${it.value}" }.toTypedArray(),
-            transcriptRows,
-            client,
-        )
-        val entry = SessionEntry(nextId.getAndIncrement(), termSession, "sh", false)
-        _sessions.value = _sessions.value + entry
-        TerminalService.ensureRunning(context, _sessions.value.size)
-        return CreateResult.Ok(entry)
+        CrashRecorder.crumb("terminal:create:start")
+        return try {
+            val env = TerminalEnv.env(prefix, filesDir)
+            CrashRecorder.crumb("terminal:create:env-built")
+            val sessionCwd = cwd ?: projectsRoot.apply { mkdirs() }
+            val termSession = TerminalSession(
+                shell.absolutePath,
+                sessionCwd.absolutePath,
+                TerminalEnv.shellArgs(),
+                env.entries.map { "${it.key}=${it.value}" }.toTypedArray(),
+                transcriptRows,
+                client,
+            )
+            CrashRecorder.crumb("terminal:create:session-built")
+            val entry = SessionEntry(nextId.getAndIncrement(), termSession, "sh", false)
+            _sessions.value = _sessions.value + entry
+            TerminalService.ensureRunning(context, _sessions.value.size)
+            CrashRecorder.crumb("terminal:create:fgs-started")
+            CreateResult.Ok(entry)
+        } catch (e: Exception) {
+            CrashRecorder.crumb("terminal:create:threw:${e.javaClass.simpleName}")
+            CreateResult.Error(
+                "session create failed: ${e.message ?: e.javaClass.simpleName}"
+            )
+        }
     }
 
     /**

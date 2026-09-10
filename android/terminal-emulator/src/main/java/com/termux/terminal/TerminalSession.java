@@ -450,7 +450,14 @@ public final class TerminalSession extends TerminalOutput {
             descriptorField.set(result, fileDescriptor);
         } catch (NoSuchFieldException | IllegalAccessException | IllegalArgumentException e) {
             Logger.logStackTraceWithMessage(client, LOG_TAG, "Error accessing FileDescriptor#descriptor private field", e);
-            System.exit(1);
+            // RustDroid fix (v0.1.8): upstream called System.exit(1) here —
+            // a SILENT instant process kill with no crash dialog and no
+            // reportable trace. The app's crash recorder can never see a
+            // System.exit. Thrown instead: the failure stays fatal for the
+            // session (the fd genuinely cannot be wrapped) but is caught,
+            // persisted and surfaced like every other crash.
+            throw new RuntimeException("Cannot wrap fd " + fileDescriptor
+                    + " — java.io.FileDescriptor#descriptor reflection failed", e);
         }
         return result;
     }

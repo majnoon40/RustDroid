@@ -72,7 +72,11 @@ class TerminalService : Service() {
 
     companion object {
         private const val CHANNEL_ID = "terminal"
-        private const val NOTIF_ID = 42
+
+        /** Distinct from ToolchainInstallService's 42 — the two services can
+         *  run concurrently (download while a terminal is open) and one
+         *  notify(42, …) would clobber the other's ongoing state. */
+        private const val NOTIF_ID = 43
 
         /** Starts the service when the live session count is ≥ 1. */
         fun ensureRunning(context: Context, liveSessions: Int) {

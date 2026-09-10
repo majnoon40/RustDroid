@@ -31,6 +31,7 @@ class TerminalViewModel(val center: TerminalCenter) : ViewModel() {
         when (val result = center.createSession()) {
             is TerminalCenter.CreateResult.Ok -> _currentId.value = result.entry.id
             is TerminalCenter.CreateResult.NotInstalled -> _lastCreateError.value = result.detail
+            is TerminalCenter.CreateResult.Error -> _lastCreateError.value = result.detail
         }
     }
 

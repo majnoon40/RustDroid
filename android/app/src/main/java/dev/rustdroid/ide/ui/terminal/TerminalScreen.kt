@@ -185,10 +185,17 @@ private fun TerminalPane(
 ) {
     val context = LocalContext.current
 
-    val view = remember(context) {
+    val view = remember(context, ctrlState) {
         TerminalView(context, null).apply {
             isFocusable = true
             isFocusableInTouchMode = true
+            // v0.1.8 hardening: set the client HERE, at creation — not in a
+            // post-composition effect. The vendored view invokes
+            // mClient.onEmulatorSet() from its first updateSize() (which
+            // can run during THIS frame's layout pass, before a
+            // LaunchedEffect fires); a null client there is an NPE that
+            // killed the app the instant a session opened.
+            setTerminalViewClient(RdViewClient(this, ctrlState))
         }
     }
 
@@ -199,8 +206,13 @@ private fun TerminalPane(
     }
 
     LaunchedEffect(entry.session) {
-        view.setTerminalViewClient(RdViewClient(view, ctrlState))
+        // Breadcrumbs bracket the attach — the vendored session forks on
+        // first size (inside attach → layout), and a native death in that
+        // window is only localizable through them (the crash recorder
+        // covers the Java side).
+        dev.rustdroid.ide.runtime.CrashRecorder.crumb("terminal:view-attach")
         view.attachSession(entry.session)
+        dev.rustdroid.ide.runtime.CrashRecorder.crumb("terminal:view-attached")
         view.requestFocus()
     }
 
@@ -322,7 +334,10 @@ private fun EmptyState(
                 )
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    "Sessions run $PREFIX_LITERAL/bin/sh in your home directory.",
+                    "Sessions run $PREFIX_LITERAL/bin/sh in your projects " +
+                        "directory — cd into a project and run cargo build, " +
+                        "cargo run or cargo fetch directly (rustc, cargo and " +
+                        "the CA bundle are all on the session's PATH).",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

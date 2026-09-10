@@ -1111,3 +1111,54 @@ AArch64 busybox.
   118,262,640 bytes). Downloads are integrity-pinned end to end.
 - versionCode 8 / versionName 0.1.7 so the fixed build is identifiable
   on the device.
+
+## 12. Terminal on-device bring-up hotfix + crash flight recorder (2026-09-10, v0.1.8)
+
+First on-device terminal session open (user report, Android device,
+toolchain verified Ready): "opening a terminal session instantly closes
+the app". No reproducible environment here (no emulator/KVM), so this
+iteration pairs a forensic audit of the entire bring-up path with an
+in-app flight recorder that makes the next occurrence self-diagnosing —
+in the app, with zero external files.
+
+Audit results (all verified by reading the full chain: Gate → Home →
+TerminalScreen → TerminalViewModel → TerminalCenter → vendored
+TerminalSession/TerminalView/termux.c):
+
+- **JNI surface**: all 6 `Java_com_termux_terminal_JNI_*` symbols present
+  in the shipped librustdroidpty.so (readelf on the APK's copy); the 5
+  declared natives all resolve. Not the failure.
+- **Fixed: null-view-client window (TerminalScreen)** — the vendored view
+  can invoke `mClient.onEmulatorSet()` from its first `updateSize()`
+  during the frame's layout pass; the client was only set in a
+  post-composition `LaunchedEffect`. An NPE in that window is an instant
+  app death exactly matching the report. The client is now set at view
+  creation (inside the `remember` block).
+- **Fixed: upstream `System.exit(1)` (TerminalSession.wrapFileDescriptor,
+  vendored)** — the FileDescriptor reflection fallback killed the process
+  SILENTLY on failure (no dialog, no reportable trace). Replaced with a
+  thrown RuntimeException (recorded in THIRD_PARTY.md). If this ever
+  fires on a device, it is now caught, persisted and surfaced.
+- **Fixed: notification-ID collision** — TerminalService reused
+  ToolchainInstallService's id 42; a concurrent download + terminal
+  clobbered each other's ongoing notifications. Now 43.
+- **Hardened: createSession never kills the process** — TerminalCenter
+  wraps session construction in runCatching → new
+  `CreateResult.Error(detail)` surfaced in the terminal's existing error
+  state (loud, never silent, never fatal).
+- **Flight recorder (CrashRecorder, new)** — default
+  uncaught-exception handler persists thread + exception + cause chain +
+  stack + breadcrumb ring to files/last-crash.txt, then CHAINS to the
+  platform handler; next launch shows an in-app dialog (AppRoot) with
+  Copy/Dismiss. Breadcrumbs bracket every risky step
+  (create:start/env-built/session-built/fgs-started, view-attach/
+  view-attached) — the fork happens between view-attach and first draw,
+  so even a NATIVE death (uncatchable in Java) is localized by the last
+  written breadcrumb. 5 JVM tests pin the persistence contract
+  (234 total).
+- **Workflow (the PyDroid-style ask)**: new sessions now start in the
+  PROJECTS directory (files/projects) instead of the empty $HOME —
+  `cd <project> && cargo run / cargo fetch` work directly (PATH leads
+  with $PREFIX/bin; CARGO_HOME/CA channels unchanged, all absolute).
+  HOME remains $RUSTDROID_HOME via env. TerminalScreen's empty state
+  now says exactly this.

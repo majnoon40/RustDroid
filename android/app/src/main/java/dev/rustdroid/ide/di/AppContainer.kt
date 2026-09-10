@@ -72,7 +72,9 @@ class AppContainer(val context: Context) {
 
     /** Phase 4: process-wide terminal session registry (plan §8.1). */
     val terminalCenter: dev.rustdroid.ide.runtime.terminal.TerminalCenter by lazy {
-        dev.rustdroid.ide.runtime.terminal.TerminalCenter(context, toolchainManager)
+        dev.rustdroid.ide.runtime.terminal.TerminalCenter(
+            context, toolchainManager, projectsRoot,
+        )
     }
 
     /** SAF folder-pick → real path (open-folder-as-project glue). */
