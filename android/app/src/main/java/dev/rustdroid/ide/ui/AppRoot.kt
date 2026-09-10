@@ -21,10 +21,12 @@ import dev.rustdroid.ide.ui.editor.EditorScreen
 import dev.rustdroid.ide.ui.gate.GateScreen
 import dev.rustdroid.ide.ui.home.HomeScreen
 import dev.rustdroid.ide.ui.settings.SettingsScreen
+import dev.rustdroid.ide.ui.terminal.TerminalScreen
 
 object Routes {
     const val GATE = "gate"
     const val HOME = "home"
+    const val TERMINAL = "terminal"
 
     /**
      * The project argument is a REF, not just a name: internal projects are
@@ -100,7 +102,13 @@ fun AppRoot(
                 container,
                 onOpenProject = { ref -> nav.navigate(Routes.editor(ref)) },
                 onOpenSettings = { nav.navigate(Routes.SETTINGS) },
+                onOpenTerminal = { nav.navigate(Routes.TERMINAL) },
             )
+        }
+        composable(Routes.TERMINAL) {
+            // A first-class destination (plan §8.1): a character-grid
+            // terminal — NOT a mode of the Editor console.
+            TerminalScreen(container, onBack = { nav.popBackStack() })
         }
         composable(
             Routes.EDITOR,

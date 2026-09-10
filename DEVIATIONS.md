@@ -922,3 +922,54 @@ implementation log (appended as terminal-layer tests land).
 - Local totals: terminal-emulator **150/0**, app **212/0** (193
   pre-existing + 8 ProcTree session/tty/union tests + 11 controller
   Recorder tests), `:app:assembleDebug` green.
+
+**Step 4 — TerminalEnv + session layer + UI + FGS (2026-09-10)**:
+
+- **`TerminalEnv`** (plan §8.2): derived from — never duplicating —
+  `ProcEnv`; the ONE delta is `TERM=xterm-256color` (the vendored
+  emulator implements the xterm 256-color subset; `dumb` would disable
+  half the toolchain's output). Table-driven JVM test
+  (`TerminalEnvTest`, 8 tests): every shared channel
+  string-identical to ProcEnv (one source of truth), TERM is the ONLY
+  difference, CA-file channels carry through, no `SSL_CERT_DIR`
+  (CApath lesson), PATH gains nothing, `CARGO_TERM_COLOR=never` stays.
+- **Vendored `TerminalSession.java` restructured** (plan §5.3/P1-4,
+  recorded in THIRD_PARTY.md): the reader now polls {master fd,
+  wakeup pipe} via `Os.poll` — teardown wakes it through the pipe
+  (`requestReaderStop()`), joins it bounded (`joinReader()`), and only
+  then does the I/O owner close the master (`closeMasterFd()`,
+  idempotent) — the upstream main-thread close under a potentially
+  watching reader (the fd-reuse use-after-close) is REMOVED from
+  `cleanupResources`. EIO on the master read is normal session end.
+  New `JNIHelper` (vendored addition): public facade for Os.kill +
+  native killpg, both throwing so Kotlin `runCatching` guards them.
+- **`TerminalCenter`**: process-wide session registry (rotation-proof;
+  the FGS keeps the process alive per §8.3), single-worker I/O-owner
+  dispatcher for every master close + teardown (the fd discipline),
+  `TerminalSessionClient` implementation routing view redraws. Sessions
+  run `$PREFIX/bin/sh` in `$HOME` with the TerminalEnv env; **no silent
+  fallback** — the shell missing (busybox ships in step 5's bundle)
+  fails LOUDLY with an explanatory empty state.
+  **Backpressure (§8.4, hard constraint)**: no unbounded Kotlin-side
+  buffering anywhere in this layer; the child blocks writing the pts
+  when the reader falls behind; the vendored ByteQueue is bounded
+  (64 KiB) and scrollback is capped (`transcriptRows = 200`).
+- **`TerminalService`** (FGS `dataSync`, ships in v0 per §11.2): starts
+  at ≥ 1 session, stops at 0; notification "Terminal session running";
+  NO session-persistence claim anywhere (§5.4); `dataSync`→`specialUse`
+  migration debt already on the targetSdk-28 list. Manifest declares
+  the service.
+- **`TerminalScreen`/`TerminalViewModel`** (plan §8.1): a first-class
+  destination (`Routes.TERMINAL` from the Home toolbar — NOT a mode of
+  the Editor console); `AndroidView` interop hosting the vendored
+  `TerminalView` following the sora-editor gesture lesson (NO Compose
+  draggable overlays over the interop area — scrolling/selection stay
+  inside the View); v0 session tab strip + per-tab close + FAB new
+  session; extra-keys row (Esc/Tab/one-shot Ctrl via
+  `readControlKey()`/arrows/PgUp/PgDn, §11.4) fixed BELOW the interop
+  area, not floating over it.
+- Local totals: app **220/0** (+8 TerminalEnv tests), terminal-emulator
+  **150/0** (patched TerminalSession compiles; the JVM suite never
+  calls the Android-only threading path), `assembleDebug/Release`
+  green; APK = `lib/arm64-v8a/{librustdroidpty.so,
+  androidx.graphics.path.so}` only.

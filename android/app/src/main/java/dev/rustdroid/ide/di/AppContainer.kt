@@ -70,6 +70,11 @@ class AppContainer(val context: Context) {
     /** ACTION_VIEW .rs intake: reads the source; placement is the user's call. */
     val rsImport: RsImport by lazy { RsImport(context) }
 
+    /** Phase 4: process-wide terminal session registry (plan §8.1). */
+    val terminalCenter: dev.rustdroid.ide.runtime.terminal.TerminalCenter by lazy {
+        dev.rustdroid.ide.runtime.terminal.TerminalCenter(context, toolchainManager)
+    }
+
     /** SAF folder-pick → real path (open-folder-as-project glue). */
     val folderLink: FolderLink by lazy { FolderLink() }
 }

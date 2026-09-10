@@ -5,4 +5,8 @@
     <string name="notif_toolchain_title">Installing Rust toolchain</string>
     <string name="notif_toolchain_body">Preparing your on-device Rust environment…</string>
     <string name="notif_toolchain_done">Rust toolchain ready</string>
+    <string name="notif_channel_terminal">Terminal sessions</string>
+    <string name="notif_terminal_running">Terminal session running</string>
+    <string name="terminal_not_ready_title">Terminal unavailable</string>
+    <string name="terminal_not_ready_body">The shell ($PREFIX/bin/sh) ships with the Phase 4 toolchain bundle.</string>
 </resources>

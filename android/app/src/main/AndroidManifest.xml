@@ -64,5 +64,17 @@
             android:name=".toolchain.ToolchainInstallService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- Phase 4 terminal sessions (plan §8.3). dataSync is correct at
+             targetSdk 28 (type enforcement off); the eventual type is
+             specialUse — recorded as a targetSdk-28 migration blocker in
+             DEVIATIONS.md §10. Keeps the PROCESS alive while ≥ 1 session
+             exists; NOT a claim of session persistence across app death
+             (plan §5.4: app death closes the pty master and the kernel
+             SIGHUPs the foreground process group). -->
+        <service
+            android:name=".runtime.terminal.TerminalService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 </manifest>

@@ -6,6 +6,7 @@ import android.os.Message;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
+import android.system.StructPollfd;
 
 import java.io.File;
 import java.io.FileDescriptor;
@@ -77,6 +78,17 @@ public final class TerminalSession extends TerminalOutput {
 
     final Handler mMainThreadHandler = new MainThreadHandler();
 
+    /**
+     * RustDroid additions (plan §5.3): the reader's wakeup pipe — teardown
+     * writes one byte to [mReaderWakeWrite] so the poll()-ing reader exits
+     * without closing anything under it — plus the reader thread reference
+     * (for a bounded join) and the master-close ownership flag.
+     */
+    private FileDescriptor mReaderWakeRead;
+    private FileDescriptor mReaderWakeWrite;
+    private Thread mReaderThread;
+    private boolean mMasterClosed;
+
     private final String mShellPath;
     private final String mCwd;
     private final String[] mArgs;
@@ -139,22 +151,65 @@ public final class TerminalSession extends TerminalOutput {
 
         final FileDescriptor terminalFileDescriptorWrapped = wrapFileDescriptor(mTerminalFileDescriptor, mClient);
 
-        new Thread("TermSessionInputReader[pid=" + mShellPid + "]") {
+        try {
+            FileDescriptor[] wakePipe = Os.pipe();
+            mReaderWakeRead = wakePipe[0];
+            mReaderWakeWrite = wakePipe[1];
+        } catch (ErrnoException e) {
+            Logger.logStackTraceWithMessage(mClient, LOG_TAG, "pipe() for the reader wakeup failed", e);
+        }
+
+        mReaderThread = new Thread("TermSessionInputReader[pid=" + mShellPid + "]") {
             @Override
             public void run() {
-                try (InputStream termIn = new FileInputStream(terminalFileDescriptorWrapped)) {
-                    final byte[] buffer = new byte[4096];
-                    while (true) {
-                        int read = termIn.read(buffer);
-                        if (read == -1) return;
-                        if (!mProcessToTerminalIOQueue.write(buffer, 0, read)) return;
-                        mMainThreadHandler.sendEmptyMessage(MSG_NEW_INPUT);
+                // RustDroid restructure (plan §5.3 / review P1-4): the
+                // reader polls {master fd, wakeup pipe} instead of blocking
+                // in read(2) — teardown wakes it through the pipe, joins it,
+                // and only then is the master closed (closing under a
+                // blocked read is the fd-reuse use-after-close). EIO after
+                // the child side is gone is NORMAL session end, never an
+                // error (Linux pty semantics).
+                final byte[] buffer = new byte[4096];
+                final byte[] drain = new byte[1];
+                final StructPollfd[] watched = new StructPollfd[2];
+                watched[0] = new StructPollfd();
+                watched[0].fd = terminalFileDescriptorWrapped;
+                watched[0].events = (short) OsConstants.POLLIN;
+                watched[1] = new StructPollfd();
+                watched[1].fd = mReaderWakeRead;
+                watched[1].events = (short) OsConstants.POLLIN;
+                while (true) {
+                    try {
+                        Os.poll(watched, -1);
+                    } catch (Exception e) {
+                        break;
                     }
-                } catch (Exception e) {
-                    // Ignore, just shutting down.
+                    if (watched[1].revents != 0) {
+                        // teardown wakeup: drain and exit without touching
+                        // the master fd — the I/O owner closes it after the join
+                        try { Os.read(mReaderWakeRead, drain, 0, 1); } catch (Exception ignored) { }
+                        break;
+                    }
+                    if (watched[0].revents != 0) {
+                        try {
+                            int read = Os.read(terminalFileDescriptorWrapped, buffer, 0, buffer.length);
+                            if (read > 0) {
+                                if (!mProcessToTerminalIOQueue.write(buffer, 0, read)) return;
+                                mMainThreadHandler.sendEmptyMessage(MSG_NEW_INPUT);
+                            } else {
+                                return; // EOF: child side gone — normal session end
+                            }
+                        } catch (ErrnoException e) {
+                            if (e.errno == OsConstants.EINTR) continue;
+                            return; // EIO and friends: normal session end, never an error
+                        } catch (Exception e) {
+                            return;
+                        }
+                    }
                 }
             }
-        }.start();
+        };
+        mReaderThread.start();
 
         new Thread("TermSessionOutputWriter[pid=" + mShellPid + "]") {
             @Override
@@ -180,6 +235,53 @@ public final class TerminalSession extends TerminalOutput {
             }
         }.start();
 
+    }
+
+    /**
+     * RustDroid addition (plan §5.3): wake the reader thread so it exits
+     * its poll loop (the teardown's "stop the reader" step). Idempotent
+     * and safe after cleanup — the pipe may already be closed, which is
+     * fine: that only means the reader already exited via EIO.
+     */
+    public void requestReaderStop() {
+        try {
+            FileDescriptor wake = mReaderWakeWrite;
+            if (wake != null) Os.write(wake, new byte[]{1}, 0, 1);
+        } catch (Exception ignored) {
+        }
+    }
+
+    /**
+     * RustDroid addition (plan §5.3): join the reader with a bounded
+     * timeout. True when the reader thread has exited.
+     */
+    public boolean joinReader(long timeoutMs) {
+        Thread reader = mReaderThread;
+        if (reader == null) return true;
+        try {
+            reader.join(timeoutMs);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        return !reader.isAlive();
+    }
+
+    /**
+     * RustDroid addition (plan §5.3): the master-fd close, performed by
+     * the session's I/O owner AFTER the reader is joined — never from
+     * the main thread while a reader could still be blocked on the fd
+     * (review P1-4, the fd-reuse use-after-close). Idempotent. Closing
+     * the master is also the kernel-delivered graceful hangup: the
+     * terminal's foreground process group receives SIGHUP.
+     */
+    public void closeMasterFd() {
+        int fd;
+        synchronized (this) {
+            if (mMasterClosed || mTerminalFileDescriptor <= 0) return;
+            mMasterClosed = true;
+            fd = mTerminalFileDescriptor;
+        }
+        JNI.close(fd);
     }
 
     /** Write data to the shell process. */
@@ -261,7 +363,13 @@ public final class TerminalSession extends TerminalOutput {
         // Stop the reader and writer threads, and close the I/O streams
         mTerminalToProcessIOQueue.close();
         mProcessToTerminalIOQueue.close();
-        JNI.close(mTerminalFileDescriptor);
+        // RustDroid restructure (plan §5.3): the master fd is NOT closed
+        // here — upstream closed it from the main thread while the reader
+        // could still be watching it (the fd-reuse use-after-close, review
+        // P1-4). The close is owned by closeMasterFd(), called by the
+        // session's I/O owner after the reader is joined.
+        try { if (mReaderWakeRead != null) Os.close(mReaderWakeRead); } catch (Exception ignored) { }
+        try { if (mReaderWakeWrite != null) Os.close(mReaderWakeWrite); } catch (Exception ignored) { }
     }
 
     @Override

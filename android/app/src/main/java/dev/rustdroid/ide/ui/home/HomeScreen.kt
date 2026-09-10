@@ -64,6 +64,7 @@ fun HomeScreen(
     container: AppContainer,
     onOpenProject: (String) -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenTerminal: () -> Unit = {},
 ) {
     val vm: HomeViewModel = viewModel(factory = HomeViewModel.factory(container))
     val projects by vm.projects.collectAsState()
@@ -119,6 +120,11 @@ fun HomeScreen(
                 actions = {
                     IconButton(onClick = openFolderPicker) {
                         Icon(RdIcons.FolderOpen, contentDescription = "Open folder as project")
+                    }
+                    // Phase 4 terminal (plan §8.1): a first-class destination
+                    // from the Home toolbar.
+                    IconButton(onClick = onOpenTerminal) {
+                        Icon(RdIcons.Terminal, contentDescription = "Open terminal")
                     }
                     IconButton(onClick = onOpenSettings) {
                         Icon(Icons.Filled.Settings, contentDescription = "Settings")
