@@ -973,3 +973,104 @@ implementation log (appended as terminal-layer tests land).
   calls the Android-only threading path), `assembleDebug/Release`
   green; APK = `lib/arm64-v8a/{librustdroidpty.so,
   androidx.graphics.path.so}` only.
+
+**Step 5 — BusyBox build + manifest-v2 bundle + Licenses screen (2026-09-10)**:
+
+- **`busybox/` (source pin, plan §7.2)**: `build.sh` downloads
+  busybox-1.36.1.tar.bz2, SHA-256-pinned from busybox.net's own
+  `.sha256` file (`b8cc24c9…`, re-verified; v1's 1.38.0 pin was
+  upstream-labelled unstable — review P1-6). The pin is the pin: a
+  mismatch fails LOUD, never silently re-pins (the openssl-probe
+  lesson). Patches: Termux's set retargeted `@TERMUX_PREFIX@` →
+  build-time `@RUSTDROID_PREFIX@` (substituted AFTER patching — the
+  `patches/post-vendor/0001` pattern). Dropped from the Termux set, with
+  reasons in `busybox/patches/README.md`: 0000 (build.sh drives clang
+  itself), 0007-0009 + 0011 (ftpd/httpd/tftp/tc — applets disabled),
+  0015 (SELinux off — static), 0016 (yescrypt patch targets ≥1.37
+  code that 1.36.1 does not have). 0002 carried with its telnetd.c
+  hunk removed (dead applet, stale 1.38 context would fail the FATAL
+  apply). NEW `0017-rd-bionic-syscalls`: NDK r27c bionic provides
+  getsid/sethostname/adjtimex, duplicating busybox's ANDROID wrappers
+  at static-link time (ld.lld duplicate-symbol) — the wrappers are
+  removed, pivot_root keeps its wrapper; an NDK bump fails loudly
+  either way. `oldconfig` (not olddefconfig — 1.36.1 has none; `yes ''
+  |` with a local pipefail exception for the expected SIGPIPE death of
+  `yes`) resolves the 1.38.0-flavored Termux template symbols.
+- **Config defect found and fixed mid-step (regression-pinned)**: the
+  Termux-derived template carried network applets plan §7.2 (condition
+  9) drops. First audit pass: TFTP, NTPD, RDATE, NETCAT (Termux's
+  1.38.0 symbol; 1.36.1's NC was already off). Second pass, from the
+  built binary's applet table, caught four more the symbol audit
+  missed: SENDMAIL (SMTP client), UDPSVD (UDP superserver), WHOIS
+  (client), POPMAILDIR (POP3 client) + FEATURE_CROND_CALL_SENDMAIL.
+  All dropped; `build.sh` now asserts BOTH directions post-oldconfig
+  (check_on for the shell pins, check_off for 31 network symbols —
+  the negative form survives symbol renames and kconfig dropping
+  unknown symbols). Proven the repo way: re-enabling CONFIG_TFTP in
+  the input config makes the build die with exit 1 at
+  "config drift: CONFIG_TFTP is ENABLED".
+- **Kept-vs-dropped classification (stated, not silent — the plan's
+  "…" resolved by its own rationale)**: applets that CONNECT to or
+  RESOLVE network hosts are dropped (static bionic has no dynamic
+  NSS/DNS path — "wget is broken" reports are worse than no wget);
+  purely-local network-admin tools are KEPT: ifconfig, route, ip,
+  netstat, arp (+ crond/crontab/makemime/reformime, all local). The
+  final binary's applet table was string-audited: 29 network
+  client/server names absent, sh/ash/vi/env/ls + local admin applets
+  present.
+- **End-to-end local build (same NDK r27c pin as CI)**: 1,286,680
+  bytes, static AArch64 ELF, no PT_INTERP, no DT_NEEDED, applet smoke
+  (sh/ash/vi/ls/env) green. `busybox.yml` (decoupled from main.yml,
+  plan §9: a config line must never cost a 2.5 h toolchain rebuild):
+  manual dispatch + push under `busybox/**`, NDK r27c, artifact
+  `rustdroid-busybox-aarch64` (binary + its sha256).
+- **Manifest v2 (plan §7.3)**: `BundleManifest` gains a `busybox`
+  `ComponentInfo` (file/sha256/size — the same per-entry discipline as
+  the tarballs) and a `symlinks` list (`SymlinkSpec`: name + target).
+  `ArtifactExtractor` installs the busybox payload to
+  `$PREFIX/bin/busybox` (exec mode, manifest-sha256-verified) and
+  creates the symlinks through the P2-8 guard: `Fs.resolveChild`
+  (lexical: no absolute, no `..`) AND `Fs.requireInside` (canonical
+  containment) on the link path, plus target-resolution containment
+  — every rejection is LOUD and install-blocking, never
+  warn-and-continue, never an empty-file placeholder. A v1-tag bundle
+  carrying v2 payloads is REJECTED (never install bytes the pinned
+  manifest does not describe); a v2-expecting app on a v1 manifest
+  fails naming busybox. Zip entries can't carry symlinks portably —
+  that is why the manifest owns them. `ToolchainDistro`: tag
+  `toolchain-1.85.0-aarch64-bb1.36.1` (self-describing), expectedEntries
+  + "busybox", `SHA256` intentionally empty until the busybox-carrying
+  release exists (the pin blocks downloads of the old bundle, whose
+  layout this app version can no longer accept; dev builds set "").
+  `ToolchainPaths` gains busybox/sh/ash.
+- **Verifier extension (plan §6.5)**: three new install-time checks —
+  busybox present/executable/static-AArch64-no-PT_INTERP (pure-Kotlin
+  64-byte ELF header + program-header parse; the INVERSE of the
+  toolchain's PT_INTERP-required check), `busybox sh -c 'echo ok'`
+  through the EXACT TerminalEnv the terminal sessions use, and
+  sh/ash-symlinks-resolve-to-busybox. Failures block Ready with
+  actionable messages. The pty round-trip smoke stays on the §6.6
+  on-device checklist (interactive bring-up) — the verifier stays a
+  pure install-time gate.
+- **GPL-2.0 surface (plan §7.4/§7.5)**:
+  `LICENSES/busybox-GPL-2.0.txt` (provenance header + license) and
+  the upstream LICENSE verbatim in `assets/licenses/`. Settings →
+  Licenses: list (component, license, pin, upstream URL) with full
+  text on tap, from `LICENSE_INDEX.json`; the BusyBox row carries the
+  REQUIRED source-asset URL (`busybox-1.36.1-src.zip` on the same
+  release as the bundle) as always-visible content, not buried behind
+  the tap — the bundle reaches recipients through the app's own
+  downloader, not the release page. `publish-release.yml` consumes
+  the busybox artifact (latest successful busybox.yml run, sha
+  re-verified at publish time — never trust transit), assembles the
+  v2 bundle (busybox + symlinks in the manifest, busybox payload in
+  the zip), builds `busybox-1.36.1-src.zip` (pristine tarball + our
+  config + patches + build script — the complete corresponding
+  source, GPL §7.4), and covers all three assets in SHA256SUMS.txt.
+- Local totals: app **226/0** (1 pre-existing skip; +6 manifest-v2
+  tests: busybox+symlinks install, `../../etc/passwd`, absolute
+  `/data/local/tmp/x`, deep `../`-chain escape, sha mismatch,
+  v1-drift), terminal-emulator 150/0, terminal-view (no JVM tests,
+  upstream has none), `assembleDebug/Release` green; APK =
+  `lib/arm64-v8a/` only, `assets/licenses/` embedded. CI: steps 1-4
+  green (faf6efd = step 4, run 34464468685).

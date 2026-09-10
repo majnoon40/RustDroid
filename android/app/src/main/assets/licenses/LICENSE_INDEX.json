@@ -1,0 +1,60 @@
+[
+  {
+    "component": "sora-editor (editor + language-textmate)",
+    "license": "LGPL-2.1",
+    "file": "sora-editor-LGPL-2.1.txt",
+    "url": "https://github.com/Rosemoe/sora-editor",
+    "pin": "Maven io.github.Rosemoe.sora-editor:0.23.6"
+  },
+  {
+    "component": "VS Code Rust TextMate grammar + themes",
+    "license": "MIT",
+    "file": "textmate-MIT.txt",
+    "url": "https://github.com/rust-lang/vscode-rust",
+    "pin": "vendored assets"
+  },
+  {
+    "component": "Mozilla CA root store (cacert.pem)",
+    "license": "MPL-2.0",
+    "file": "mozilla-ca-MPL-2.0.txt",
+    "url": "https://curl.se/ca/cacert.pem",
+    "pin": "periodically refreshed"
+  },
+  {
+    "component": "Rust (rustc, cargo, rust-std)",
+    "license": "MIT OR Apache-2.0",
+    "file": "textmate-MIT.txt",
+    "file2": "Apache-2.0.txt",
+    "url": "https://github.com/rust-lang/rust",
+    "pin": "tag 1.85.0"
+  },
+  {
+    "component": "Termux terminal-emulator (vendored source)",
+    "license": "Apache-2.0",
+    "file": "terminal-emulator-Apache-2.0.txt",
+    "url": "https://github.com/termux/termux-app",
+    "pin": "commit 3b66f8799635a4dba4a206563048ff0e6792c487 (origin: jackpal/Android-Terminal-Emulator)"
+  },
+  {
+    "component": "Termux terminal-view (vendored source)",
+    "license": "Apache-2.0",
+    "file": "terminal-emulator-Apache-2.0.txt",
+    "url": "https://github.com/termux/termux-app",
+    "pin": "commit 3b66f8799635a4dba4a206563048ff0e6792c487"
+  },
+  {
+    "component": "BusyBox (separate static executable, mere aggregation)",
+    "license": "GPL-2.0",
+    "file": "busybox-GPL-2.0.txt",
+    "url": "https://busybox.net",
+    "pin": "1.36.1 (SHA-256 b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314)",
+    "sourceAssetUrl": "https://github.com/majnoon40/RustDroid/releases/download/toolchain-1.85.0-aarch64-bb1.36.1/busybox-1.36.1-src.zip"
+  },
+  {
+    "component": "Kotlin / Compose / AndroidX / OkHttp / commons-compress / XZ / tomlj",
+    "license": "Apache-2.0",
+    "file": "Apache-2.0.txt",
+    "url": "https://developer.android.com/jetpack/androidx",
+    "pin": "see android/gradle/libs.versions.toml"
+  }
+]

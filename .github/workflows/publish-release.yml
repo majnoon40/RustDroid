@@ -21,7 +21,7 @@ on:
       tag:
         description: 'Release tag'
         required: false
-        default: 'toolchain-1.85.0-aarch64'
+        default: 'toolchain-1.85.0-aarch64-bb1.36.1'
 
 permissions:
   contents: write
@@ -32,6 +32,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Checkout
+        # For the busybox source asset (plan §7.4): busybox/ and LICENSES/
+        # at the pinned commit are release inputs. Everything else comes
+        # from the Actions artifacts API.
+        uses: actions/checkout@v4
+
       - name: Resolve the source run + artifact
         env:
           GH_TOKEN: ${{ github.token }}
@@ -76,6 +82,32 @@ jobs:
           echo "=== dist contents ==="
           ls -la dist/
 
+      # Phase 4 (plan §9): consume the busybox artifact from the latest
+      # successful busybox.yml run — decoupled from main.yml so bundle
+      # iteration never costs a 2.5 h toolchain rebuild.
+      - name: Download BusyBox artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BB_RUN_ID=$(gh api "repos/${{ github.repository }}/actions/workflows/busybox.yml/runs?status=success&per_page=1" --jq '.workflow_runs[0].id')
+          echo "busybox from run #$BB_RUN_ID"
+          gh api "repos/${{ github.repository }}/actions/runs/$BB_RUN_ID/artifacts" > bb-arts.json
+          BB_ART_ID=$(jq -r '.artifacts[]? | select(.name=="rustdroid-busybox-aarch64") | .id' bb-arts.json | head -1)
+          if [ -z "$BB_ART_ID" ] || [ "$BB_ART_ID" = "null" ]; then
+            echo "no rustdroid-busybox-aarch64 artifact — run busybox.yml first"; exit 1
+          fi
+          gh api "repos/${{ github.repository }}/actions/artifacts/$BB_ART_ID/zip" > bb.zip
+          mkdir -p busybox-dist && unzip -q bb.zip -d busybox-dist/
+          ls -la busybox-dist/
+          # verify again at publish time (fail loud, never trust transit)
+          [ -f busybox-dist/busybox ] || { echo "busybox binary missing"; exit 1; }
+          ACTUAL=$(sha256sum busybox-dist/busybox | awk '{print $1}')
+          PINNED=$(awk '{print $1}' busybox-dist/busybox.sha256)
+          if [ "$ACTUAL" != "$PINNED" ]; then
+            echo "busybox sha mismatch at publish: expected $PINNED got $ACTUAL"; exit 1
+          fi
+
       - name: Build the app bundle (subset the app installs)
         run: |
           set -euo pipefail
@@ -87,6 +119,7 @@ jobs:
             [ -f "$f" ] || { echo "MISSING from dist: $f"; exit 1; }
           done
           [ -d rustdroid-link ] || { echo "MISSING from dist: rustdroid-link/"; exit 1; }
+          [ -f ../busybox-dist/busybox ] || { echo "MISSING busybox"; exit 1; }
 
           # per-component sha256 for the manifest
           sha_of() { sha256sum "$1" | awk '{print $1}'; }
@@ -94,12 +127,14 @@ jobs:
           CARGO_SHA=$(sha_of "$CARGO_TAR"); CARGO_SZ=$(stat -c%s "$CARGO_TAR")
           STD_SHA=$(sha_of "$STD_TAR"); STD_SZ=$(stat -c%s "$STD_TAR")
           LIBCXX_SHA=$(sha_of libc++_shared.so); LIBCXX_SZ=$(stat -c%s libc++_shared.so)
+          BB_SHA=$(sha_of ../busybox-dist/busybox); BB_SZ=$(stat -c%s ../busybox-dist/busybox)
           KIT_FILES=$(find rustdroid-link -type f | wc -l)
 
           cat > rustdroid-app-bundle.json <<EOF
           {
-            "format": 1,
+            "format": 2,
             "rust_version": "1.85.0",
+            "busybox_version": "1.36.1",
             "target": "aarch64-linux-android",
             "created": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
             "source_run": ${{ env.RUN_ID }},
@@ -110,23 +145,52 @@ jobs:
               "rust-std":  { "file": "$STD_TAR",    "sha256": "$STD_SHA",   "size": $STD_SZ },
               "libcxx":    { "file": "libc++_shared.so", "sha256": "$LIBCXX_SHA", "size": $LIBCXX_SZ },
               "kit":       { "file": "rustdroid-link", "sha256": "", "size": $KIT_FILES }
-            }
+            },
+            "busybox":   { "file": "busybox", "sha256": "$BB_SHA", "size": $BB_SZ },
+            "symlinks": [
+              { "name": "bin/sh",  "target": "busybox" },
+              { "name": "bin/ash", "target": "busybox" }
+            ]
           }
           EOF
           cat rustdroid-app-bundle.json
 
+          cp ../busybox-dist/busybox .
           cd ..
           # STORED (no recompression): contents are already xz-compressed.
           (cd dist && zip -0 -r ../rustdroid-app-bundle-aarch64.zip \
             "$RUSTC_TAR" "$CARGO_TAR" "$STD_TAR" \
-            libc++_shared.so rustdroid-app-bundle.json rustdroid-link/)
+            libc++_shared.so busybox rustdroid-app-bundle.json rustdroid-link/)
           # full dist zip gets a stable name
           cp full-dist.zip rustdroid-toolchain-aarch64.zip
           ls -la *.zip
 
+      # GPL-2.0 §7.4 / plan §7.4: complete corresponding source for the
+      # exact shipped busybox — the pristine tarball + our config +
+      # patches + build script (the inputs that deterministically produce
+      # the shipped binary). The checkout from the workflow start provides
+      # busybox/ and LICENSES/ at the pinned commit.
+      - name: Build BusyBox source asset (GPL corresponding source)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o busybox-1.36.1.tar.bz2 https://busybox.net/downloads/busybox-1.36.1.tar.bz2
+          ACTUAL=$(sha256sum busybox-1.36.1.tar.bz2 | awk '{print $1}')
+          if [ "$ACTUAL" != "b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314" ]; then
+            echo "busybox tarball sha256 mismatch — refusing to publish"; exit 1
+          fi
+          mkdir -p busybox-src/busybox
+          cp busybox-1.36.1.tar.bz2 busybox-src/
+          cp busybox/busybox.config busybox-src/busybox/
+          cp busybox/patches/*.patch busybox-src/busybox/
+          cp busybox/build.sh busybox-src/busybox/
+          cp LICENSES/busybox-GPL-2.0.txt busybox-src/
+          (cd busybox-src && zip -q -r ../busybox-1.36.1-src.zip .)
+          unzip -l busybox-1.36.1-src.zip
+
       - name: Checksums
         run: |
-          sha256sum rustdroid-app-bundle-aarch64.zip rustdroid-toolchain-aarch64.zip | tee SHA256SUMS.txt
+          sha256sum rustdroid-app-bundle-aarch64.zip rustdroid-toolchain-aarch64.zip \
+            busybox-1.36.1-src.zip | tee SHA256SUMS.txt
 
       - name: Upload release assets
         env:
@@ -137,13 +201,14 @@ jobs:
           # create release if missing (idempotent)
           gh release view "$TAG" --repo "${{ github.repository }}" 2>/dev/null || \
             gh release create "$TAG" --repo "${{ github.repository }}" \
-              --title "RustDroid toolchain 1.85.0 (aarch64-linux-android)" \
+              --title "RustDroid toolchain 1.85.0 + busybox 1.36.1 (aarch64-linux-android)" \
               --prerelease \
-              --notes "Self-hosting Rust toolchain for aarch64 Android. See the app (android/) for the installable IDE."
+              --notes "Self-hosting Rust toolchain and busybox shell for aarch64 Android. See the app (android/) for the installable IDE."
 
           gh release upload "$TAG" \
             rustdroid-app-bundle-aarch64.zip \
             rustdroid-toolchain-aarch64.zip \
+            busybox-1.36.1-src.zip \
             SHA256SUMS.txt \
             --clobber --repo "${{ github.repository }}"
 

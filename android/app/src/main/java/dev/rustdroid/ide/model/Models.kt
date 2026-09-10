@@ -1,6 +1,7 @@
 package dev.rustdroid.ide.model
 
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.builtins.ListSerializer
 
 /** Which stream a console line came from. */
 enum class Stream { STDOUT, STDERR, SYSTEM }
@@ -141,6 +142,9 @@ data class BundleManifest(
     val source_run: Long = 0,
     val source_commit: String = "",
     val components: Map<String, ComponentInfo> = emptyMap(),
+    /** Manifest v2 (Phase 4 / plan §7.3): busybox + guarded symlinks. */
+    val busybox: ComponentInfo? = null,
+    val symlinks: List<SymlinkSpec> = emptyList(),
 ) {
     @Serializable
     data class ComponentInfo(
@@ -148,8 +152,37 @@ data class BundleManifest(
         val sha256: String = "",
         val size: Long = 0,
     )
+
+    /**
+     * A manifest-v2 symlink: `name` (path under $PREFIX) -> `target`
+     * (path under $PREFIX). Creation is guarded by Fs.resolveChild AND
+     * Fs.requireInside — a traversal attempt fails LOUD and blocks the
+     * install (plan §6.5 / review P2-8).
+     */
+    @Serializable
+    data class SymlinkSpec(
+        val name: String = "",
+        val target: String = "",
+    )
 }
 
 fun parseBundleManifest(json: String): BundleManifest =
     kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
         .decodeFromString(BundleManifest.serializer(), json)
+
+/** One row of the in-app Licenses screen (plan §7.5). */
+@Serializable
+data class LicenseEntry(
+    val component: String = "",
+    val license: String = "",
+    val file: String = "",
+    val file2: String? = null,
+    val url: String = "",
+    val pin: String = "",
+    /** GPL-2.0 source offer (BusyBox): the release-asset URL — required content. */
+    val sourceAssetUrl: String? = null,
+)
+
+fun parseLicenseIndex(json: String): List<LicenseEntry> =
+    kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+        .decodeFromString(ListSerializer(LicenseEntry.serializer()), json)

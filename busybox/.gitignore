@@ -1,0 +1,10 @@
+# build.sh working state — the pristine tarball, the extracted source,
+# the binary and the build log are all reproducible from build.sh and
+# never belong in git (the tarball itself ships in the GPL source zip
+# assembled by publish-release.yml at release time).
+busybox-1.36.1.tar.bz2
+busybox-1.36.1/
+busybox-build.log
+busybox
+busybox-test*
+sabotage-test*

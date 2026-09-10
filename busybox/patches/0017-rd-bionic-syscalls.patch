@@ -1,0 +1,32 @@
+--- a/libbb/missing_syscalls.c	2026-09-10 10:23:35.909438186 +0000
++++ b/libbb/missing_syscalls.c	2026-09-10 10:23:35.925438302 +0000
+@@ -10,21 +10,14 @@
+ #if defined(ANDROID) || defined(__ANDROID__)
+ /*# include <linux/timex.h> - for struct timex, but may collide with <time.h> */
+ # include <sys/syscall.h>
+-pid_t getsid(pid_t pid)
+-{
+-	return syscall(__NR_getsid, pid);
+-}
+-
+-int sethostname(const char *name, size_t len)
+-{
+-	return syscall(__NR_sethostname, name, len);
+-}
+-
+-struct timex;
+-int adjtimex(struct timex *buf)
+-{
+-	return syscall(__NR_adjtimex, buf);
+-}
++/*
++ * RustDroid (NDK r27c / API 24 / static): bionic's syscalls-arm64.S now
++ * provides getsid, sethostname and adjtimex, so busybox's unconditional
++ * ANDROID wrappers duplicate them at static link time (ld.lld "duplicate
++ * symbol"). pivot_root is still absent from bionic and keeps its wrapper
++ * below. If the NDK pin ever moves, re-check this list — the build fails
++ * loudly either way (duplicate symbols, or missing pivot_root).
++ */
+ 
+ int pivot_root(const char *new_root, const char *put_old)
+ {

@@ -1,0 +1,65 @@
+# BusyBox build (plan §7.2 / §9): static aarch64-linux-android binary,
+# 1.36.1, SHA-256-pinned from busybox.net's own .sha256 file.
+#
+# DECOUPLED from main.yml on purpose (plan §9): the 2.5 h toolchain build
+# must never run because a busybox config line changed. The artifact
+# (rustdroid-busybox-aarch64) is consumed by publish-release.yml when
+# assembling the app bundle (manifest v2).
+#
+# Triggers: manual dispatch + pushes under busybox/**.
+name: BusyBox build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'busybox/**'
+      - '.github/workflows/busybox.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  busybox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: busybox
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Same NDK pin as the rust toolchain build (env.sh) and the app's
+      # vendored modules: r27c = 27.2.12479018.
+      - name: Install Android NDK r27c
+        run: |
+          curl -sSL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          unzip -q /tmp/ndk.zip -d "$HOME"
+          echo "ANDROID_NDK_HOME=$HOME/android-ndk-r27c" >> "$GITHUB_ENV"
+
+      - name: Build (source pin + patches + config asserts)
+        run: |
+          set -euo pipefail
+          chmod +x build.sh
+          # The script verifies the tarball SHA-256 (b8cc24c9…) LOUDLY,
+          # applies the patch set FATAL-ly, asserts the plan §7.2 config
+          # pins post-oldconfig, and checks static-ELF/AArch64/
+          # no-PT_INTERP/no-DT_NEEDED + applet smoke.
+          ./build.sh busybox
+
+      - name: Show binary
+        run: |
+          ls -la busybox
+          file busybox || true
+          sha256sum busybox | tee busybox.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdroid-busybox-aarch64
+          path: |
+            busybox/busybox
+            busybox/busybox.sha256
+          if-no-files-found: error

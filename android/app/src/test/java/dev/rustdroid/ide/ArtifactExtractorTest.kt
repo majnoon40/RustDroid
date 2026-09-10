@@ -57,18 +57,28 @@ class ArtifactExtractorTest {
                 zos.closeArchiveEntry()
             }
 
+            // Manifest v2 (Phase 4 / plan §7.3): busybox + guarded symlinks.
+            val busyboxBytes = "fake-static-busybox".toByteArray()
+            val busyboxSha = java.security.MessageDigest.getInstance("SHA-256")
+                .digest(busyboxBytes).joinToString("") { "%02x".format(it) }
             val manifest = """
                 {
-                  "format": 1,
+                  "format": 2,
                   "rust_version": "1.85.0",
                   "target": "aarch64-linux-android",
                   "created": "2026-09-02T00:00:00Z",
                   "source_run": 26,
                   "source_commit": "2cc5296",
-                  "components": {}
+                  "components": {},
+                  "busybox": { "file": "busybox", "sha256": "$busyboxSha", "size": ${busyboxBytes.size} },
+                  "symlinks": [
+                    { "name": "bin/sh", "target": "busybox" },
+                    { "name": "bin/ash", "target": "busybox" }
+                  ]
                 }
             """.trimIndent().toByteArray()
             put("rustdroid-app-bundle.json", manifest)
+            put("busybox", busyboxBytes, 0b111_101_101)
 
             put(
                 "rustc-1.85.0-aarch64-linux-android.tar.xz",
@@ -204,13 +214,22 @@ class ArtifactExtractorTest {
             extraTarEntries(tar)
         }
         ZipArchiveOutputStream(zip.outputStream()).use { zos ->
+            val bb = "fake-static-busybox".toByteArray()
+            val bbSha = java.security.MessageDigest.getInstance("SHA-256")
+                .digest(bb).joinToString("") { "%02x".format(it) }
             val manifest = """
-                {"format":1,"rust_version":"1.85.0","target":"aarch64-linux-android",
+                {"format":2,"rust_version":"1.85.0","target":"aarch64-linux-android",
                 "created":"2026-09-02T00:00:00Z","source_run":26,"source_commit":"2cc5296",
-                "components":{}}
+                "components":{},
+                "busybox":{"file":"busybox","sha256":"$bbSha","size":${bb.size}},
+                "symlinks":[{"name":"bin/sh","target":"busybox"},{"name":"bin/ash","target":"busybox"}]}
             """.trimIndent().toByteArray()
             zos.putArchiveEntry(ZipArchiveEntry("rustdroid-app-bundle.json"))
             zos.write(manifest)
+            zos.closeArchiveEntry()
+
+            zos.putArchiveEntry(ZipArchiveEntry("busybox"))
+            zos.write(bb)
             zos.closeArchiveEntry()
 
             zos.putArchiveEntry(
@@ -388,4 +407,163 @@ class ArtifactExtractorTest {
         assertTrue(Files.isSymbolicLink(link.toPath()))
         assertEquals("xyz", link.readText())
     }
+
+    // ------------------------------------------------------------------
+    // Manifest v2: busybox + symlink traversal rejection (plan §7.3/§6.5,
+    // review P2-8) — every rejection is LOUD and install-blocking.
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `manifest v2 installs busybox and the sh and ash symlinks`() {
+        val zip = File(tmp.root, "bundle.zip")
+        writeBundle(zip)
+        val filesDir = tmp.newFolder("files-bb")
+        val paths = ToolchainPaths(filesDir)
+        ArtifactExtractor(paths).install(zip)
+
+        val busybox = File(paths.prefix, "bin/busybox")
+        assertTrue("bin/busybox missing", busybox.isFile)
+        assertTrue("bin/busybox not executable", busybox.canExecute())
+        assertEquals("fake-static-busybox", busybox.readText())
+
+        val sh = File(paths.prefix, "bin/sh")
+        val ash = File(paths.prefix, "bin/ash")
+        assertTrue("bin/sh must be a symlink", java.nio.file.Files.isSymbolicLink(sh.toPath()))
+        assertTrue("bin/ash must be a symlink", java.nio.file.Files.isSymbolicLink(ash.toPath()))
+        assertEquals(busybox.canonicalFile, sh.canonicalFile)
+        assertEquals(busybox.canonicalFile, ash.canonicalFile)
+    }
+
+    @Test
+    fun `relative traversal symlink target is rejected loud and install-blocking`() {
+        val bad = writeBundleWithSymlinks("""{ "name": "bin/evil", "target": "../../etc/passwd" }""")
+        val paths = ToolchainPaths(tmp.newFolder("files-trav1"))
+        val e = expectIllegalState { ArtifactExtractor(paths).install(bad) }
+        assertTrue(
+            "failure must name the traversal: " + e.message,
+            e.message!!.contains("escapes the install prefix"),
+        )
+        // install-blocking: nothing was created outside the prefix
+        assertFalse(File(paths.prefix, "bin/evil").exists())
+    }
+
+    @Test
+    fun `absolute symlink target is rejected loud and install-blocking`() {
+        val bad = writeBundleWithSymlinks("""{ "name": "bin/evil", "target": "/data/local/tmp/x" }""")
+        val paths = ToolchainPaths(tmp.newFolder("files-trav2"))
+        val e = expectIllegalState { ArtifactExtractor(paths).install(bad) }
+        assertTrue(e.message!!.contains("escapes the install prefix"))
+        assertFalse(File(paths.prefix, "bin/evil").exists())
+        assertFalse(File("/data/local/tmp/x").exists())
+    }
+
+    @Test
+    fun `symlink-chain escape is rejected loud and install-blocking`() {
+        // A link whose target uses enough ..-hops to exit the prefix via a
+        // DIFFERENT chain shape than the plain relative case (the
+        // ../../../../data/data/com.other/... form from the review).
+        val bad = writeBundleWithSymlinks(
+            """{ "name": "bin/evil2", "target": "../../../../../../data/data/com.other/files/x" }""",
+        )
+        val paths = ToolchainPaths(tmp.newFolder("files-trav3"))
+        val e = expectIllegalState { ArtifactExtractor(paths).install(bad) }
+        assertTrue(e.message!!.contains("escapes the install prefix"))
+    }
+
+    @Test
+    fun `busybox sha mismatch fails the install loud`() {
+        val zip = File(tmp.root, "badsha.zip")
+        // same structure as writeBundle but the manifest's busybox sha
+        // is the hash of DIFFERENT bytes than the zip entry carries
+        ZipArchiveOutputStream(zip.outputStream()).use { zos ->
+            fun put(name: String, data: ByteArray, mode: Int = 0b110_100_100) {
+                val e = ZipArchiveEntry(name)
+                e.externalAttributes = (mode shl 16).toLong()
+                zos.putArchiveEntry(e)
+                zos.write(data)
+                zos.closeArchiveEntry()
+            }
+            val wrongSha = java.security.MessageDigest.getInstance("SHA-256")
+                .digest("different-bytes".toByteArray()).joinToString("") { "%02x".format(it) }
+            put("busybox", "fake-static-busybox".toByteArray(), 0b111_101_101)
+            put(
+                "rustdroid-app-bundle.json",
+                """
+                {
+                  "format": 2, "rust_version": "1.85.0",
+                  "busybox": { "file": "busybox", "sha256": "$wrongSha", "size": 19 },
+                  "symlinks": [ { "name": "bin/sh", "target": "busybox" } ]
+                }
+                """.trimIndent().toByteArray(),
+            )
+        }
+        val paths = ToolchainPaths(tmp.newFolder("files-sha"))
+        val e = expectIllegalState { ArtifactExtractor(paths).install(zip) }
+        assertTrue("failure must name the mismatch: " + e.message, e.message!!.contains("sha256 mismatch"))
+    }
+
+    @Test
+    fun `v2 app expects busybox - a manifest without it is layout drift`() {
+        val zip = File(tmp.root, "v1.zip")
+        // reuse the good bundle but strip the busybox entry from the manifest
+        ZipArchiveOutputStream(zip.outputStream()).use { zos ->
+            fun put(name: String, data: ByteArray, mode: Int = 0b110_100_100) {
+                val e = ZipArchiveEntry(name)
+                e.externalAttributes = (mode shl 16).toLong()
+                zos.putArchiveEntry(e)
+                zos.write(data)
+                zos.closeArchiveEntry()
+            }
+            put(
+                "rustdroid-app-bundle.json",
+                """
+                { "format": 1, "rust_version": "1.85.0", "components": {} }
+                """.trimIndent().toByteArray(),
+            )
+        }
+        val paths = ToolchainPaths(tmp.newFolder("files-v1"))
+        val e = expectIllegalState { ArtifactExtractor(paths).install(zip) }
+        assertTrue(e.message!!.contains("busybox"))
+    }
+
+    /** A good v2 bundle whose symlinks list is replaced by [evilSymlinkJson]. */
+    private fun writeBundleWithSymlinks(evilSymlinkJson: String): File {
+        val good = File(tmp.root, "good.zip")
+        writeBundle(good)
+        val zip = File(tmp.root, "trav-${System.nanoTime()}.zip")
+        ZipArchiveOutputStream(zip.outputStream()).use { zos ->
+            val zis = org.apache.commons.compress.archivers.zip.ZipArchiveInputStream(good.inputStream())
+            while (true) {
+                val entry = zis.nextZipEntry ?: break
+                val data = zis.readBytes()
+                val out: ByteArray = if (entry.name == "rustdroid-app-bundle.json") {
+                    val text = data.decodeToString()
+                    // swap the whole symlinks array for the evil entry
+                    val start = text.indexOf("\"symlinks\":")
+                    val open = text.indexOf('[', start)
+                    val close = text.indexOf(']', open)
+                    val evil = "\"symlinks\": [ " + evilSymlinkJson + " ]"
+                    (text.substring(0, start) + evil + text.substring(close + 1)).toByteArray()
+                } else {
+                    data
+                }
+                val e = ZipArchiveEntry(entry.name)
+                e.externalAttributes = entry.externalAttributes
+                zos.putArchiveEntry(e)
+                zos.write(out)
+                zos.closeArchiveEntry()
+            }
+            zis.close()
+        }
+        return zip
+    }
+
+    /** JUnit-friendly "must throw IllegalStateException" with the exception returned. */
+    private inline fun expectIllegalState(block: () -> Unit): IllegalStateException =
+        try {
+            block()
+            throw AssertionError("expected IllegalStateException")
+        } catch (e: IllegalStateException) {
+            e
+        }
 }

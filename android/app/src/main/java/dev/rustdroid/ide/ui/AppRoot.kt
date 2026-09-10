@@ -38,6 +38,7 @@ object Routes {
     const val EDITOR = "editor/{project}?file={file}"
     const val DEPS = "deps/{project}"
     const val SETTINGS = "settings"
+    const val LICENSES = "licenses"
 
     fun editor(project: String, file: String = ""): String =
         "editor/${android.net.Uri.encode(project)}?file=${android.net.Uri.encode(file)}"
@@ -157,7 +158,12 @@ fun AppRoot(
                     nav.popBackStack()
                 }
             }
-            SettingsScreen(container)
+            SettingsScreen(container, onOpenLicenses = { nav.navigate(Routes.LICENSES) })
+        }
+        composable(Routes.LICENSES) {
+            // Plan §7.5: the in-app license surface — the BusyBox GPL
+            // source-asset URL is REQUIRED content here.
+            dev.rustdroid.ide.ui.settings.LicensesScreen(onBack = { nav.popBackStack() })
         }
     }
 

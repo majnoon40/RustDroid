@@ -71,6 +71,7 @@ class ArtifactExtractor(
 
         var manifest: dev.rustdroid.ide.model.BundleManifest? = null
         var libcxxDone = false
+        var busyboxDone = false
         var kitEntries = 0
         val kitDest = File(prefix, "lib/rustdroid-link")
 
@@ -89,6 +90,20 @@ class ArtifactExtractor(
                         zis.copyToFile(dest)
                         Fs.applyPosixMode(dest, 0b110_100_100)
                         libcxxDone = true
+                    }
+
+                    // Manifest v2 (plan §7.3): the BusyBox executable —
+                    // a STATIC aarch64 ELF, installed $PREFIX/bin/busybox
+                    // with exec mode. The checksum in the manifest is the
+                    // same per-entry discipline as the tarballs: verified
+                    // by the verifier at Ready-gate time.
+                    name == "busybox" -> {
+                        val dest = Fs.resolveChild(prefix, "bin/busybox")
+                        Fs.requireInside(prefix, dest)
+                        dest.parentFile?.mkdirs()
+                        zis.copyToFile(dest)
+                        Fs.applyPosixMode(dest, 0b111_101_101)
+                        busyboxDone = true
                     }
 
                     name.endsWith(".tar.xz") -> {
@@ -131,6 +146,31 @@ class ArtifactExtractor(
         val m = manifest ?: error(
             "bundle manifest ${ToolchainDistro.MANIFEST_ENTRY} missing — layout drift?"
         )
+
+        // ---- manifest v2: busybox + guarded symlinks (plan §7.3, P2-8) ----
+        // Checked FIRST: a missing busybox entry is a bundle-generation
+        // contract violation (the pinned tag carries -bb1.36.1), more
+        // fundamental than payload completeness — the message must name
+        // busybox even when libc++/kit are also absent.
+        val busyboxRequired = ToolchainDistro.BUSYBOX_BUNDLED
+        if (busyboxRequired) {
+            if (m.busybox == null) {
+                error("bundle manifest v2 missing the busybox entry (expected tag ${ToolchainDistro.RELEASE_TAG})")
+            }
+            if (!busyboxDone) error("bundle missing busybox executable (manifest declares it)")
+            if (m.busybox.sha256.isNotEmpty()) {
+                val actual = hashFile(File(prefix, "bin/busybox"))
+                if (actual != m.busybox.sha256) {
+                    error("busybox sha256 mismatch: manifest ${m.busybox.sha256}, extracted $actual")
+                }
+            }
+            installManifestSymlinks(prefix, m.symlinks)
+        } else if (busyboxDone || m.symlinks.isNotEmpty()) {
+            // A v1-tag bundle that carries v2 payloads — reject: never
+            // install bytes the pinned manifest does not describe.
+            error("bundle carries busybox/symlinks but the pinned tag is pre-busybox — layout drift")
+        }
+
         if (!libcxxDone) error("bundle missing libc++_shared.so (runtime dep of rustc/cargo)")
         if (kitEntries == 0) error("bundle has no rustdroid-link/ kit folder")
 
@@ -163,6 +203,54 @@ class ArtifactExtractor(
         "cargo-${ToolchainDistro.RUST_VERSION}-aarch64-linux-android.tar.xz",
         "rust-std-${ToolchainDistro.RUST_VERSION}-aarch64-linux-android.tar.xz",
     )
+
+    /**
+     * Manifest-v2 symlink pass (plan §7.3 / review P2-8): every link is
+     * resolved through [Fs.resolveChild] (lexical: no absolute, no `..`)
+     * AND [Fs.requireInside] (canonical containment through existing
+     * symlinked ancestors — the same guard the extractor applies to tar
+     * entries) BEFORE creation. A traversal attempt fails LOUD and is
+     * install-blocking — never warn-and-continue. (Zip entries can't
+     * carry symlinks portably; that is why the manifest owns them.)
+     */
+    private fun installManifestSymlinks(prefix: File, symlinks: List<dev.rustdroid.ide.model.BundleManifest.SymlinkSpec>) {
+        val prefixPath = prefix.canonicalFile.toPath()
+        for (link in symlinks) {
+            if (link.name.isBlank() || link.target.isBlank()) {
+                error("manifest symlink entry with blank name/target — corrupt manifest")
+            }
+            val dest = Fs.resolveChild(prefix, link.name)
+            Fs.requireInside(prefix, dest)
+            // The target must also stay inside the prefix after lexical
+            // resolution (relative to the link's own directory).
+            val targetPath = if (link.target.startsWith("/")) {
+                Paths.get(link.target).normalize()
+            } else {
+                dest.parentFile.toPath().resolve(link.target).normalize()
+            }
+            if (!targetPath.startsWith(prefixPath)) {
+                error(
+                    "manifest symlink '${link.name}' -> '${link.target}' escapes the install " +
+                        "prefix — corrupt bundle, install blocked (plan §6.5)",
+                )
+            }
+            try {
+                Files.deleteIfExists(dest.toPath())
+                Files.createSymbolicLink(dest.toPath(), Paths.get(link.target))
+            } catch (e: java.io.IOException) {
+                // NEVER an empty-file placeholder: a broken symlink fails
+                // loud at install time (the same discipline as tar links).
+                throw IOException(
+                    "cannot create manifest symlink '${link.name}' -> '${link.target}': ${e.message}",
+                    e,
+                )
+            }
+        }
+    }
+
+    private fun hashFile(f: File): String = java.security.MessageDigest.getInstance("SHA-256")
+        .digest(f.readBytes())
+        .joinToString("") { "%02x".format(it) }
 
     /**
      * Streams one dist tarball: every payload entry is

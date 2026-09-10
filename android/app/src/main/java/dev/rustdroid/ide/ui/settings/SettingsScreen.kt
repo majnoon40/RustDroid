@@ -41,7 +41,7 @@ private val HealthyGreen = Color(0xFF4CAF50)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SettingsScreen(container: AppContainer) {
+fun SettingsScreen(container: AppContainer, onOpenLicenses: () -> Unit = {}) {
     val vm: SettingsViewModel = viewModel(factory = SettingsViewModel.factory(container))
     val state by vm.toolchainState.collectAsState()
     val storage by vm.storage.collectAsState()
@@ -154,6 +154,11 @@ fun SettingsScreen(container: AppContainer) {
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    // Plan §7.5: the full per-component license surface —
+                    // including the REQUIRED BusyBox GPL-2.0 source offer.
+                    OutlinedButton(onClick = onOpenLicenses) {
+                        Text("Licenses")
+                    }
                 }
             }
         }

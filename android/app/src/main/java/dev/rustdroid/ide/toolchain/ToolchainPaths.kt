@@ -29,6 +29,15 @@ class ToolchainPaths(val filesDir: File) {
 
     val libcxx: File get() = File(lib, "libc++_shared.so")
 
+    /**
+     * The terminal shell (plan §7.3): busybox is a payload entry the
+     * extractor installs; `sh`/`ash` are manifest-v2 symlinks to it
+     * (created through the Fs.resolveChild + Fs.requireInside guard).
+     */
+    val busybox: File get() = File(bin, "busybox")
+    val sh: File get() = File(bin, "sh")
+    val ash: File get() = File(bin, "ash")
+
     /** Download/import staging area for the bundle zip. */
     val cacheDir: File get() = File(filesDir, "home/cache")
 

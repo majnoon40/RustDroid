@@ -170,6 +170,59 @@ class ToolchainVerifier(
             }
         }
 
+        // ---- Phase 4 (plan §6.5): BusyBox install-time gate ------------
+        // The terminal's shell: present, executable, STATIC AArch64 ELF
+        // (no PT_INTERP — the inverse of the toolchain's PT_INTERP check),
+        // actually EXECUTES through the exact env the terminal will use,
+        // and the sh/ash symlinks resolve. A pty round-trip smoke belongs
+        // to the on-device validation checklist (§6.6: interactive bring-
+        // up) — the live terminal path is exercised by real use, and the
+        // verifier stays a pure install-time gate (recorded in DEVIATIONS).
+        val busybox = File(paths.prefix, "bin/busybox")
+        runCheck("busybox", "busybox present, executable, static AArch64 ELF") {
+            when {
+                !busybox.isFile -> "missing ${busybox.path} — the bundle is pre-busybox?"
+                !busybox.canExecute() -> "${busybox.path} not executable"
+                else -> when (val elf = elfStaticAarch64(busybox)) {
+                    null -> "not an ELF file (magic mismatch)"
+                    is String -> elf // diagnostic from the parser
+                    else -> null // static AArch64, no PT_INTERP
+                }
+            }
+        }
+        runCheck("busybox-sh", "busybox sh -c 'echo ok' runs in the terminal env") {
+            // the EXACT env the terminal session will use (TerminalEnv —
+            // TERM=xterm-256color and the whole ProcEnv channel set)
+            val termEnv = dev.rustdroid.ide.runtime.terminal.TerminalEnv.env(
+                paths.prefix, filesDir, assetProvider = caAssetProvider,
+            )
+            val out = runner.probe(
+                listOf(busybox.absolutePath, "sh", "-c", "echo ok"), termEnv,
+            )
+            if (out.trim() != "ok") "unexpected output: '${out.take(80)}'" else null
+        }
+        runCheck("shell-symlinks", "sh and ash symlinks resolve to busybox") {
+            val sh = File(paths.prefix, "bin/sh")
+            val ash = File(paths.prefix, "bin/ash")
+            when {
+                !java.nio.file.Files.isSymbolicLink(sh.toPath()) ->
+                    "${sh.path} is not a symlink (manifest v2 symlinks pass failed?)"
+                !java.nio.file.Files.isSymbolicLink(ash.toPath()) ->
+                    "${ash.path} is not a symlink"
+                else -> {
+                    val shReal = runCatching { sh.canonicalFile }.getOrNull()
+                    val ashReal = runCatching { ash.canonicalFile }.getOrNull()
+                    when {
+                        shReal != busybox.canonicalFile ->
+                            "bin/sh resolves to ${shReal?.path ?: "(unresolvable)"}, not busybox"
+                        ashReal != busybox.canonicalFile ->
+                            "bin/ash resolves to ${ashReal?.path ?: "(unresolvable)"}, not busybox"
+                        else -> null
+                    }
+                }
+            }
+        }
+
         // 10. THE gate: compile+link+run hello.rs through the real chain
         runCheck("smoke", "smoke test: rustc hello.rs && ./hello") {
             val scratch = paths.scratch.apply { mkdirs() }
@@ -207,6 +260,47 @@ class ToolchainVerifier(
         }
 
         return results
+    }
+
+    /**
+     * Pure-Kotlin ELF check (plan §6.5): null = static AArch64 with no
+     * PT_INTERP; a String = the specific problem. Only the 64-byte ELF64
+     * header + program header table is read — no library dependency.
+     */
+    private fun elfStaticAarch64(f: File): String? {
+        val header = f.inputStream().use { it.readNBytes(64) }
+        if (header.size < 64 || header[0] != 0x7f.toByte() ||
+            header[1] != 'E'.code.toByte() || header[2] != 'L'.code.toByte() ||
+            header[3] != 'F'.code.toByte()
+        ) return "not an ELF file"
+        val machine = ((header[19].toInt() and 0xff) shl 8) or (header[18].toInt() and 0xff)
+        if (machine != 0xb7) return "not AArch64 (e_machine=0x${machine.toString(16)})"
+        fun u16(o: Int) = ((header[o + 1].toInt() and 0xff) shl 8) or (header[o].toInt() and 0xff)
+        fun u64(o: Int): Long {
+            var v = 0L
+            for (b in 0 until 8) v = (v shl 8) or (header[o + (7 - b)].toLong() and 0xff)
+            return v
+        }
+        val off = u64(32)
+        val phentsize = u16(54)
+        val phnum = u16(56)
+        if (phentsize < 56 || phnum <= 0 || phnum > 64) return "implausible program header table"
+        f.inputStream().use { input ->
+            var skipped = 0L
+            while (skipped < off) {
+                val n = input.skip(off - skipped)
+                if (n <= 0) return "cannot seek to program headers"
+                skipped += n
+            }
+            repeat(phnum) {
+                val ph = input.readNBytes(phentsize)
+                if (ph.size < phentsize) return "truncated program header table"
+                val type = ((ph[3].toInt() and 0xff) shl 24) or ((ph[2].toInt() and 0xff) shl 16) or
+                    ((ph[1].toInt() and 0xff) shl 8) or (ph[0].toInt() and 0xff)
+                if (type == 3) return "PT_INTERP present — busybox is not static"
+            }
+        }
+        return null
     }
 
     /** ELF header peek: class + machine. */
