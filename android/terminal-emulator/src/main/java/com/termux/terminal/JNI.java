@@ -6,7 +6,10 @@ package com.termux.terminal;
 final class JNI {
 
     static {
-        System.loadLibrary("termux");
+        // RustDroid divergence (plan §4.2): library renamed from "termux"
+        // to "rustdroidpty"; the Java package and JNI symbol names are
+        // unchanged.
+        System.loadLibrary("rustdroidpty");
     }
 
     /**
@@ -37,5 +40,13 @@ final class JNI {
 
     /** Close a file descriptor through the close(2) system call. */
     public static native void close(int fileDescriptor);
+
+    /**
+     * RustDroid addition (plan §4.5): send a signal to every process in the
+     * process group {@code pgid} via {@code killpg(2)}. Throws a RuntimeException
+     * on failure (e.g. ESRCH if the group no longer exists) — callers wrap this
+     * in runCatching so a teardown race can never crash.
+     */
+    public static native void sendSignalToProcessGroup(int pgid, int sig);
 
 }

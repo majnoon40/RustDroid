@@ -792,3 +792,70 @@ implementation log (appended as terminal-layer tests land).
   `LOCAL_MODULE libtermux` and `JNI.java`
   `System.loadLibrary("termux")` — the `librustdroidpty` rename is
   step 2, by plan §12.2 ordering.
+
+**Step 2 — JNI defect fixes + fork-window restructure + host harness
+(2026-09-10)**:
+
+- `termux.c` rewritten per plan §4.3/§4.4/§4.5 (full patch set in the
+  file's header comment + THIRD_PARTY.md's file-by-file table):
+  defect 1 (release pairing), defect 2 (fd leaks on all three failure
+  paths), defect 3 (argv/envp early-return leaks, single-exit cleanup
+  with zeroed arrays so partially-built marshalling is safely
+  releasable), async-signal-safe child path `rd_child_exec` (between
+  `RD_CHILD_PATH` markers, whitelist-grepped in CI), parent-side
+  pre-scan of `/proc/self/fd`, parent-side executable resolution
+  (absolute / cwd-anchored / PATH search; loud failure, never a silent
+  child death), execve with wholesale envp, `_exit(127)` on exec
+  failure, `RD_FORK`/`RD_GRANTPT`/`RD_MALLOC` test seams (libc
+  defaults in production builds).
+- **`close_range` is nowhere in the child path** — the pre-scanned
+  close-list is the only fd-cleanup mechanism (P0-2, deliberate).
+  The never-probe-from-the-parent trap is recorded in the plan.
+- Library renamed: `Android.mk` `LOCAL_MODULE librustdroidpty`,
+  `JNI.java` `System.loadLibrary("rustdroidpty")`; Java package and
+  JNI symbol names unchanged. APK verified to contain exactly
+  `lib/arm64-v8a/librustdroidpty.so` (no `libtermux.so`).
+- `sendSignalToProcessGroup(pgid, sig)` → `killpg(2)` added to
+  `termux.c` + `JNI.java` (plan §4.5); throws RuntimeException with
+  errno on failure; Kotlin call sites will wrap it in `runCatching`
+  (condition 8) when the controller lands in step 3.
+- **Host-side JNI test harness** (`android/terminal-emulator/
+  host-tests/`, plan §6.2): fake `jni.h` + mock JNIEnv with call
+  recording and injectable failures; ASan+LSan test binary (9 checks);
+  allocation-interposer binary (`--wrap=malloc/.../execve/_exit`,
+  no sanitizers — ASan cannot coexist with `--wrap=malloc`);
+  `sigprobe` helper; `check_child_path.sh` whitelist grep (forbidden
+  identifier list from plan §4.4 incl. `syscall`/`close_range`; also
+  enforces the child path stays ≤120 lines).
+- **Regression pinning (the repo's established standard — each test
+  proven to fail on the unfixed code)**: fixed code = 9 checks, 0
+  failures; upstream `termux.c` @ the pin + only the 4 mechanical
+  seam substitutions (fork/grantpt/malloc routing — no fixes) =
+  **8 of 9 checks failing**, exactly the defect tests:
+  release-pairing violation (defect 1), fd-leak `closed=0` on the
+  fork/grantpt/critical paths (defect 2), LSan-visible marshalling
+  leaks on both injection tests (defect 3), SIGPIPE observed as
+  SIG_IGN (no disposition reset), happy-path pairing violation.
+  `test_fd_count_200_cycles` passes on both — it is a guard for the
+  C-layer fd discipline, not a defect discriminator (as documented in
+  tests.c).
+- **Honest scope statements** (review Part 2): the malloc interposer
+  sees only OUR compilation units — glibc-internal allocations
+  (opendir's buffer, in-libc asprintf) are invisible to link-time
+  wrapping, so the fork-window zero-allocation test is a guard on OUR
+  code, necessary-not-sufficient; it is no Android-seccomp oracle
+  (only the §6.6 device matrix is). The harness is glibc/x86.
+- A pty-lifetime subtlety surfaced while testing: closing the master
+  fd before the child has opened the slave destroys the pty
+  (slave-open returns ENOENT — verified empirically). The parent
+  always holds the master on success paths, so this only manifests on
+  failure paths whose child is doomed anyway; tests reap children
+  before closing the master. Recorded because it explains stderr
+  noise in failure-injection tests, and because it is exactly the
+  reader-join-before-close discipline (P1-4) in miniature.
+- Local verification: harness fully green (9/9 + alloc window
+  0-allocations/exit-127 + whitelist grep clean over 92 lines);
+  `:app:assembleDebug` green with `librustdroidpty.so` packaged;
+  vendored JVM suite + app suite green; `termux.c` compiles clean
+  under gcc (host, `-D_GNU_SOURCE` for glibc POSIX visibility) and
+  NDK r27c clang aarch64 (verbatim upstream cFlags incl. `-Werror`).

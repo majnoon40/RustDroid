@@ -1,0 +1,4 @@
+# Harness build artifacts (make check rebuilds them)
+tests_asan
+tests_alloc
+sigprobe

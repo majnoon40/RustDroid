@@ -69,6 +69,16 @@ jobs:
       - name: Vendored terminal-emulator unit tests
         run: ./gradlew :terminal-emulator:testDebugUnitTest --console=plain
 
+      # Phase 4 step 2 (plan §6.2): host-side JNI harness — mock JNIEnv,
+      # ASan+LSan defect regression tests, fork-window allocation
+      # discipline via link-time --wrap, and the async-signal-safe
+      # child-path whitelist grep. glibc/x86: an oracle for OUR code
+      # discipline only, never for Android seccomp/syscall availability.
+      - name: Host JNI test harness (ASan + interposer + whitelist grep)
+        working-directory: android/terminal-emulator/host-tests
+        run: |
+          make CC=clang check
+
       - name: Assemble debug APK
         run: ./gradlew :app:assembleDebug --console=plain
 
