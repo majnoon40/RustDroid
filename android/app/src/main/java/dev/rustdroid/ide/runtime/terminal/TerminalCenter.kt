@@ -87,6 +87,15 @@ class TerminalCenter(
         val session: TerminalSession,
         val title: String,
         val finished: Boolean,
+        /** Review P2 fix: the project this session belongs to (the same
+         *  string TerminalScreen's `projectRef` param carries), or null for
+         *  a plain projects-root session. TerminalScreen filters [sessions]
+         *  by this before deciding "does a session already exist here" —
+         *  previously that check ran against the GLOBAL session list, so
+         *  navigating from project A's terminal to project B's reused A's
+         *  session (any live session made `sessions.isEmpty()` false) under
+         *  a title that claimed to be B. */
+        val projectRef: String? = null,
     )
 
     /**
@@ -179,7 +188,7 @@ class TerminalCenter(
      * construction throws: the exception is captured into the error
      * state (and a breadcrumb) instead of killing the process.
      */
-    fun createSession(cwd: File? = null): CreateResult {
+    fun createSession(cwd: File? = null, projectRef: String? = null): CreateResult {
         val state = toolchainManager.state.value
         if (state !is ToolchainState.Ready) {
             return CreateResult.NotInstalled("Toolchain not installed")
@@ -211,6 +220,7 @@ class TerminalCenter(
             val entry = SessionEntry(
                 nextId.getAndIncrement(), termSession,
                 cwd?.name?.takeIf { it.isNotBlank() } ?: "sh", false,
+                projectRef = projectRef,
             )
             // CAS update: create (main), close (owner) and updateEntry
             // (callback handler) all mutate this list from different

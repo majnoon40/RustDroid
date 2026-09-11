@@ -92,9 +92,20 @@ fun TerminalScreen(
     val vm: TerminalViewModel = viewModel(
         factory = TerminalViewModel.factory(container.terminalCenter)
     )
-    val sessions by vm.sessions.collectAsState()
+    val allSessions by vm.sessions.collectAsState()
     val currentId by vm.currentId.collectAsState()
     val createError by vm.lastCreateError.collectAsState()
+
+    // Review P2 fix: TerminalCenter.sessions is PROCESS-GLOBAL (deliberately
+    // — it survives this screen's own rotation/navigation), so this screen
+    // must filter it down to just this project's sessions before making any
+    // "does a session already exist" decision. Previously the raw global
+    // list was used directly: navigating from project A's terminal straight
+    // to project B's found A's session still present, `sessions.isEmpty()`
+    // was false, no session was created for B, and `sessions.firstOrNull()`
+    // (falling back from a null currentId on the fresh nav destination)
+    // handed B's screen A's shell — under a title that said "Terminal · B".
+    val sessions = allSessions.filter { it.projectRef == projectRef }
 
     // Where new sessions land: the project we were opened from (project
     // card / editor toolbar), else the projects root (v0.1.8 default).
@@ -105,10 +116,13 @@ fun TerminalScreen(
         }
     }
 
-    // First visit auto-opens one session (the top-bar +, the FAB and the
-    // empty state create more — always in [projectDir] for this screen).
-    LaunchedEffect(Unit) {
-        if (sessions.isEmpty()) vm.createSession(projectDir)
+    // First visit to EACH project auto-opens one session — keyed on
+    // [projectRef] (was `Unit`, so this only ever ran once per screen
+    // instance regardless of which project it was for) and checked against
+    // the project-filtered [sessions] above (was the global list, so any
+    // live session anywhere made this a no-op for a second project).
+    LaunchedEffect(projectRef) {
+        if (sessions.isEmpty()) vm.createSession(projectDir, projectRef)
     }
     LaunchedEffect(sessions.size) {
         if (sessions.isNotEmpty() && currentId == null) vm.switchTo(sessions.first().id)
@@ -138,7 +152,7 @@ fun TerminalScreen(
                 actions = {
                     // New session — in the same project this screen was
                     // opened for (else the projects root).
-                    IconButton(onClick = { vm.createSession(projectDir) }) {
+                    IconButton(onClick = { vm.createSession(projectDir, projectRef) }) {
                         Icon(Icons.Filled.Add, contentDescription = "New session")
                     }
                 },
@@ -175,7 +189,7 @@ fun TerminalScreen(
                     TerminalEmptyState(
                         hasError = createError != null,
                         error = createError,
-                        onNewSession = { vm.createSession(projectDir) },
+                        onNewSession = { vm.createSession(projectDir, projectRef) },
                         onBack = onBack,
                     )
                 }

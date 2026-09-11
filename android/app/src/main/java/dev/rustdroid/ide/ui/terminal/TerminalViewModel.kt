@@ -28,9 +28,14 @@ class TerminalViewModel(val center: TerminalCenter) : ViewModel() {
     }
 
     /** Create a session, optionally rooted in a project directory (v0.2:
-     *  opened-from-a-project terminals run cargo right there). */
-    fun createSession(cwd: java.io.File? = null) {
-        when (val result = center.createSession(cwd)) {
+     *  opened-from-a-project terminals run cargo right there). [projectRef]
+     *  is the same string TerminalScreen's route param carries — threaded
+     *  through so TerminalCenter can tag the resulting SessionEntry and the
+     *  screen can filter its own project's sessions out of the global list
+     *  (review P2: session identity was previously untracked, so two
+     *  projects' terminal screens could not tell their sessions apart). */
+    fun createSession(cwd: java.io.File? = null, projectRef: String? = null) {
+        when (val result = center.createSession(cwd, projectRef)) {
             is TerminalCenter.CreateResult.Ok -> _currentId.value = result.entry.id
             is TerminalCenter.CreateResult.NotInstalled -> _lastCreateError.value = result.detail
             is TerminalCenter.CreateResult.Error -> _lastCreateError.value = result.detail
