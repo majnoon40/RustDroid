@@ -14,12 +14,16 @@ import dev.rustdroid.ide.toolchain.ToolchainManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -28,10 +32,33 @@ import java.util.concurrent.atomic.AtomicLong
  * and the foreground service ([TerminalService]) keeps the PROCESS (and
  * therefore the sessions) alive while ≥ 1 session exists.
  *
- * The session I/O-owner scope is a single-worker dispatcher: every master
- * fd close and every teardown runs confined to it, so exactly one thread
- * ever performs them (plan §5.3 / review P1-4: the close happens after
- * the reader is joined — never under a blocked read).
+ * The session I/O-owner scope is a DEDICATED single thread (v0.2.1): every
+ * master fd close and every teardown runs confined to it, so exactly one
+ * thread ever performs them (plan §5.3 / review P1-4: the close happens
+ * after the reader is joined — never under a blocked read).
+ *
+ * v0.2.1 correction (review P0): the previous owner scope was
+ * `Dispatchers.IO.limitedParallelism(1)` — and worse, closeSession
+ * re-derived that limiter in an inner `withContext(...)` on EVERY call.
+ * `limitedParallelism` is a concurrency limiter over an elastic thread
+ * pool, not thread confinement, and it returns a NEW view each invocation
+ * (it does not memoize), so concurrent closeSession calls ran fully in
+ * parallel with no single-flight guarantee at all — contradicting this
+ * class's own doc comment. Reachable by ordinary use (closing a tab just
+ * as its shell exits, where onSessionFinished's teardown races the user's
+ * close). Fixed with one `Executors.newSingleThreadExecutor`
+ * dispatcher stored in a field and never re-derived.
+ *
+ * STATE DISCIPLINE (review P1): [_sessions] is mutated from the main
+ * thread (create), the owner thread (close), and the vendored session's
+ * callback handler (updateEntry on title/finish). All three now use
+ * `update { }` (CAS-looped) rather than `value = value ± x`, which is a
+ * non-atomic read-modify-write that can lose one of two concurrent
+ * updates — a vanished new session (orphaned shell with no UI affordance
+ * to kill it) or a resurrected closed one (a dead fd behind a live tab).
+ * [views] is a ConcurrentHashMap: it is touched from the client callbacks
+ * and from the screen's bind/unbind, and a plain HashMap mutated
+ * concurrently can corrupt its table.
  *
  * BACKPRESSURE (plan §8.4, a hard constraint — not a nice-to-have): no
  * unbounded Kotlin-side output buffering exists in this layer. The child
@@ -62,7 +89,16 @@ class TerminalCenter(
         val finished: Boolean,
     )
 
-    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
+    /**
+     * The session I/O owner: ONE dedicated daemon thread, created once.
+     * Genuine thread confinement — unlike `limitedParallelism`, which
+     * limits concurrency without pinning a thread and returns a fresh
+     * view per call.
+     */
+    private val ioDispatcher = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "rd-terminal-io").apply { isDaemon = true }
+    }.asCoroutineDispatcher()
+    private val ioScope = CoroutineScope(SupervisorJob() + ioDispatcher)
     private val nextId = AtomicLong(1)
 
     /** Transcript (scrollback) rows — CAPPED (plan §8.4). */
@@ -71,8 +107,9 @@ class TerminalCenter(
     private val _sessions = MutableStateFlow<List<SessionEntry>>(emptyList())
     val sessions: StateFlow<List<SessionEntry>> = _sessions
 
-    /** Views currently displaying a session (weak: the screen unregisters on dispose). */
-    private val views = HashMap<TerminalSession, com.termux.view.TerminalView>()
+    /** Views currently displaying a session (the screen unregisters on dispose).
+     *  ConcurrentHashMap: written from the session callbacks and the screen. */
+    private val views = ConcurrentHashMap<TerminalSession, com.termux.view.TerminalView>()
 
     private val client = object : TerminalSessionClient {
         override fun onTextChanged(changedSession: TerminalSession) {
@@ -175,7 +212,10 @@ class TerminalCenter(
                 nextId.getAndIncrement(), termSession,
                 cwd?.name?.takeIf { it.isNotBlank() } ?: "sh", false,
             )
-            _sessions.value = _sessions.value + entry
+            // CAS update: create (main), close (owner) and updateEntry
+            // (callback handler) all mutate this list from different
+            // threads — `value = value + x` would drop a concurrent update.
+            _sessions.update { it + entry }
             TerminalService.ensureRunning(context, _sessions.value.size)
             CrashRecorder.crumb("terminal:create:fgs-started")
             CreateResult.Ok(entry)
@@ -190,24 +230,29 @@ class TerminalCenter(
     /**
      * Full session teardown via [TerminalSessionController] — the exact
      * plan §5.3 sequence — on the I/O-owner scope.
+     *
+     * The entry is removed from [_sessions] BEFORE teardown is enqueued
+     * (v0.2.1): a second close tap therefore finds nothing and cannot
+     * enqueue a duplicate teardown for the same session, and the tab strip
+     * stops offering a session that is already on its way out.
      */
     fun closeSession(id: Long) {
         val entry = _sessions.value.firstOrNull { it.id == id } ?: return
+        _sessions.update { list -> list.filterNot { it.id == id } }
+        // The session is gone from the UI now; stop the FGS if it was the
+        // last live one (the teardown below runs regardless).
+        TerminalService.ensureStopped(context, _sessions.value.count { !it.finished })
         ioScope.launch {
-            withContext(Dispatchers.IO.limitedParallelism(1)) {
-                TerminalSessionController(
-                    procRoot = File("/proc"),
-                    shellPid = entry.session.pid.toLong(),
-                    ptsDevice = entry.session.ptsDevice.toLong(),
-                    signal = { pid, sig -> com.termux.terminal.JNIHelper.signal(pid, sig) },
-                    killpg = { pgid, sig -> com.termux.terminal.JNIHelper.sendSignalToGroup(pgid, sig) },
-                    closeMaster = { entry.session.closeMasterFd() },
-                    stopReader = { entry.session.requestReaderStop() },
-                    joinReader = { entry.session.joinReader(it) },
-                ).teardown()
-            }
-            _sessions.value = _sessions.value.filterNot { it.id == id }
-            TerminalService.ensureStopped(context, _sessions.value.size)
+            TerminalSessionController(
+                procRoot = File("/proc"),
+                shellPid = entry.session.pid.toLong(),
+                ptsDevice = entry.session.ptsDevice.toLong(),
+                signal = { pid, sig -> com.termux.terminal.JNIHelper.signal(pid, sig) },
+                killpg = { pgid, sig -> com.termux.terminal.JNIHelper.sendSignalToGroup(pgid, sig) },
+                closeMaster = { entry.session.closeMasterFd() },
+                stopReader = { entry.session.requestReaderStop() },
+                joinReader = { entry.session.joinReader(it) },
+            ).teardown()
         }
     }
 
@@ -221,7 +266,9 @@ class TerminalCenter(
     }
 
     private fun updateEntry(session: TerminalSession, transform: (SessionEntry) -> SessionEntry) {
-        _sessions.value = _sessions.value.map { if (it.session === session) transform(it) else it }
+        _sessions.update { list ->
+            list.map { if (it.session === session) transform(it) else it }
+        }
         TerminalService.ensureStopped(context, _sessions.value.count { !it.finished })
     }
 
