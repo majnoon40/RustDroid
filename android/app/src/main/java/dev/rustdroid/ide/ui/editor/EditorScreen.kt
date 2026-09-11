@@ -155,6 +155,21 @@ fun EditorScreen(
     // panel below). Track View-level focus from sora-editor.
     var editorFocused by remember { mutableStateOf(false) }
 
+    // v0.2.1 (review P2): the console panel's visibility is decided by the IME
+    // inset's DIRECTION, not by a fixed fraction of the screen. The v0.2 rule
+    // ("inset > 12% of screen height = keyboard up") was tuned to a full-height
+    // phone keyboard and inverted for anything shorter: a floating/split IME
+    // holding well under 12% read as CLOSED for the entire time it was open,
+    // so the console panel popped back while the user was still typing — the
+    // original v0.2 complaint, reversed. Direction distinguishes a small
+    // keyboard from no keyboard, and closing on the first SHRINKING frame is
+    // what delivers the v0.2 latency fix. See ImeDeltaTracker (pure state
+    // machine, unit-tested in ImeDeltaTrackerTest).
+    val imeTracker = remember { ImeDeltaTracker() }
+    val imeVisible = imeTracker.update(
+        WindowInsets.ime.getBottom(androidx.compose.ui.platform.LocalDensity.current)
+    )
+
     val drawerState = androidx.compose.material3.rememberDrawerState(
         initialValue = androidx.compose.material3.DrawerValue.Closed,
     )
@@ -391,21 +406,12 @@ fun EditorScreen(
                 // the console's stdin bar keeps the panel (it owns focus
                 // there) with the console shrunk to 88dp instead of 220dp.
                 //
-                // v0.2 console-delay fix: the raw IME inset stays > 0 for the
-                // ENTIRE closing animation (~300ms+ on many OEM skins) and
-                // the old isImeVisible flag only flipped at the very end —
-                // the console felt like it took a second to come back after
-                // closing the keyboard. The IME inset animates per-frame, so
-                // comparing it against a collapse threshold (a keyboard is
-                // ~40-50% of screen height; 12% is deep into the collapse)
-                // brings the panel back the moment the collapse STARTS. The
-                // one trade: the panel also hides slightly late while the
-                // keyboard is OPENING (near the animation's end) — brief
-                // overlap beats a dead-feeling panel.
-                val density = androidx.compose.ui.platform.LocalDensity.current
-                val config = androidx.compose.ui.platform.LocalConfiguration.current
-                val imeCollapsePx = with(density) { (config.screenHeightDp * 0.12f).dp.toPx() }
-                val imeVisible = WindowInsets.ime.getBottom(density) > imeCollapsePx
+                // imeVisible now comes from ImeDeltaTracker (above), which
+                // closes on the first SHRINKING frame rather than waiting for
+                // the inset to reach zero (~300ms+ on many OEM skins — the
+                // v0.2 "console takes a second to come back" report) and
+                // treats a small but held-open keyboard as open (the
+                // floating-IME inversion the threshold rule had).
                 val hideBottom = imeVisible && editorFocused
                 val errorCount = problems.count { it.severity == Severity.ERROR }
                 val warningCount = problems.count { it.severity == Severity.WARNING }
