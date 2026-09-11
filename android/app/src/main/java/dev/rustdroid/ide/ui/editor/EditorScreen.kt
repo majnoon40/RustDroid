@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.WindowInsets
@@ -609,7 +610,7 @@ private fun FileTreeRow(
 
 /**
  * Confirms deleting [node] (a whole subtree when it is a directory).
- * Errors from the repository guards (root Cargo.toml, root itself, …)
+ * Errors from the repository guards (root Cargo.toml, root itself, ...)
  * show inline and keep the dialog open, mirroring NewFileDialog.
  */
 @Composable
