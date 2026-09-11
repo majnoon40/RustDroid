@@ -56,10 +56,20 @@ jobs:
           key: gradle-${{ runner.os }}-${{ hashFiles('android/gradle/libs.versions.toml', 'android/app/build.gradle.kts', 'android/build.gradle.kts', 'android/terminal-emulator/build.gradle.kts', 'android/terminal-view/build.gradle.kts') }}
           restore-keys: gradle-${{ runner.os }}-
 
-      - name: App JVM unit tests
+      # Process fix (full-repo review, root-cause finding): four of the
+      # last five releases shipped with "compile-correctness by inspection"
+      # commit-message disclaimers, and CI's first real compile caught a
+      # break every single time. :app:testDebugUnitTest compiles main
+      # BEFORE it compiles/runs tests, so a plain compile error has always
+      # worn a test-failure mask in the step list — this step makes that
+      # failure mode unambiguous instead of merged into the test step.
+      - name: Compile check (app)
         run: |
           chmod +x gradlew
-          ./gradlew :app:testDebugUnitTest --console=plain
+          ./gradlew :app:compileDebugKotlin --console=plain
+
+      - name: App JVM unit tests
+        run: ./gradlew :app:testDebugUnitTest --console=plain
 
       # Phase 4 step-1 gate (plan §12.2): the vendored upstream suite
       # (19 files: 18 test classes + TerminalTestCase base) must be green
