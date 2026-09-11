@@ -23,6 +23,11 @@ import java.io.File
  * are only sent after re-reading the stat and confirming the current
  * occupant still has the captured start time; a mismatch means the
  * original process is gone and the PID was reused, so it is skipped.
+ *
+ * SINGLE-READ DISCIPLINE (v0.2.1): [readStat] parses a whole stat line
+ * ONCE into a [Stat]. Callers that need identity AND state (liveness,
+ * zombie-ness) must use it rather than the split [stillMatches] +
+ * [isZombie] pair — see [Stat] for why two reads is a TOCTOU hole.
  */
 object ProcTree {
 
@@ -31,6 +36,38 @@ object ProcTree {
 
     /** PID + start time (stat field 22) — identity of a concrete process. */
     data class ProcessId(val pid: Long, val startTime: Long?)
+
+    /**
+     * One parse of `/proc/<pid>/stat`: identity (start time) AND the
+     * fields a teardown needs to decide, read ATOMICALLY from a single
+     * `readText()`.
+     *
+     * Why this type exists (v0.2.1): a teardown that asks [stillMatches]
+     * ("is this still my process?") and then [isZombie] ("is it dead?")
+     * performs TWO reads of the same file. Between them the process can
+     * exit and its PID be reused, so the first question is answered about
+     * the OLD occupant and the second about the NEW one — the identity
+     * discipline that exists to prevent PID-reuse signalling, defeated by
+     * splitting the read. One read, one parse, one decision.
+     *
+     * Fields per proc(5); note the comm field (2) may contain spaces and
+     * ')' so parsing resumes after the LAST ')'.
+     */
+    data class Stat(
+        val pid: Long,
+        /** field 3: one of R/S/D/Z/T/... ('Z' = zombie/dead-pending-reap). */
+        val state: Char,
+        /** field 4 */
+        val ppid: Long,
+        /** field 5 */
+        val pgrp: Long,
+        /** field 6 — session id (pgid/sid semantics, see [sessionMembers]). */
+        val session: Long,
+        /** field 7 — controlling terminal device number. */
+        val ttyNr: Long,
+        /** field 22 — start time in kernel jiffies; the PID-reuse guard. */
+        val startTime: Long,
+    )
 
     /**
      * All descendants of [rootPid], breadth-first (children before
@@ -101,10 +138,43 @@ object ProcTree {
     }
 
     /**
+     * Read + parse `/proc/<pid>/stat` ONCE into a [Stat] (identity AND
+     * state together). Null when the file is missing/unreadable/malformed.
+     *
+     * This is the ONLY stat read a teardown should use to decide whether
+     * to signal: it makes "still my process?" and "still alive?" a single
+     * observation instead of two that a PID reuse can slip between.
+     */
+    fun readStat(procRoot: File, pid: Long): Stat? {
+        val f = File(procRoot, "$pid/stat")
+        if (!f.isFile) return null
+        return runCatching {
+            val text = f.readText()
+            val close = text.lastIndexOf(')')
+            if (close < 0) return@runCatching null
+            // tokens[0] is field 3 (state); field N -> index N - 3
+            val t = text.substring(close + 1).trim().split(' ')
+            Stat(
+                pid = pid,
+                state = t.getOrNull(0)?.firstOrNull() ?: return@runCatching null,
+                ppid = t.getOrNull(1)?.toLongOrNull() ?: return@runCatching null,
+                pgrp = t.getOrNull(2)?.toLongOrNull() ?: return@runCatching null,
+                session = t.getOrNull(3)?.toLongOrNull() ?: return@runCatching null,
+                ttyNr = t.getOrNull(4)?.toLongOrNull() ?: return@runCatching null,
+                startTime = t.getOrNull(19)?.toLongOrNull() ?: return@runCatching null,
+            )
+        }.getOrNull()
+    }
+
+    /**
      * True when the process currently occupying [id.pid] is still the
      * captured process: /proc entry exists AND the start time matches.
      * A null [ProcessId.startTime] can never be revalidated, so it
      * returns false (conservative — never signal an unvalidatable PID).
+     *
+     * NOTE: this reads the stat file on its own. A caller that also needs
+     * zombie state must NOT follow this with [isZombie] (two reads = a
+     * PID-reuse window between them) — use [readStat] once instead.
      */
     fun stillMatches(procRoot: File, id: ProcessId): Boolean {
         val startTime = id.startTime ?: return false
@@ -134,7 +204,8 @@ object ProcTree {
     /**
      * Field [field] of a /proc stat file (field numbering per proc(5):
      * tokens[0] is field 3, so field N -> tokens[N - 3]; the comm field
-     * (2) may contain spaces and ')' — parse after the LAST ')').
+     * (2) may contain spaces and ')' — parse after the LAST ')'). Null
+     * when the file is missing/unreadable/malformed.
      */
     private fun longFieldOf(stat: File, field: Int): Long? {
         if (!stat.isFile) return null
@@ -247,14 +318,19 @@ object ProcTree {
      * operational sense: signals — SIGKILL included — do nothing to a
      * corpse; only reaping (or its parent dying and init inheriting it)
      * removes it from /proc.
+     *
+     * NOTE: like [stillMatches], this is a standalone read. A teardown
+     * deciding whether to signal must use [readStat] (identity + state in
+     * one observation) rather than [stillMatches] && ![isZombie], which
+     * reads the file twice.
      */
     fun isZombie(procRoot: File, pid: Long): Boolean =
         stateOf(File(procRoot, "$pid/stat")) == 'Z'
 
     /**
      * `/proc/<pid>/stat` state character (field 3 — the first token
-     * after the LAST ')'; the comm field may contain spaces and ')').
-     * Null when the file is missing/unreadable/malformed — treated as
+     * after the LAST ')'; the comm field may contain spaces and ')'). Null
+     * when the file is missing/unreadable/malformed — treated as
      * "not a zombie": an unparseable stat also fails identity
      * revalidation, so such a process can never reach the sweep's
      * signal path anyway.
@@ -355,8 +431,9 @@ object ProcTree {
         // and the caller pays the full sweep budget re-signaling the
         // dead. Excluded here: dead is dead.
         for (sweep in 0 until maxSweeps) {
-            val remaining = captured.filter {
-                stillMatches(procRoot, it) && !isZombie(procRoot, it.pid)
+            val remaining = captured.filter { id ->
+                val st = readStat(procRoot, id.pid) ?: return@filter false
+                id.startTime != null && st.startTime == id.startTime && st.state != 'Z'
             }
             if (remaining.isEmpty()) return
             for (id in remaining) runCatching { signal(id.pid, SIGKILL) }
