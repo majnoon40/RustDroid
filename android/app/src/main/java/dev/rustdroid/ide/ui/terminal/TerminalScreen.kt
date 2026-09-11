@@ -9,12 +9,14 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
@@ -85,7 +87,7 @@ import kotlin.math.roundToInt
  * one-shot: the next key the IME delivers is ctrl-ified through the
  * view's own readControlKey() pipeline, then the toggle resets.
  */
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun TerminalScreen(
     container: AppContainer,
@@ -110,8 +112,9 @@ fun TerminalScreen(
     // handed B's screen A's shell — under a title that said "Terminal · B".
     val sessions = allSessions.filter { it.projectRef == projectRef }
 
-    // TEMPORARY (v0.2.2): on-screen diagnostics for the "multiple blank
-    // prompts at startup / on a key press" report. See TERMINAL_DIAGNOSTICS.
+    // TEMPORARY (v0.2.2): on-screen diagnostics. Still enabled on purpose —
+    // it is now the VERIFICATION TOOL for the resize fix below (see
+    // TERMINAL_DIAGNOSTICS).
     val diag = remember { mutableStateOf("(waiting for events)") }
 
     // Where new sessions land: the project we were opened from (project
@@ -145,6 +148,48 @@ fun TerminalScreen(
         ctrlState.onConsumed = { ctrlVisual = false }
     }
 
+    // ---- v0.2.2 "multiple blank prompts" FIX -------------------------
+    // Measured on the device, not inferred: the diagnostic line read
+    // `resizes=58 cp=1 crlf=0` — CRLF injection ruled OUT (crlf=0), and 58
+    // pty resizes measured. EVERY pty resize sends SIGWINCH, and a shell
+    // redraws its prompt on SIGWINCH. That is the blank-prompt spam.
+    //
+    // Why 58: `Modifier.imePadding()` tracks the ANIMATED IME inset (androidx
+    // documents that on API 30+ the `ime` insets "animate synchronously with
+    // the actual IME animation"), so the Column's height changed on every
+    // animation frame. `TerminalView.updateSize()` pushes a new pty size for
+    // every distinct row count it measures, so a ~250-300 ms keyboard
+    // animation became ~58 SIGWINCHes.
+    //
+    // The fix is a plain DEBOUNCE on the padding we apply to ourselves: the
+    // animated inset is still read (it must be, to know where the keyboard
+    // ends up), but it is only COMMITTED to layout once it has stopped
+    // changing. The terminal therefore resizes once per settled keyboard
+    // state instead of once per frame — which is also what a stock Termux
+    // Activity gets for free from `adjustResize` (one window resize at the
+    // end), and it is the behaviour our Compose host lost.
+    //
+    // Deliberately NOT WindowInsetsAnimation/imeAnimationTarget: those need
+    // API-30 branching and a new API surface, whereas a debounce over the
+    // inset we already read is one mechanism on every supported API level
+    // (minSdk 24) and also absorbs any other source of churn (rotation,
+    // split-screen, the IME changing its own height).
+    //
+    // Trade-off, stated: while the keyboard is animating, the bottom of the
+    // terminal (and the extra-keys row under it) sits behind the sliding
+    // keyboard for ~100 ms longer than before, then snaps up. That is
+    // invisible for the terminal (the keyboard covers exactly that area) and
+    // brief for the key row.
+    val density = androidx.compose.ui.platform.LocalDensity.current
+    val imeInsetPx = WindowInsets.ime.getBottom(density)
+    var imePadPx by remember { mutableStateOf(0) }
+    LaunchedEffect(imeInsetPx) {
+        // Restarted on every frame of the animation, so this only runs to
+        // completion once the inset holds still for the quiet period.
+        kotlinx.coroutines.delay(IME_SETTLE_DEBOUNCE_MS)
+        imePadPx = imeInsetPx
+    }
+
     val title = projectDir?.let { "Terminal · ${it.name}" } ?: "Terminal"
 
     Scaffold(
@@ -170,11 +215,11 @@ fun TerminalScreen(
             Modifier
                 .fillMaxSize()
                 .padding(padding)
-                // Edge-to-edge neutralizes adjustResize (the Editor screen's
-                // comment applies here too): IME insets must be applied
-                // manually or the keyboard covers the extra-keys row and the
-                // active prompt line.
-                .imePadding()
+                // The DEBOUNCED inset (see above), NOT imePadding(): padding
+                // per animation frame is what produced 58 pty resizes and 58
+                // shell prompts. Edge-to-edge still neutralizes adjustResize,
+                // so the inset must be applied by hand — just not per frame.
+                .padding(bottom = with(density) { imePadPx.toDp() })
         ) {
             // ---- session tab strip (v0: simple strip + close per tab) ----
             SessionTabs(
@@ -244,25 +289,24 @@ fun TerminalScreen(
 }
 
 /**
+ * Quiet period the IME inset must hold still before we commit it to layout
+ * (v0.2.2). Must exceed the gap between animation frames (~16 ms) and be
+ * comfortably under the keyboard animation's own duration, so the padding
+ * lands shortly after the animation ends and never mid-animation.
+ */
+private const val IME_SETTLE_DEBOUNCE_MS = 100L
+
+/**
  * TEMPORARY (v0.2.2) — on-screen terminal diagnostics.
  *
- * WHY: the on-device report is "several blank prompts appear as soon as the
- * terminal starts, and pressing a key at the bottom of the screen does it
- * too". Two mechanisms produce that visual and they need different fixes:
+ * KEEP THIS ON until the resize fix is confirmed on the device: it is the
+ * instrument that proved the "multiple blank prompts" cause and it is how
+ * the fix is verified. Expected after the fix: `resizes` stays at ~1-3
+ * (initial attach + one per settled keyboard transition) instead of ~58,
+ * and `crlf` remains 0.
  *
- *  A. RESIZE STORM (SIGWINCH). `TerminalView.updateSize()` pushes a new pty
- *     size for every distinct column/row count it measures, and each push
- *     makes the shell redraw its prompt. This screen resizes that view
- *     repeatedly (imePadding re-measures it per frame while the IME
- *     animates), so a burst of `resizes=` is the tell.
- *  B. IME NEWLINE INJECTION. The vendored BaseInputConnection routes
- *     commitText/finishComposingText through sendTextToTerminal(), which
- *     converts '\n' to '\r' — a real Enter. `crlf=` > 0 is the tell.
- *
- * Reading `resizes` and `crlf` off the screen (no logcat, no adb — the user
- * reads reports in-app) distinguishes A from B in one reproduction.
- *
- * Set to false once diagnosed; delete this block and the overlay together.
+ * Then set this to false and delete it together with the overlay call site
+ * and the counters in RdViewClient.
  */
 private const val TERMINAL_DIAGNOSTICS = true
 
@@ -458,6 +502,13 @@ private fun requestFocusAndShowKeyboard(view: View) {
  * the total to [TerminalViewClient.onScale]; this class clamps it and
  * applies the resulting px size (skipping redundant setTextSize calls —
  * each one recreates the TerminalRenderer).
+ *
+ * NOTE (v0.2.2): each applied font size also drives a pty resize via
+ * setTextSize -> updateSize, so a pinch drag is a second potential source
+ * of the same SIGWINCH churn the screen-level debounce fixes for the IME.
+ * The per-pixel guard below already collapses most of it (a pinch that
+ * lands on the same px is a no-op); coalescing the rest is a follow-up if
+ * the device shows a pinch-driven prompt burst.
  */
 private class TerminalFontState(context: Context) {
     val basePx: Int = (TERMINAL_FONT_SIZE_DP * context.resources.displayMetrics.density).roundToInt()
@@ -567,7 +618,8 @@ private class RdViewClient(
 
     override fun onEmulatorSet() {
         // Fires once per applied pty size — i.e. once per SIGWINCH the shell
-        // receives. A burst here is the "multiple blank prompts" mechanism.
+        // receives. This counter is what measured resizes=58 (and crlf=0,
+        // which ruled the IME-newline theory out) and what verifies the fix.
         resizeCount++
         publish()
     }
