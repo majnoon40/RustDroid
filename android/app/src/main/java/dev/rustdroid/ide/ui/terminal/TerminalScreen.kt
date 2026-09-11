@@ -137,7 +137,7 @@ fun TerminalScreen(
 
     val current = sessions.firstOrNull { it.id == currentId } ?: sessions.firstOrNull()
 
-    // ONE Ctrl state shared by the extra-keys row and the view's input
+    // ONE Ctrl state shared between the extra-keys row and the view's input
     // pipeline (the pane's view client reads it; the row's button sets it).
     val ctrlState = remember { TerminalCtrlState() }
     var ctrlVisual by remember { mutableStateOf(false) }
@@ -254,8 +254,7 @@ fun TerminalScreen(
  *     size for every distinct column/row count it measures, and each push
  *     makes the shell redraw its prompt. This screen resizes that view
  *     repeatedly (imePadding re-measures it per frame while the IME
- *     animates), so a burst of `resizes=` is the tell. A key press re-triggers
- *     the IME animation, which is why a key press also shows it.
+ *     animates), so a burst of `resizes=` is the tell.
  *  B. IME NEWLINE INJECTION. The vendored BaseInputConnection routes
  *     commitText/finishComposingText through sendTextToTerminal(), which
  *     converts '\n' to '\r' — a real Enter. `crlf=` > 0 is the tell.
@@ -275,9 +274,45 @@ private fun SessionTabs(
     onClose: (Long) -> Unit,
 ) {
     if (sessions.isEmpty()) return
+
+    // v0.2.2 CRASH FIX. The reported crash was
+    //   IndexOutOfBoundsException: Index 1 out of bounds for length 1
+    //     at TabRowKt$ScrollableTabRow$1.invoke(TabRow.kt:502)
+    // i.e. the DEFAULT indicator lambda of the (deprecated) ScrollableTabRow,
+    // which indexes WITHOUT a bounds check:
+    //
+    //   TabRowDefaults.SecondaryIndicator(
+    //       Modifier.tabIndicatorOffset(tabPositions[selectedTabIndex]))
+    //
+    // (androidx guards this in TabRow — `if (selectedTabIndex <
+    // tabPositions.size)` — but NOT in ScrollableTabRow.) Mechanism, all on
+    // the main thread in one frame: tapping "+" creates a session and
+    // TerminalViewModel sets currentId to the NEW session's id, so the index
+    // below becomes 1 while `sessions` has just grown to 2 — but the layout
+    // pass has not yet republished tabPositions (still size 1, from the
+    // single-tab frame). The default lambda then reads tabPositions[1] and
+    // the app dies. Reproducible on the second session, every time.
+    //
+    // TWO fixes, both here:
+    //  1. Clamp the index to the sessions we actually have, so a stale
+    //     currentId (e.g. pointing at a session that was just closed) cannot
+    //     produce an out-of-range index either.
+    //  2. Supply our OWN indicator. The crashing lambda is the parameter
+    //     DEFAULT, so passing one replaces it entirely and removes the
+    //     unguarded indexing from the composition. It is intentionally empty:
+    //     drawing a correct indicator needs an offset helper whose exact
+    //     receiver/overload differs between the deprecated and current
+    //     Material3 APIs, and guessing at that here would risk trading a
+    //     crash for a compile error in code I cannot run. Selection is still
+    //     legible — M3's Tab tints its label via contentColor and the
+    //     selected tab gets a raised surface below.
+    val selectedIdx = sessions.indexOfFirst { it.id == currentId }
+        .takeIf { it in sessions.indices } ?: 0
+
     ScrollableTabRow(
-        selectedTabIndex = sessions.indexOfFirst { it.id == currentId }.coerceAtLeast(0),
+        selectedTabIndex = selectedIdx,
         edgePadding = 0.dp,
+        indicator = { _ -> },
     ) {
         sessions.forEach { entry ->
             Tab(
