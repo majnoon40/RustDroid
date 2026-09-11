@@ -23,7 +23,7 @@
   {
     "component": "Rust (rustc, cargo, rust-std)",
     "license": "MIT OR Apache-2.0",
-    "file": "textmate-MIT.txt",
+    "file": "rust-MIT.txt",
     "file2": "Apache-2.0.txt",
     "url": "https://github.com/rust-lang/rust",
     "pin": "tag 1.85.0"
@@ -38,7 +38,7 @@
   {
     "component": "Termux terminal-view (vendored source)",
     "license": "Apache-2.0",
-    "file": "terminal-emulator-Apache-2.0.txt",
+    "file": "terminal-view-Apache-2.0.txt",
     "url": "https://github.com/termux/termux-app",
     "pin": "commit 3b66f8799635a4dba4a206563048ff0e6792c487"
   },
