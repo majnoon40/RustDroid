@@ -36,6 +36,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -43,7 +44,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -107,6 +110,10 @@ fun TerminalScreen(
     // handed B's screen A's shell — under a title that said "Terminal · B".
     val sessions = allSessions.filter { it.projectRef == projectRef }
 
+    // TEMPORARY (v0.2.2): on-screen diagnostics for the "multiple blank
+    // prompts at startup / on a key press" report. See TERMINAL_DIAGNOSTICS.
+    val diag = remember { mutableStateOf("(waiting for events)") }
+
     // Where new sessions land: the project we were opened from (project
     // card / editor toolbar), else the projects root (v0.1.8 default).
     val projectDir = remember(projectRef) {
@@ -130,8 +137,8 @@ fun TerminalScreen(
 
     val current = sessions.firstOrNull { it.id == currentId } ?: sessions.firstOrNull()
 
-    // ONE Ctrl state shared by the view's key pipeline and the extra-keys
-    // row (the pane's view client reads it; the row's button sets it).
+    // ONE Ctrl state shared by the extra-keys row and the view's input
+    // pipeline (the pane's view client reads it; the row's button sets it).
     val ctrlState = remember { TerminalCtrlState() }
     var ctrlVisual by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
@@ -184,6 +191,7 @@ fun TerminalScreen(
                         entry = current,
                         center = container.terminalCenter,
                         ctrlState = ctrlState,
+                        diag = diag,
                     )
                 } else {
                     TerminalEmptyState(
@@ -204,6 +212,24 @@ fun TerminalScreen(
                     onCtrlToggled = { ctrlVisual = it },
                 )
             }
+
+            // TEMPORARY (v0.2.2) diagnostic overlay. Sits in the Column —
+            // OUTSIDE the interop Box — so it cannot observe or consume any
+            // pointer event over the terminal view (the v0.1.3 gesture
+            // lesson); it is a plain Text, not a clickable.
+            if (TERMINAL_DIAGNOSTICS) {
+                Text(
+                    diag.value + " | tabs=${sessions.size} live=${current != null}",
+                    Modifier
+                        .fillMaxWidth()
+                        .background(Color.Black.copy(alpha = 0.75f))
+                        .padding(horizontal = 6.dp, vertical = 2.dp),
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = Color.Yellow,
+                    maxLines = 3,
+                )
+            }
         }
     }
 
@@ -216,6 +242,30 @@ fun TerminalScreen(
         }
     }
 }
+
+/**
+ * TEMPORARY (v0.2.2) — on-screen terminal diagnostics.
+ *
+ * WHY: the on-device report is "several blank prompts appear as soon as the
+ * terminal starts, and pressing a key at the bottom of the screen does it
+ * too". Two mechanisms produce that visual and they need different fixes:
+ *
+ *  A. RESIZE STORM (SIGWINCH). `TerminalView.updateSize()` pushes a new pty
+ *     size for every distinct column/row count it measures, and each push
+ *     makes the shell redraw its prompt. This screen resizes that view
+ *     repeatedly (imePadding re-measures it per frame while the IME
+ *     animates), so a burst of `resizes=` is the tell. A key press re-triggers
+ *     the IME animation, which is why a key press also shows it.
+ *  B. IME NEWLINE INJECTION. The vendored BaseInputConnection routes
+ *     commitText/finishComposingText through sendTextToTerminal(), which
+ *     converts '\n' to '\r' — a real Enter. `crlf=` > 0 is the tell.
+ *
+ * Reading `resizes` and `crlf` off the screen (no logcat, no adb — the user
+ * reads reports in-app) distinguishes A from B in one reproduction.
+ *
+ * Set to false once diagnosed; delete this block and the overlay together.
+ */
+private const val TERMINAL_DIAGNOSTICS = true
 
 @Composable
 private fun SessionTabs(
@@ -287,6 +337,7 @@ private fun TerminalPane(
     entry: TerminalCenter.SessionEntry,
     center: TerminalCenter,
     ctrlState: TerminalCtrlState,
+    diag: MutableState<String>,
 ) {
     val context = LocalContext.current
 
@@ -305,7 +356,7 @@ private fun TerminalPane(
             // can run during THIS frame's layout pass, before a
             // LaunchedEffect fires); a null client there is an NPE that
             // killed the app the instant a session opened.
-            setTerminalViewClient(RdViewClient(this, ctrlState, fontState))
+            setTerminalViewClient(RdViewClient(this, ctrlState, fontState) { s -> diag.value = s })
             // v0.1.9 hardening: create the renderer HERE, at creation — the
             // second half of the same upstream host contract. setTextSize()
             // is the ONLY place a TerminalRenderer is ever created
@@ -316,10 +367,11 @@ private fun TerminalPane(
             // zero-size guard at :987 does not apply — the v0.1.8 flight
             // recorder caught exactly this NPE at the terminal:view-attach
             // crumb. NOTE: the value is PIXELS despite the upstream javadoc
-            // claiming dp (TerminalRenderer hands it straight to
-            // Paint.setTextSize()). 11dp is the v0.2 default (Termux-sized,
-            // a third smaller than v0.1.9's 14 which read as "UI very big";
-            // pinch adjusts it live).
+            // claiming dp — verified against the vendored TerminalRenderer,
+            // which hands it straight to Paint.setTextSize() with no density
+            // multiply, so `dp * density` here is correct. 11dp is the v0.2
+            // default (a third smaller than v0.1.9's 14 which read as "UI
+            // very big"); pinch adjusts it live.
             setTextSize(fontState.appliedPx)
         }
     }
@@ -424,12 +476,21 @@ class TerminalCtrlState(var onConsumed: (() -> Unit)? = null) {
  * consumed (one-shot, like Termux's extra keys). Pinch answers [onScale]
  * (v0.2: live font scaling); taps focus AND show the keyboard (v0.2
  * input fix).
+ *
+ * v0.2.2: counts [onEmulatorSet] (one call per applied pty size) and line
+ * terminators seen in [onCodePoint], and publishes them to the on-screen
+ * diagnostic overlay. Counters only — no behavior change.
  */
 private class RdViewClient(
     private val view: TerminalView,
     private val ctrl: TerminalCtrlState,
     private val font: TerminalFontState,
+    private val onDiag: (String) -> Unit,
 ) : TerminalViewClient {
+
+    private var resizeCount = 0
+    private var codePointCount = 0
+    private var lineTerminatorCount = 0
 
     override fun onScale(scale: Float): Float = font.apply(view, scale)
 
@@ -462,11 +523,30 @@ private class RdViewClient(
     override fun readFnKey(): Boolean = false
 
     override fun onCodePoint(codePoint: Int, ctrlDown: Boolean, session: TerminalSession?): Boolean {
+        codePointCount++
+        if (codePoint == 10 || codePoint == 13) lineTerminatorCount++
+        publish()
         if (ctrlDown) ctrl.take() // one-shot: consumed by this key
         return false
     }
 
-    override fun onEmulatorSet() {}
+    override fun onEmulatorSet() {
+        // Fires once per applied pty size — i.e. once per SIGWINCH the shell
+        // receives. A burst here is the "multiple blank prompts" mechanism.
+        resizeCount++
+        publish()
+    }
+
+    private fun publish() {
+        val em = view.mTermSession?.emulator
+        val line = "resizes=$resizeCount cp=$codePointCount crlf=$lineTerminatorCount" +
+            " cols=${em?.mColumns} rows=${em?.mRows} viewH=${view.height}"
+        android.util.Log.i("RdTermDiag", line)
+        // Posted, not set inline: onEmulatorSet runs from the view's layout
+        // pass, and writing Compose state during layout is asking for a
+        // "state modified during layout" round. post() defers it a frame.
+        view.post { onDiag(line) }
+    }
 
     override fun logError(tag: String?, message: String?) { android.util.Log.e(tag ?: "TerminalView", message ?: "") }
     override fun logWarn(tag: String?, message: String?) { android.util.Log.w(tag ?: "TerminalView", message ?: "") }
