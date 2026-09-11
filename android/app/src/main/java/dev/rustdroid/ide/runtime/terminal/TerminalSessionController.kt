@@ -1,6 +1,7 @@
 package dev.rustdroid.ide.runtime.terminal
 
 import dev.rustdroid.ide.runtime.ProcTree
+import kotlinx.coroutines.delay
 import java.io.File
 
 /**
@@ -54,6 +55,21 @@ import java.io.File
  * we stopped stopped forever (SIGKILL wins over SIGCONT for dying
  * members; a survivor that ignored SIGKILL is resumed and left to the
  * OS).
+ *
+ * v0.2.1 (review P1) — three corrections, all in this file:
+ *  1. [teardown] is a `suspend fun` and the default [sleeper] is
+ *     `delay`, not `Thread.sleep`. The old shape blocked its dispatcher
+ *     for up to ~2.4 s (2 s reader join + 300 ms grace + 2×50 ms sweeps)
+ *     per session, which — now that the caller really is single-threaded
+ *     — would serialize every other session's close behind it, and a
+ *     blocking sleep also ignores cancellation entirely.
+ *  2. Identity/state decisions use a SINGLE [ProcTree.readStat] read.
+ *     The old `stillMatches() && !isZombie()` pair read the same stat
+ *     file twice per member per sweep; a PID reuse between those two
+ *     reads validated the old occupant and the new one independently.
+ *  3. The group signal is guarded against a non-positive pgid, and is
+ *     backed by an identity-guarded direct signal to the shell (see
+ *     step 7) — never a raw PID signal.
  */
 class TerminalSessionController(
     private val procRoot: File,
@@ -76,10 +92,21 @@ class TerminalSessionController(
     private val maxSweeps: Int = 3,
     private val sweepDelayMs: Long = 50L,
     private val readerJoinTimeoutMs: Long = 2_000L,
-    private val sleeper: (ms: Long) -> Unit = { Thread.sleep(it) },
+    /** Suspend by default (v0.2.1): cancellation must propagate, and the
+     *  owner dispatcher must not be held by a blocking sleep. Tests inject
+     *  a recording lambda. */
+    private val sleeper: suspend (ms: Long) -> Unit = { delay(it) },
 ) {
     /** Full teardown per plan §5.3 steps 1–8. Idempotent by contract of the injected lambdas. */
-    fun teardown() {
+    suspend fun teardown() {
+        // 0. Capture the shell's identity ONCE, at the start. Every later
+        //    destructive decision about the shell revalidates against THIS
+        //    value. A null here (the /proc entry was already gone) disables
+        //    both late rediscovery and the step-7 fallback: an identity we
+        //    never captured cannot be revalidated, and a destructive
+        //    traversal must not proceed on "cannot disprove".
+        val shellId = ProcTree.identity(procRoot, shellPid)
+
         // 1. Quiesce input: the CALLER stops writing to the master before
         //    calling teardown (the session's input path is runCatching-
         //    guarded; a post-close write surfaces EBADF and is ignored).
@@ -102,9 +129,7 @@ class TerminalSessionController(
         //    the freeze must come after this, not before.)
         sleeper(graceMs)
 
-        // 5. Snapshot via union discovery — the identity map is cached
-        //    for the whole teardown (sweeps re-validate only captured
-        //    PIDs, never a full /proc re-scan).
+        // 5. Snapshot via union discovery.
         val captured = ArrayList<ProcTree.ProcessId>()
         val seen = HashSet<Long>()
         for (id in ProcTree.unionMembers(procRoot, shellPid, ptsDevice)) {
@@ -122,22 +147,60 @@ class TerminalSessionController(
         //    still provably the ORIGINAL process — a reaped-and-reused
         //    shell PID belongs to someone else's tree now (the same
         //    discipline as ProcTree.terminateTree step 5).
-        val shellId = ProcTree.identity(procRoot, shellPid)
         if (shellId != null && ProcTree.stillMatches(procRoot, shellId)) {
             for (id in ProcTree.unionMembers(procRoot, shellPid, ptsDevice)) {
                 if (seen.add(id.pid)) captured.add(id)
             }
         }
 
-        // 7. Kill: the shell's own process group first (it can only ever
-        //    contain members of this session — a pgrp cannot span
-        //    sessions), then bounded identity-checked, zombie-excluded
-        //    SIGKILL sweeps with early return (the first sweep IS the
-        //    kill pass — same shape as ProcTree.terminateTree step 6).
-        runCatching { killpg(shellPid, ProcTree.SIGKILL) }
+        // 7. Kill. TWO paths, both identity-disciplined.
+        //
+        //    (a) The shell's process group. The shell is the session AND
+        //        group leader, so its pgrp can only contain members of
+        //        this session. GUARDED on a positive pgid (review P1):
+        //        killpg(0, sig) is kill(0, sig) — the CALLER'S OWN process
+        //        group, i.e. the app signalling itself — and killpg(1, ·)
+        //        targets init. Neither is a no-op, and both are reachable
+        //        when the session already finished: upstream's mShellPid
+        //        starts at 0 and is set to -1 on exit, so an
+        //        already-finished session can hand us a non-positive pid.
+        if (shellPid > 1) runCatching { killpg(shellPid, ProcTree.SIGKILL) }
+        //
+        //    (b) A direct, identity-guarded SIGKILL to the shell itself.
+        //        The master close's SIGHUP only reaches whatever occupies
+        //        the pty's CURRENT foreground process group at that
+        //        instant — so a shell that backgrounded itself, changed its
+        //        own pgid, or whose group bookkeeping is the stale part
+        //        (as opposed to its pid) can survive the hangup
+        //        indefinitely. Given shellPid > 1 is independently
+        //        known-good here, quietly accepting that weaker outcome
+        //        while a stronger one is available is exactly the gap the
+        //        step-6 backstop exists to avoid.
+        //
+        //        NOT a raw pid signal: PID + start time are revalidated
+        //        through the same single readStat observation every other
+        //        signal path here uses, so a reused PID is never targeted,
+        //        and a zombie (already dead, awaiting reap) is not
+        //        signalled.
+        if (shellPid > 1) {
+            val st = ProcTree.readStat(procRoot, shellPid)
+            if (st != null && shellId != null &&
+                st.startTime == shellId.startTime && st.state != 'Z'
+            ) {
+                runCatching { signal(shellPid, ProcTree.SIGKILL) }
+            }
+        }
+        //
+        //    Then bounded identity-checked, zombie-excluded SIGKILL sweeps
+        //    with early return (the first sweep IS the kill pass — same
+        //    shape as ProcTree.terminateTree step 6). Each member's
+        //    identity AND liveness come from ONE readStat: chaining
+        //    stillMatches() with isZombie() read the stat file twice and
+        //    let a PID reuse slip between the two questions.
         for (sweep in 0 until maxSweeps) {
-            val remaining = captured.filter {
-                ProcTree.stillMatches(procRoot, it) && !ProcTree.isZombie(procRoot, it.pid)
+            val remaining = captured.filter { id ->
+                val st = ProcTree.readStat(procRoot, id.pid) ?: return@filter false
+                id.startTime != null && st.startTime == id.startTime && st.state != 'Z'
             }
             if (remaining.isEmpty()) return
             for (id in remaining) runCatching { signal(id.pid, ProcTree.SIGKILL) }
@@ -147,9 +210,11 @@ class TerminalSessionController(
         // 8. Budget exhausted: SIGCONT every freeze survivor still alive —
         //    we stopped it, so we must never leave it stopped forever.
         //    (SIGKILL wins over SIGCONT for dying members; a survivor that
-        //    ignored SIGKILL is resumed and left to the OS.)
+        //    ignored SIGKILL is resumed and left to the OS.) Same
+        //    single-read discipline as step 7.
         for (id in captured) {
-            if (ProcTree.stillMatches(procRoot, id) && !ProcTree.isZombie(procRoot, id.pid)) {
+            val st = ProcTree.readStat(procRoot, id.pid) ?: continue
+            if (id.startTime != null && st.startTime == id.startTime && st.state != 'Z') {
                 runCatching { signal(id.pid, SIGCONT) }
             }
         }
