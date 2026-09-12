@@ -85,8 +85,8 @@ public final class TerminalSession extends TerminalOutput {
      * (for a bounded join) and the master-close ownership flag.
      */
     private FileDescriptor mReaderWakeRead;
-    private FileDescriptor mReaderWakeWrite;
-    private Thread mReaderThread;
+    private volatile FileDescriptor mReaderWakeWrite;
+    private volatile Thread mReaderThread;
     private boolean mMasterClosed;
 
     private final String mShellPath;
@@ -123,6 +123,14 @@ public final class TerminalSession extends TerminalOutput {
         if (mEmulator == null) {
             initializeEmulator(columns, rows, cellWidthPixels, cellHeightPixels);
         } else {
+            // External bug report (Critical #2, confirmed): a layout pass
+            // can call updateSize() after closeMasterFd() has already run
+            // (e.g. a rotation racing session teardown) — without this
+            // guard, setPtyWindowSize() would target an fd number the
+            // kernel may already have reused for something unrelated.
+            synchronized (this) {
+                if (mMasterClosed) return;
+            }
             JNI.setPtyWindowSize(mTerminalFileDescriptor, rows, columns, cellWidthPixels, cellHeightPixels);
             mEmulator.resize(columns, rows, cellWidthPixels, cellHeightPixels);
         }
@@ -281,7 +289,38 @@ public final class TerminalSession extends TerminalOutput {
             mMasterClosed = true;
             fd = mTerminalFileDescriptor;
         }
+        // External bug report (Critical #2, confirmed): cleanupResources()
+        // used to close the wake pipe unconditionally on the exit callback,
+        // which can race the reader thread still being watched on it in
+        // Os.poll (POLLNVAL, then a read on a possibly-already-reused fd
+        // number) — and separately, the writer thread and updateSize() kept
+        // using mTerminalFileDescriptor after this method ran, on a session
+        // killed by teardown BEFORE the shell exited naturally (cleanup
+        // Resources() only fires on natural exit, so its own IOQueue.close()
+        // never covered that path at all).
+        //
+        // Fix: this method is the SOLE owner of every fd this session holds,
+        // called by the I/O owner strictly after requestReaderStop() ->
+        // joinReader() have completed (that contract is the caller's, not
+        // enforced here). Closing the queue first wakes the writer thread's
+        // blocked read() immediately so it stops using the fd; JNI.close(fd)
+        // is then the real close; the wake pipe closes last since nothing
+        // needs it anymore once the reader is already known-joined.
+        //
+        // Residual, stated rather than hidden: the writer thread's own
+        // try-with-resources FileOutputStream (wrapping this same fd number
+        // via reflection, not a fd it opened itself) still runs its own
+        // close() when its loop notices the queue closed and returns — a
+        // narrow scheduling window exists between JNI.close(fd) here and
+        // that thread waking up and closing its wrapped stream. This exact
+        // window already exists today on the natural-exit path (cleanup
+        // Resources() closes the same queue there); this change extends the
+        // same, already-accepted pattern to the explicit-teardown path
+        // rather than introducing a new one.
+        mTerminalToProcessIOQueue.close();
         JNI.close(fd);
+        try { if (mReaderWakeRead != null) Os.close(mReaderWakeRead); } catch (Exception ignored) { }
+        try { if (mReaderWakeWrite != null) Os.close(mReaderWakeWrite); } catch (Exception ignored) { }
     }
 
     /** Write data to the shell process. */
@@ -360,16 +399,21 @@ public final class TerminalSession extends TerminalOutput {
             mShellExitStatus = exitStatus;
         }
 
-        // Stop the reader and writer threads, and close the I/O streams
+        // Stop the reader and writer threads, and close the I/O streams.
+        // RustDroid restructure (plan §5.3, hardened by external bug report
+        // Critical #2): neither the master fd NOR the wake pipe are closed
+        // here anymore. Upstream closed the master from the main thread
+        // while the reader could still be watching it (the fd-reuse
+        // use-after-close, review P1-4) — and this method's OWN wake-pipe
+        // closes had the identical bug: cleanupResources() runs on the exit
+        // callback, asynchronously with respect to whatever the session's
+        // I/O owner is doing, so it could close the wake pipe while the
+        // reader was still polling it. closeMasterFd() is now the sole
+        // owner of every fd this session holds (master, wake pipe, and the
+        // writer queue), called by the owner strictly after
+        // requestReaderStop() -> joinReader() have completed.
         mTerminalToProcessIOQueue.close();
         mProcessToTerminalIOQueue.close();
-        // RustDroid restructure (plan §5.3): the master fd is NOT closed
-        // here — upstream closed it from the main thread while the reader
-        // could still be watching it (the fd-reuse use-after-close, review
-        // P1-4). The close is owned by closeMasterFd(), called by the
-        // session's I/O owner after the reader is joined.
-        try { if (mReaderWakeRead != null) Os.close(mReaderWakeRead); } catch (Exception ignored) { }
-        try { if (mReaderWakeWrite != null) Os.close(mReaderWakeWrite); } catch (Exception ignored) { }
     }
 
     @Override
