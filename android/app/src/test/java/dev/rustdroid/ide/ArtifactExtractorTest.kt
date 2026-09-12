@@ -558,6 +558,80 @@ class ArtifactExtractorTest {
         return zip
     }
 
+    // ------------------------------------------------------------------
+    // External bug report, Critical #1 (CONFIRMED against source before
+    // this fix): both symlink-containment checks canonicalized the
+    // PREFIX (resolving every symlink in its path, including Android's
+    // universal `/data/user/0 -> /data/data`) but built the resolved
+    // TARGET via `.normalize()` alone — purely lexical, never touching
+    // the filesystem, so it never resolved that same symlink on the
+    // target side. `startsWith` then compared an unresolved path against
+    // a resolved one and rejected every legitimate relative symlink
+    // target on a real device, while every existing test above passed —
+    // because none of them put the prefix behind a symlink, and neither
+    // does a Linux CI runner's plain /tmp. This test reproduces the real
+    // device layout directly on CI: a symlinked "files" directory
+    // standing in for `/data/user/0`, pointing at a "real" directory
+    // standing in for `/data/data`. It fails on the pre-fix
+    // containedTarget logic and passes on the canonicalize-both-sides fix.
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `manifest symlinks install correctly when the prefix sits behind a symlink (Android's data-user-0 layout)`() {
+        val realDataRoot = tmp.newFolder("real-data-data")          // stands in for /data/data/<pkg>
+        val userRoot = tmp.newFolder("android-data-user-0-parent")
+        val linkedFilesDir = File(userRoot, "files")                 // stands in for /data/user/0/<pkg>/files
+        Files.createSymbolicLink(linkedFilesDir.toPath(), realDataRoot.toPath())
+
+        val zip = File(tmp.root, "bundle-behind-symlink.zip")
+        writeBundle(zip)
+
+        val paths = ToolchainPaths(linkedFilesDir)
+        // Must not throw "escapes the install prefix" for the bundle's own
+        // legitimate bin/sh -> busybox and bin/ash -> busybox symlinks.
+        ArtifactExtractor(paths).install(zip)
+
+        val busybox = File(paths.prefix, "bin/busybox")
+        val sh = File(paths.prefix, "bin/sh")
+        val ash = File(paths.prefix, "bin/ash")
+        assertTrue("busybox must be installed", busybox.isFile)
+        assertTrue("bin/sh must be a symlink", Files.isSymbolicLink(sh.toPath()))
+        assertTrue("bin/ash must be a symlink", Files.isSymbolicLink(ash.toPath()))
+        assertEquals(busybox.canonicalFile, sh.canonicalFile)
+        assertEquals(busybox.canonicalFile, ash.canonicalFile)
+    }
+
+    @Test
+    fun `tar symlinks install correctly when the prefix sits behind a symlink`() {
+        // Same device-layout reproduction, exercising the OTHER call site
+        // (resolveLink's symbolic-link branch, used for tar-embedded
+        // symlinks rather than manifest-v2 ones).
+        val realDataRoot = tmp.newFolder("real-data-data-2")
+        val userRoot = tmp.newFolder("android-data-user-0-parent-2")
+        val linkedFilesDir = File(userRoot, "files")
+        Files.createSymbolicLink(linkedFilesDir.toPath(), realDataRoot.toPath())
+
+        val zip = minimalBundleWith {
+            linkTarEntry(
+                this,
+                "rustc-1.85.0-aarch64-linux-android/rustc/lib/alias.so",
+                "real.so",
+                TarConstants.LF_SYMLINK,
+            )
+            val e = TarArchiveEntry("rustc-1.85.0-aarch64-linux-android/rustc/lib/real.so")
+            e.size = 3L
+            putArchiveEntry(e)
+            write("abc".toByteArray())
+            closeArchiveEntry()
+        }
+        val paths = ToolchainPaths(linkedFilesDir)
+        ArtifactExtractor(paths).install(zip)
+
+        val link = File(paths.prefix, "lib/alias.so")
+        assertTrue(Files.isSymbolicLink(link.toPath()))
+        assertEquals("abc", link.readText())
+    }
+
     /** JUnit-friendly "must throw IllegalStateException" with the exception returned. */
     private inline fun expectIllegalState(block: () -> Unit): IllegalStateException =
         try {

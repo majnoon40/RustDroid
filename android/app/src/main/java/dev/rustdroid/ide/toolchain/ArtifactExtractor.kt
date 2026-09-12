@@ -214,21 +214,13 @@ class ArtifactExtractor(
      * carry symlinks portably; that is why the manifest owns them.)
      */
     private fun installManifestSymlinks(prefix: File, symlinks: List<dev.rustdroid.ide.model.BundleManifest.SymlinkSpec>) {
-        val prefixPath = prefix.canonicalFile.toPath()
         for (link in symlinks) {
             if (link.name.isBlank() || link.target.isBlank()) {
                 error("manifest symlink entry with blank name/target — corrupt manifest")
             }
             val dest = Fs.resolveChild(prefix, link.name)
             Fs.requireInside(prefix, dest)
-            // The target must also stay inside the prefix after lexical
-            // resolution (relative to the link's own directory).
-            val targetPath = if (link.target.startsWith("/")) {
-                Paths.get(link.target).normalize()
-            } else {
-                dest.parentFile.toPath().resolve(link.target).normalize()
-            }
-            if (!targetPath.startsWith(prefixPath)) {
+            if (!containedTarget(prefix, dest, link.target)) {
                 error(
                     "manifest symlink '${link.name}' -> '${link.target}' escapes the install " +
                         "prefix — corrupt bundle, install blocked (plan §6.5)",
@@ -246,6 +238,39 @@ class ArtifactExtractor(
                 )
             }
         }
+    }
+
+    /**
+     * External bug report (Critical #1, CONFIRMED against this exact code):
+     * both symlink-containment checks canonicalized [prefix]
+     * (`prefix.canonicalFile.toPath()` — resolves EVERY symlink in the
+     * prefix's path, including Android's own `/data/user/0 -> /data/data`,
+     * which is a universal, documented characteristic of
+     * `context.filesDir` on real devices, API 24+) but built the resolved
+     * TARGET path via `.resolve(...).normalize()` alone — `.normalize()`
+     * is purely lexical, it never touches the filesystem, so it never
+     * resolved that same symlink on the target side. The `startsWith`
+     * comparison then compared an unresolved path
+     * (`/data/user/0/.../usr.new/bin/busybox`) against a resolved one
+     * (`/data/data/.../usr.new`) and was false for every legitimate
+     * relative symlink target on a real device — while passing on any
+     * Linux CI/JVM test, where the temp directory isn't itself behind a
+     * symlink. This is why the bug was never caught: it is invisible to
+     * every test this project's existing suite could run.
+     *
+     * Fix: canonicalize the resolved target too. [File.getCanonicalFile]
+     * resolves every EXISTING ancestor component and tolerates a
+     * non-existent leaf (the symlink itself doesn't exist yet — we're
+     * validating before creating it — but by the time either call site
+     * runs, the link's parent directory and the target file it points at
+     * have already been extracted, so the leaf is the only thing that may
+     * be absent, and canonicalization handles that correctly).
+     */
+    private fun containedTarget(prefix: File, linkDest: File, target: String): Boolean {
+        val prefixPath = prefix.canonicalFile.toPath()
+        val base = if (target.startsWith("/")) File(target) else File(linkDest.parentFile, target)
+        val resolved = base.canonicalFile.toPath()
+        return resolved == prefixPath || resolved.startsWith(prefixPath)
     }
 
     private fun hashFile(f: File): String = java.security.MessageDigest.getInstance("SHA-256")
@@ -333,13 +358,7 @@ class ArtifactExtractor(
         // symbolic link: the target must resolve inside the prefix. Every
         // other symlink in the tree passes the same check, so chains of
         // in-prefix links cannot combine into an escape.
-        val targetPath = if (link.linkName.startsWith("/")) {
-            Paths.get(link.linkName).normalize()
-        } else {
-            link.dest.parentFile.toPath().resolve(link.linkName).normalize()
-        }
-        val prefixPath = prefix.canonicalFile.toPath()
-        if (!targetPath.startsWith(prefixPath)) {
+        if (!containedTarget(prefix, link.dest, link.linkName)) {
             throw IOException(
                 "$label: symlink '${link.dest.relativeTo(prefix).path}' -> " +
                     "'${link.linkName}' escapes the install prefix — corrupt archive",
