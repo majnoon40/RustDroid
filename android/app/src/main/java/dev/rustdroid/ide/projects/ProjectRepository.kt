@@ -258,10 +258,23 @@ class ProjectRepository(
 
     // ---- file tree for the editor ----
 
-    /** Files under the project, skipping target/ and .git/. */
+    /**
+     * Files under the project, skipping target/ and .git/.
+     *
+     * External bug report (confirmed): unlike [latestMtime], this walk had
+     * no guard against a symlink loop (`ln -s . self` inside a project,
+     * or any symlink whose target chain eventually points back at an
+     * ancestor) — `child.isDirectory` is true for a symlinked directory,
+     * so the recursion had no base case and opening the editor on such a
+     * project was a guaranteed StackOverflowError. Same
+     * visited-canonical-path guard as [latestMtime], reused here.
+     */
     fun fileTree(projectDir: File, allFiles: Boolean): List<dev.rustdroid.ide.model.FileNode> {
         val out = mutableListOf<dev.rustdroid.ide.model.FileNode>()
+        val visited = HashSet<String>()
         fun walk(dir: File, depth: Int) {
+            val canonical = dir.canonicalPath
+            if (!visited.add(canonical)) return
             val children = dir.listFiles() ?: return
             val sorted = children.sortedWith(
                 compareByDescending<File> { it.isDirectory }.thenBy { it.name.lowercase() }

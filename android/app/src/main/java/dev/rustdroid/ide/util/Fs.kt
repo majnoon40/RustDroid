@@ -70,23 +70,46 @@ object Fs {
         }
     }
 
-    /** Recursively delete, tolerating partial failure; returns success. */
+    /**
+     * Recursively delete, tolerating partial failure; returns success.
+     *
+     * External bug report (confirmed): `File.isDirectory` is true for a
+     * symlink TO a directory, so the previous version descended into and
+     * deleted the TARGET's contents. The terminal ships `ln -s` (busybox),
+     * so `ln -s ~/../usr ~/projects/foo/tc` followed by deleting project
+     * `foo` deleted the toolchain. A dangling symlink was also never
+     * deleted at all (`exists()` is false for one, so the old code
+     * returned "success" without touching it). Fix: check
+     * `Files.isSymbolicLink` FIRST — a symlink is never recursed into and
+     * is deleted as the link itself (`file.delete()` removes a symlink
+     * without following it, on every JVM/Android version this app
+     * targets), regardless of whether its target exists.
+     */
     fun deleteRecursively(file: File): Boolean {
-        if (!file.exists()) return true
-        if (file.isDirectory) {
+        val isLink = Files.isSymbolicLink(file.toPath())
+        if (!isLink && !file.exists()) return true
+        if (!isLink && file.isDirectory) {
             file.listFiles()?.forEach { deleteRecursively(it) }
         }
         return file.delete()
     }
 
-    /** Directory size in bytes, 0 if absent. Follows symlinks shallowly. */
+    /**
+     * Directory size in bytes, 0 if absent.
+     *
+     * External bug report (confirmed, same root cause as [deleteRecursively]):
+     * a symlinked subdirectory was previously followed and its target's
+     * bytes double-counted into the total. A symlink now contributes 0 —
+     * its own directory-entry size isn't meaningful data-usage information
+     * to the user, and following it risks the same self-referential-loop
+     * hazard `deleteRecursively` had.
+     */
     fun sizeOf(file: File): Long {
+        if (Files.isSymbolicLink(file.toPath())) return 0
         if (!file.exists()) return 0
         if (file.isFile) return file.length()
         var total = 0L
-        file.listFiles()?.forEach { child ->
-            total += if (child.isDirectory) sizeOf(child) else child.length()
-        }
+        file.listFiles()?.forEach { child -> total += sizeOf(child) }
         return total
     }
 

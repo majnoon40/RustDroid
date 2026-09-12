@@ -173,4 +173,53 @@ class FsTest {
         assertTrue(Fs.deleteRecursively(d))
         assertFalse(d.exists())
     }
+
+    @Test
+    fun `deleteRecursively removes the link, never the symlinked target`() {
+        // External bug report (confirmed against source): File.isDirectory
+        // is true for a symlink TO a directory, so the previous
+        // implementation followed it and deleted the target's contents.
+        // This test fails on the pre-fix code (the target directory and
+        // its file would be gone) and passes on the fix (only the link
+        // entry itself is removed).
+        val victim = tmp.newFolder("victim")
+        File(victim, "important.txt").writeText("do not delete me")
+        val container = tmp.newFolder("container")
+        val link = File(container, "link-to-victim")
+        java.nio.file.Files.createSymbolicLink(link.toPath(), victim.toPath())
+
+        assertTrue(Fs.deleteRecursively(container))
+
+        assertFalse(container.exists())
+        assertTrue("the symlink TARGET must survive deleting a link that pointed at it", victim.exists())
+        assertTrue(File(victim, "important.txt").exists())
+    }
+
+    @Test
+    fun `deleteRecursively removes a dangling symlink instead of silently no-opping`() {
+        val container = tmp.newFolder("container2")
+        val link = File(container, "dangling")
+        val ghost = File(tmp.root, "never-created")
+        java.nio.file.Files.createSymbolicLink(link.toPath(), ghost.toPath())
+        // exists() is false for a dangling link — the pre-fix code's
+        // `if (!file.exists()) return true` short-circuited here, claiming
+        // success without ever calling delete() on the link entry itself.
+        assertTrue(Fs.deleteRecursively(container))
+        assertFalse(container.exists())
+    }
+
+    @Test
+    fun `sizeOf does not double-count through a symlinked directory`() {
+        val real = tmp.newFolder("real-data")
+        File(real, "big.bin").writeBytes(ByteArray(1000))
+        val container = tmp.newFolder("container3")
+        File(container, "own.bin").writeBytes(ByteArray(1))
+        val link = File(container, "link-to-real")
+        java.nio.file.Files.createSymbolicLink(link.toPath(), real.toPath())
+
+        // Pre-fix: sizeOf followed the symlink and included real-data's
+        // 1000 bytes in container3's reported size. A symlink should
+        // contribute 0 of its own — only own.bin's 1 byte is container3's.
+        assertEquals(1L, Fs.sizeOf(container))
+    }
 }
