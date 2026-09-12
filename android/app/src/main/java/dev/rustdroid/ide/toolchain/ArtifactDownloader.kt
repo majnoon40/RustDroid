@@ -57,6 +57,27 @@ class ArtifactDownloader(baseClient: OkHttpClient) {
         .writeTimeout(120, TimeUnit.SECONDS)
         .build()
 
+    // External bug report #6 (confirmed): downloadBlocking was pure
+    // blocking code with no cancellation awareness at all — cancelling
+    // the coroutine that called it neither interrupted the in-flight
+    // OkHttp read nor stopped the backoff retry loop (a cancelled Call
+    // throws IOException, which the loop happily retried). A user who
+    // killed the install kept downloading for up to MAX_ATTEMPTS more
+    // tries. [cancel] is idempotent and safe to call from any thread —
+    // callers should invoke it from a CancellationException handler or a
+    // Job.invokeOnCompletion callback.
+    private val currentCall = java.util.concurrent.atomic.AtomicReference<okhttp3.Call?>(null)
+    @Volatile private var cancelled = false
+
+    fun cancel() {
+        cancelled = true
+        currentCall.get()?.cancel()
+    }
+
+    private fun checkCancelled() {
+        if (cancelled) throw java.util.concurrent.CancellationException("download cancelled")
+    }
+
     sealed class DownloadState {
         data class Progress(val bytes: Long, val total: Long?) : DownloadState()
         data class Done(val file: File, val sha256: String) : DownloadState()
@@ -142,6 +163,7 @@ class ArtifactDownloader(baseClient: OkHttpClient) {
 
         var lastError: IOException? = null
         for (attempt in 1..MAX_ATTEMPTS) {
+            checkCancelled()
             try {
                 attemptOnce(url, tmp, dest, expectedSha256, onProgress)
                 return
@@ -159,6 +181,7 @@ class ArtifactDownloader(baseClient: OkHttpClient) {
                     } catch (_: InterruptedException) {
                         Thread.currentThread().interrupt()
                     }
+                    checkCancelled()
                 }
             }
         }
@@ -174,7 +197,14 @@ class ArtifactDownloader(baseClient: OkHttpClient) {
         expectedSha256: String?,
         onProgress: (Long, Long?) -> Unit,
     ) = attemptLoop(url, tmp, dest, expectedSha256, onProgress) { builder ->
-        client.newCall(builder.build()).execute()
+        checkCancelled()
+        val call = client.newCall(builder.build())
+        currentCall.set(call)
+        try {
+            call.execute()
+        } finally {
+            currentCall.compareAndSet(call, null)
+        }
     }
 
     /**
@@ -199,6 +229,7 @@ class ArtifactDownloader(baseClient: OkHttpClient) {
     ) {
         var restarts = 0
         while (true) {
+            checkCancelled()
             val resumeFrom = if (tmp.isFile) tmp.length() else 0L
             if (resumeFrom == 0L) discardPartOrThrow(tmp)
             val meta = readMeta(tmp)

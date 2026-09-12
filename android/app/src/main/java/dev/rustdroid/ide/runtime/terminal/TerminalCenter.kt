@@ -282,8 +282,29 @@ class TerminalCenter(
         TerminalService.ensureStopped(context, _sessions.value.count { !it.finished })
     }
 
+    /**
+     * Tears down every live session, then retires the I/O-owner thread.
+     *
+     * External bug report #8 (confirmed): the previous version called
+     * `ioScope.cancel()` immediately after `ioScope.launch { ... }` —
+     * since both run on the SAME scope, cancel() could tear down the
+     * launched job before the single-thread dispatcher ever got to start
+     * executing it (or interrupt it mid-teardown), so nothing was
+     * actually torn down. Fixed by cancelling only after the job
+     * completes.
+     *
+     * WIRING GAP, stated rather than silently left: nothing in the app
+     * currently calls shutdown(). The natural hook is
+     * TerminalService.onDestroy() (via the Application's AppContainer),
+     * so terminal sessions are torn down when the service itself is
+     * killed (app swiped away while a terminal is open) rather than
+     * relying solely on the kernel's SIGHUP-on-master-close side effect.
+     * Not wired here — confirming the exact Application/container access
+     * pattern needs a look at RustDroidApp.kt, deliberately deferred
+     * rather than guessing a cross-file reference that could be wrong.
+     */
     fun shutdown() {
-        ioScope.launch {
+        val job = ioScope.launch {
             _sessions.value.forEach { entry ->
                 runCatching {
                     TerminalSessionController(
@@ -299,6 +320,6 @@ class TerminalCenter(
                 }
             }
         }
-        ioScope.cancel()
+        job.invokeOnCompletion { ioScope.cancel() }
     }
 }

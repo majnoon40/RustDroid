@@ -119,6 +119,11 @@ class ToolchainManager(
             requireFreeSpace(ToolchainDistro.EXPECTED_INSTALLED_BYTES, "toolchain install")
             _state.value = ToolchainState.Downloading(0, ToolchainDistro.expectedSizeBytes)
             withContext(Dispatchers.IO) {
+                // #5/#6: propagate coroutine cancellation into the
+                // downloader's blocking call — see ArtifactDownloader.cancel().
+                coroutineContext.job.invokeOnCompletion {
+                    if (it is kotlinx.coroutines.CancellationException) downloader.cancel()
+                }
                 downloader.downloadBlocking(
                     ToolchainDistro.url,
                     zip,
@@ -263,11 +268,32 @@ class ToolchainManager(
         } catch (e: kotlinx.coroutines.CancellationException) {
             // A cancelled install is NOT a failure: coroutine cancellation
             // must propagate (the service scope or VM scope is going away).
-            // If the swap already happened, the pending marker stays on
-            // disk and startup recovery restores the previous install.
+            //
+            // External bug report #5 (confirmed): if the swap already
+            // happened, this branch previously did nothing — relying on
+            // "startup recovery restores it later", which only runs from
+            // init() on the NEXT process start. Inside the SAME process,
+            // the state was reset to NotInstalled, the user could tap
+            // Download again immediately, and ToolchainSwap.swap()
+            // pre-cleans `aside` unconditionally — destroying the very
+            // known-good install this rollback exists to protect, before
+            // the new attempt had proven itself. Roll back NOW,
+            // non-cancellably (the scope that's being torn down must not
+            // interrupt its own cleanup), rather than deferring to a
+            // restart that may not happen before the next tap.
+            if (swapped) {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                    val rollbackFailure = ToolchainTransaction.rollbackFailedInstall(
+                        paths.pendingInstall, paths.prefix, paths.aside,
+                    ) { line -> log("cancelled — $line") }
+                    if (rollbackFailure != null) {
+                        log("cancelled install: rollback FAILED (${rollbackFailure.message}) — startup recovery will retry")
+                    }
+                }
+            }
             when (val s = _state.value) {
                 is ToolchainState.Ready, is ToolchainState.Failed, is ToolchainState.NotInstalled -> {}
-                else -> _state.value = ToolchainState.NotInstalled // stale progress state
+                else -> _state.value = initialState() // disk truth, not a blind reset
             }
             throw e
         } catch (e: Exception) {

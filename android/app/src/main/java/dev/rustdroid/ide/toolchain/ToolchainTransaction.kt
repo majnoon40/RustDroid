@@ -180,6 +180,23 @@ internal object ToolchainTransaction {
                 // disk-garbage, not an unsafe state (the next swap
                 // pre-cleans it) — the verified install IS the safe
                 // final state, so the marker is cleared either way.
+                //
+                // External bug report #7 (partially already fixed by an
+                // earlier pass — RESTORE_ASIDE/DISCARD below already clean
+                // staging; this branch was the one remaining gap): a hard
+                // crash (not a normal exception path) between the swap's
+                // own `finally { Fs.deleteRecursively(staging) }` and that
+                // block actually running can leave staging's ~500 MB on
+                // disk indefinitely, since this recovery branch never
+                // touched it. Note: the report ALSO suggested deleting
+                // `prefix` in the DISCARD branch below when no ready
+                // marker is present — that is NOT applied, because
+                // GateScreen's "Verify files already on this device"
+                // rescue path deliberately depends on exactly those files
+                // surviving so re-verification can promote them to Ready
+                // without a re-download; deleting them there would
+                // silently remove a real, intentional feature.
+                Fs.deleteRecursively(staging)
                 if (!ToolchainSwap.commit(aside)) {
                     log("recovery: could not delete the old toolchain at ${aside.path} (retried next install)")
                 }
