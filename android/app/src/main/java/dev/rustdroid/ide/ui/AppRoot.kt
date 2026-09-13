@@ -108,6 +108,45 @@ fun AppRoot(
         }
     }
 
+    /**
+     * On-device bug report: pressing system back from the Terminal screen
+     * produced a blank intermediate entry, a briefly unresponsive UI, and
+     * misbehaving extra-key buttons. Root cause: neither Home's nor
+     * Editor's "open terminal" callback used launchSingleTop, so opening
+     * the terminal for the SAME project from two different places (or
+     * twice without popping in between) pushed a SECOND, fully separate
+     * TerminalScreen nav destination on top of the first — a distinct
+     * composable instance with its own TerminalViewModel and its own
+     * remembered com.termux.view.TerminalView, both independently binding
+     * to the SAME underlying session (per the existing projectRef-scoped
+     * session lookup). Back then walked through this extra, stale
+     * instance rather than a single canonical terminal screen per
+     * project — plausibly explaining all three symptoms (an intermediate
+     * "blank" entry, transient unresponsiveness while a stale TerminalView
+     * re-attaches to a session mid-navigation, and extra-key state
+     * belonging to the wrong screen instance).
+     *
+     * Fix: launchSingleTop, PLUS pop any existing instance of this exact
+     * route (same project argument) before pushing a new one — this
+     * guarantees at most one Terminal destination per project ever
+     * exists in the back stack, matching the route's own "project-scoped
+     * destination" design intent (plan §8.1) rather than allowing
+     * unbounded duplicate instances to accumulate.
+     *
+     * NOTE: this is a well-reasoned fix for a real, confirmed gap in the
+     * nav graph, but stated honestly — it was diagnosed from source
+     * without a logcat/stack trace from the actual on-device failure. If
+     * the symptom persists after this change, a logcat capture of the
+     * back-press sequence is the next step, not another guess from here.
+     */
+    fun navigateToTerminal(nav: androidx.navigation.NavHostController, project: String?) {
+        val route = Routes.terminal(project)
+        nav.navigate(route) {
+            launchSingleTop = true
+            popUpTo(route) { inclusive = true }
+        }
+    }
+
     NavHost(navController = nav, startDestination = startDest) {
         composable(Routes.GATE) {
             GateScreen(
@@ -129,7 +168,7 @@ fun AppRoot(
                 container,
                 onOpenProject = { ref -> nav.navigate(Routes.editor(ref)) },
                 onOpenSettings = { nav.navigate(Routes.SETTINGS) },
-                onOpenTerminal = { ref -> nav.navigate(Routes.terminal(ref)) },
+                onOpenTerminal = { ref -> navigateToTerminal(nav, ref) },
             )
         }
         composable(
@@ -167,7 +206,7 @@ fun AppRoot(
                 container, project,
                 initialFile = file.ifBlank { null },
                 onOpenDeps = { nav.navigate(Routes.deps(it)) },
-                onOpenTerminal = { ref -> nav.navigate(Routes.terminal(ref)) },
+                onOpenTerminal = { ref -> navigateToTerminal(nav, ref) },
             )
         }
         composable(Routes.DEPS) { entry ->
