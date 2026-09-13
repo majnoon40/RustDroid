@@ -121,7 +121,15 @@ class ToolchainManager(
             withContext(Dispatchers.IO) {
                 // #5/#6: propagate coroutine cancellation into the
                 // downloader's blocking call — see ArtifactDownloader.cancel().
-                coroutineContext.job.invokeOnCompletion {
+                // NOTE: coroutineContext.job is a kotlinx.coroutines
+                // EXTENSION property requiring its own explicit import
+                // (`import kotlinx.coroutines.job`), which this file didn't
+                // have — the actual first CI compile failure this fix is
+                // for. coroutineContext[Job] uses the base
+                // CoroutineContext.get operator instead, needing no extra
+                // import (Job is referenced fully-qualified here for the
+                // same reason).
+                coroutineContext[kotlinx.coroutines.Job]?.invokeOnCompletion {
                     if (it is kotlinx.coroutines.CancellationException) downloader.cancel()
                 }
                 downloader.downloadBlocking(
